@@ -1,0 +1,64 @@
+{
+  "name": "@riaskov/nevo-messaging",
+  "version": "1.0.0",
+  "description": "Microservices messaging framework for NestJS with Kafka transport",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build",
+    "test": "jest",
+    "lint": "eslint src/**/*.ts",
+    "format": "prettier --write \"src/**/*.ts\" \"examples/**/*.ts\""
+  },
+  "keywords": [
+    "nestjs",
+    "microservices",
+    "kafka",
+    "messaging",
+    "signal-router",
+    "nevo"
+  ],
+  "author": "Andrei Riaskov <code@riaskov.com>",
+  "license": "MIT",
+  "peerDependencies": {
+    "@nestjs/common": "^11.1.0",
+    "@nestjs/core": "^11.1.0",
+    "@nestjs/microservices": "^11.1.0",
+    "@nestjs/config": "^4.0.0",
+    "@nestjs/platform-fastify": "^11.1.0",
+    "kafkajs": "^2.2.4",
+    "rxjs": "^7.8.2",
+    "reflect-metadata": "^0.2.2"
+  },
+  "devDependencies": {
+    "@nestjs/common": "11.1.0",
+    "@nestjs/core": "11.1.0",
+    "@nestjs/microservices": "11.1.0",
+    "@nestjs/config": "4.0.2",
+    "@nestjs/platform-fastify": "11.1.0",
+    "kafkajs": "2.2.4",
+    "rxjs": "7.8.2",
+    "reflect-metadata": "0.2.2",
+    "@types/node": "^22.15.30",
+    "@typescript-eslint/eslint-plugin": "6.21.0",
+    "@typescript-eslint/parser": "6.21.0",
+    "eslint": "8.57.1",
+    "jest": "29.7.0",
+    "prettier": "3.5.3",
+    "typescript": "5.9.2"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ARyaskov/nevo-messaging.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ARyaskov/nevo-messaging/issues"
+  },
+  "homepage": "https://github.com/ARyaskov/nevo-messaging#readme"
+}
