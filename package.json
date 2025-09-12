@@ -1,6 +1,6 @@
 {
   "name": "@riaskov/nevo-messaging",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Microservices messaging framework for NestJS with Kafka transport",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -60,5 +60,5 @@
   "bugs": {
     "url": "https://github.com/ARyaskov/nevo-messaging/issues"
   },
-  "homepage": "https://github.com/ARyaskov/nevo-messaging#readme"
+  "homepage": "https://aryaskov.github.io/nevo-messaging/"
 }
