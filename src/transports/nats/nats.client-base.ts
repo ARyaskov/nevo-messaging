@@ -1,9 +1,9 @@
-import { NevoKafkaClient } from "./nevo-kafka.client"
+import { NevoNatsClient } from "./nevo-nats.client"
 
-export abstract class KafkaClientBase {
-  protected readonly universalClient: NevoKafkaClient
+export abstract class NatsClientBase {
+  protected readonly universalClient: NevoNatsClient
 
-  protected constructor(universalClient: NevoKafkaClient) {
+  protected constructor(universalClient: NevoNatsClient) {
     this.universalClient = universalClient
   }
 
@@ -26,8 +26,8 @@ export abstract class KafkaClientBase {
   protected async subscribe<T = any>(
     serviceName: string,
     method: string,
-    options: Parameters<NevoKafkaClient["subscribe"]>[2],
-    handler: Parameters<NevoKafkaClient["subscribe"]>[3]
+    options: Parameters<NevoNatsClient["subscribe"]>[2],
+    handler: Parameters<NevoNatsClient["subscribe"]>[3]
   ) {
     return this.universalClient.subscribe<T>(serviceName, method, options, handler)
   }

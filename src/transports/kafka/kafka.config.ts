@@ -1,10 +1,12 @@
 import { Transport } from "@nestjs/microservices"
 import { Partitioners } from "kafkajs"
 import { NevoKafkaClient } from "./nevo-kafka.client"
+import { DEFAULT_BROADCAST_TOPIC, DEFAULT_DISCOVERY_TOPIC, DEFAULT_SUBSCRIPTION_SUFFIX } from "../../common"
 
 export interface KafkaClientFactoryOptions {
   clientIdPrefix: string
   groupIdPrefix?: string
+  serviceName?: string
   sessionTimeout?: number
   allowAutoTopicCreation?: boolean
   retryAttempts?: number
@@ -12,6 +14,12 @@ export interface KafkaClientFactoryOptions {
   kafkaHost?: string
   kafkaPort?: string
   debug?: boolean
+  authToken?: string
+  discovery?: {
+    enabled?: boolean
+    heartbeatIntervalMs?: number
+    ttlMs?: number
+  }
 }
 
 async function createKafkaTopics(serviceNames: string[], options: KafkaClientFactoryOptions): Promise<void> {
@@ -44,6 +52,7 @@ async function createKafkaTopics(serviceNames: string[], options: KafkaClientFac
       const normalizedServiceName = serviceName.toLowerCase()
       const eventsTopic = `${normalizedServiceName}-events`
       const replyTopic = `${eventsTopic}.reply`
+      const subscriptionTopic = `${normalizedServiceName}${DEFAULT_SUBSCRIPTION_SUFFIX}`
 
       const topics = []
 
@@ -73,8 +82,46 @@ async function createKafkaTopics(serviceNames: string[], options: KafkaClientFac
         })
       }
 
+      if (!existingTopics.includes(subscriptionTopic)) {
+        topics.push({
+          topic: subscriptionTopic,
+          numPartitions: 3,
+          replicationFactor: 1,
+          configEntries: [
+            { name: "cleanup.policy", value: "delete" },
+            { name: "retention.ms", value: "86400000" },
+            { name: "max.message.bytes", value: "1000012" }
+          ]
+        })
+      }
+
       return topics
     })
+
+    if (!existingTopics.includes(DEFAULT_BROADCAST_TOPIC)) {
+      topicsToCreate.push({
+        topic: DEFAULT_BROADCAST_TOPIC,
+        numPartitions: 3,
+        replicationFactor: 1,
+        configEntries: [
+          { name: "cleanup.policy", value: "delete" },
+          { name: "retention.ms", value: "86400000" },
+          { name: "max.message.bytes", value: "1000012" }
+        ]
+      })
+    }
+
+    if (!existingTopics.includes(DEFAULT_DISCOVERY_TOPIC)) {
+      topicsToCreate.push({
+        topic: DEFAULT_DISCOVERY_TOPIC,
+        numPartitions: 1,
+        replicationFactor: 1,
+        configEntries: [
+          { name: "cleanup.policy", value: "compact" },
+          { name: "retention.ms", value: "86400000" }
+        ]
+      })
+    }
 
     if (topicsToCreate.length > 0) {
       console.log(
@@ -137,7 +184,12 @@ export const createNevoKafkaClient = (serviceNames: string[], options: KafkaClie
     retryAttempts: 3,
     brokerRetryTimeout: 1000,
     debug: false,
-    timeoutMs: 20000
+    timeoutMs: 20000,
+    discovery: {
+      enabled: true,
+      heartbeatIntervalMs: 5000,
+      ttlMs: 15000
+    }
   }
 
   const mergedOptions = { ...defaultOptions, ...options }
@@ -208,7 +260,11 @@ export const createNevoKafkaClient = (serviceNames: string[], options: KafkaClie
 
       return new NevoKafkaClient(kafkaClient, serviceNames, {
         timeoutMs: mergedOptions.timeoutMs,
-        debug: mergedOptions.debug
+        debug: mergedOptions.debug,
+        serviceName: mergedOptions.serviceName || mergedOptions.clientIdPrefix,
+        authToken: mergedOptions.authToken,
+        brokers: [`${host}:${port}`],
+        discovery: mergedOptions.discovery
       })
     }
   }

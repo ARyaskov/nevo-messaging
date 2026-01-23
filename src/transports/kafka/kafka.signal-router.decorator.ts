@@ -21,7 +21,8 @@ export function KafkaSignalRouter(serviceType: Type<any> | Type<any>[], options?
       return {
         method: messageData.method,
         params: messageData.params,
-        uuid: messageData.uuid
+        uuid: messageData.uuid,
+        meta: messageData.meta
       }
     },
     (target, eventPattern, handlerName) => {

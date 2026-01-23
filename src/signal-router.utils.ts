@@ -1,5 +1,7 @@
 import { Type } from "@nestjs/common"
-import { BeforeHook, AfterHook, stringifyWithBigInt, parseWithBigInt, serializeBigInt } from "./common"
+import { BeforeHook, AfterHook, stringifyWithBigInt, serializeBigInt, AccessControlConfig, MessageMeta } from "./common"
+import { createAccessDeniedError, extractCallerService, isAccessAllowed, logAccessDenied } from "./common/access-control"
+import { ErrorCode } from "./common"
 import { getClassSignals } from "./signal.decorator"
 
 export interface SignalRouterOptions {
@@ -7,12 +9,14 @@ export interface SignalRouterOptions {
   after?: AfterHook
   debug?: boolean
   eventPattern?: string
+  accessControl?: AccessControlConfig
 }
 
 export interface MessageData {
   method: string
   params: any
   uuid: string
+  meta?: MessageMeta
 }
 
 export type MessageExtractor = (data: any) => MessageData
@@ -48,6 +52,59 @@ export function createErrorResponse(message: string, uuid?: string, method?: str
   }
 }
 
+function levenshteinDistance(a: string, b: string): number {
+  if (a === b) {
+    return 0
+  }
+  if (!a.length) {
+    return b.length
+  }
+  if (!b.length) {
+    return a.length
+  }
+
+  const matrix: number[][] = Array.from({ length: a.length + 1 }, () => [])
+
+  for (let i = 0; i <= a.length; i++) {
+    matrix[i][0] = i
+  }
+  for (let j = 0; j <= b.length; j++) {
+    matrix[0][j] = j
+  }
+
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1
+      matrix[i][j] = Math.min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j - 1] + cost)
+    }
+  }
+
+  return matrix[a.length][b.length]
+}
+
+function suggestClosestMethod(method: string, candidates: string[]): string | null {
+  if (!candidates.length) {
+    return null
+  }
+
+  const normalized = method.toLowerCase()
+  let best: { name: string; score: number } | null = null
+
+  for (const candidate of candidates) {
+    const score = levenshteinDistance(normalized, candidate.toLowerCase())
+    if (!best || score < best.score) {
+      best = { name: candidate, score }
+    }
+  }
+
+  if (!best) {
+    return null
+  }
+
+  const threshold = Math.max(2, Math.floor(method.length * 0.4))
+  return best.score <= threshold ? best.name : null
+}
+
 export function createSignalRouterDecorator(
   serviceType: Type<any> | Type<any>[],
   options: SignalRouterOptions = {},
@@ -68,7 +125,7 @@ export function createSignalRouterDecorator(
         }
 
         const messageData = messageExtractor(data)
-        const { method, params, uuid } = messageData
+        const { method, params, uuid, meta } = messageData
 
         if (!method) {
           console.error("Missing 'method' field in message")
@@ -85,6 +142,22 @@ export function createSignalRouterDecorator(
           return createErrorResponse("Service not found", uuid, method)
         }
 
+        const callerService = extractCallerService(meta)
+        const topic = eventPattern
+
+        if (!isAccessAllowed(options.accessControl, topic, method, callerService)) {
+          logAccessDenied(options.accessControl, { topic, method, serviceName: eventPattern, callerService })
+          return {
+            uuid,
+            method,
+            params: {
+              result: "error",
+              error: createAccessDeniedError(method, eventPattern, callerService)
+            },
+            meta
+          }
+        }
+
         let processedParams = params
         if (options.before) {
           const hookResult = await options.before({
@@ -92,7 +165,8 @@ export function createSignalRouterDecorator(
             serviceName: eventPattern,
             uuid,
             rawData: data,
-            params
+            params,
+            meta
           })
           if (hookResult !== undefined) {
             processedParams = hookResult
@@ -104,7 +178,12 @@ export function createSignalRouterDecorator(
 
         if (!signalHandler) {
           console.error(`No handler found for method:`, method)
-          return createErrorResponse(`Method ${method} not found`, uuid, method)
+          const suggestion = suggestClosestMethod(
+            method,
+            signals.map((s) => s.signalName)
+          )
+          const message = suggestion ? `Invalid method name '${method}', did you mean '${suggestion}'?` : `Method ${method} not found`
+          return createErrorResponse(message, uuid, method)
         }
 
         let serviceInstance = null
@@ -139,7 +218,8 @@ export function createSignalRouterDecorator(
         let response = {
           uuid,
           method,
-          params: { result: serializedResult }
+          params: { result: serializedResult },
+          meta
         }
 
         if (options.after) {
@@ -150,7 +230,8 @@ export function createSignalRouterDecorator(
             rawData: data,
             params: processedParams,
             result: serializedResult,
-            response
+            response,
+            meta
           })
           if (hookResponse !== undefined) {
             response = hookResponse
@@ -161,7 +242,7 @@ export function createSignalRouterDecorator(
       } catch (error: any) {
         const errorMessage = error instanceof Error ? error.message : "Unknown error"
         console.error(`[${eventPattern}] Processing error:`, error)
-        return createErrorResponse(errorMessage, data.uuid, data.method, error.code)
+        return createErrorResponse(errorMessage, data.uuid, data.method, error.code || ErrorCode.UNKNOWN)
       }
     }
 

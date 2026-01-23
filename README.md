@@ -6,8 +6,13 @@ A powerful microservices messaging framework for NestJS 11+ with Kafka 4+ transp
 
 - 🚀 **Type-safe messaging** - Full TypeScript support with auto-completion
 - 🔄 **Dual communication patterns** - Both request-response (query) and fire-and-forget (emit)
+- 📡 **Subscriptions** - Publish/subscribe updates without direct requests
+- 📢 **Broadcast** - System-wide messages for all connected consumers
 - 🎯 **Signal-based routing** - Declarative method mapping with `@Signal` decorator
 - 📡 **Kafka transport** - Production-ready Apache Kafka integration
+- 🧭 **Service discovery** - Heartbeat-based registry topic
+- 🔐 **Access control** - Topic + method + service-level ACLs
+- 🔌 **Multiple transports** - Kafka, NATS, HTTP (SSE), Socket.IO
 - 🔧 **Auto-configuration** - Automatic topic creation and client setup
 - 🛡️ **Error handling** - Comprehensive error propagation and timeout management
 - 📊 **BigInt support** - Native handling of large integers across services
@@ -23,7 +28,7 @@ npm install @riaskov/nevo-messaging
 ### Peer Dependencies
 
 ```bash
-npm install @nestjs/common @nestjs/core @nestjs/microservices @nestjs/config @nestjs/platform-fastify kafkajs rxjs reflect-metadata
+npm install @nestjs/common @nestjs/core @nestjs/microservices @nestjs/config @nestjs/platform-fastify kafkajs nats socket.io socket.io-client rxjs reflect-metadata
 ```
 
 ## Quick Start
@@ -142,6 +147,38 @@ Use for events and notifications:
 
 ```typescript
 await this.emit("notifications", "user.created", { userId: 123n, email: "user@example.com" })
+```
+
+#### Subscription Pattern (Publish/Subscribe)
+Use when you want to receive updates without requesting:
+
+```typescript
+const sub = await this.subscribe("user", "user.updated", { ack: true }, async (msg, ctx) => {
+  await ctx.ack()
+})
+
+await sub.unsubscribe()
+```
+
+Publish updates:
+
+```typescript
+await this.publish("user", "user.updated", { userId: 123n })
+```
+
+#### Broadcast Pattern (System-Wide)
+Send to everyone connected to the broker:
+
+```typescript
+await this.broadcast("system.status", { ok: true })
+```
+
+Receive broadcast:
+
+```typescript
+await this.subscribe("__broadcast", "system.status", {}, (msg) => {
+  console.log("System status:", msg)
+})
 ```
 
 ## Advanced Usage
@@ -282,6 +319,65 @@ export class UserService extends KafkaClientBase {
 }
 ```
 
+### Method Suggestions (Did You Mean)
+
+If you call a method that doesn't exist, the framework returns a helpful error:
+
+```
+Invalid method name 'user.getByI', did you mean 'user.getById'?
+```
+
+This works for all transports.
+
+### Exponential Backoff (Client-Side)
+
+Clients apply a backoff for **in-flight requests** to avoid sending a duplicate query while the previous one is still being processed.
+
+```typescript
+createNevoKafkaClient(["USER"], {
+  clientIdPrefix: "frontend",
+  backoff: {
+    enabled: true,
+    baseMs: 100,
+    maxMs: 2000,
+    maxAttempts: 0, // 0 = wait until slot is free
+    jitter: true
+  }
+})
+```
+
+This prevents repeated sending of the same request while the service is busy (e.g., stopped on a breakpoint).
+
+### Access Control (ACL)
+
+Restrict who can read messages by topic + method + service:
+
+```typescript
+@KafkaSignalRouter([UserService], {
+  accessControl: {
+    rules: [
+      { topic: "user-events", method: "*", allow: ["frontend", "coordinator"] },
+      { topic: "user-events", method: "user.delete", deny: ["frontend"] }
+    ],
+    logDenied: true
+  }
+})
+export class UserController {}
+```
+
+By default, all services are allowed.
+
+### Service Discovery (Registry Topic)
+
+Each client sends heartbeats to `__nevo.discovery`. You can read the registry:
+
+```typescript
+const services = this.getDiscoveredServices()
+const isUserAvailable = this.isServiceAvailable("user")
+```
+
+Discovery is enabled by default for Kafka/NATS. HTTP and Socket.IO discovery are currently disabled.
+
 ## Configuration
 
 ### Environment Variables
@@ -304,7 +400,12 @@ createNevoKafkaClient(["USER", "INVENTORY", "NOTIFICATIONS"], {
   retryAttempts: 5,
   brokerRetryTimeout: 2000,
   timeoutMs: 25000,
-  debug: false
+  debug: false,
+  discovery: {
+    enabled: true,
+    heartbeatIntervalMs: 5000,
+    ttlMs: 15000
+  }
 })
 ```
 
@@ -322,6 +423,68 @@ createKafkaMicroservice({
     await app.get(DatabaseService).runMigrations()
   }
 })
+```
+
+## Transports
+
+### Kafka (default)
+Use `createKafkaMicroservice` + `KafkaSignalRouter` as before.
+
+### NATS
+Client factory:
+
+```typescript
+createNevoNatsClient(["USER", "COORDINATOR"], {
+  clientIdPrefix: "user",
+  servers: ["nats://127.0.0.1:4222"]
+})
+```
+
+Controller decorator:
+
+```typescript
+@NatsSignalRouter([UserService])
+export class UserController {}
+```
+
+### HTTP (SSE)
+HTTP uses plain POST for `query/emit` and SSE for `subscribe`.
+
+```typescript
+@HttpSignalRouter([UserService])
+export class UserController {}
+```
+
+Include transport controller to enable SSE + publish endpoints:
+
+```typescript
+controllers: [UserController, HttpTransportController]
+```
+
+Client:
+
+```typescript
+createNevoHttpClient(
+  { coordinator: "http://127.0.0.1:8091" },
+  { clientIdPrefix: "user" }
+)
+```
+
+### Socket.IO
+Socket.IO server is started inside the router decorator:
+
+```typescript
+@SocketSignalRouter([UserService], { serviceName: "user", port: 8093 })
+export class UserController {}
+```
+
+Client:
+
+```typescript
+createNevoSocketClient(
+  { coordinator: "http://127.0.0.1:8094" },
+  { clientIdPrefix: "user" }
+)
 ```
 
 ## BigInt Support
@@ -726,7 +889,12 @@ Base class for services that need to communicate with other microservices.
 **Methods:**
 - `query<T>(serviceName, method, params): Promise<T>` - Request-response communication
 - `emit(serviceName, method, params): Promise<void>` - Fire-and-forget communication
+- `publish(serviceName, method, params): Promise<void>` - Publish to subscriptions
+- `subscribe(serviceName, method, options, handler): Promise<Subscription>` - Subscribe to updates
+- `broadcast(method, params): Promise<void>` - System-wide broadcast
 - `getAvailableServices(): string[]` - List registered services
+- `getDiscoveredServices(): DiscoveryEntry[]` - Service registry snapshot
+- `isServiceAvailable(serviceName): boolean` - Availability check
 
 #### `NevoKafkaClient`
 
@@ -735,6 +903,9 @@ Universal Kafka client for multi-service communication.
 **Methods:**
 - `query<T>(serviceName, method, params): Promise<T>` - Send query to service
 - `emit(serviceName, method, params): Promise<void>` - Emit event to service
+- `publish(serviceName, method, params): Promise<void>` - Publish to subscriptions
+- `subscribe(serviceName, method, options, handler): Promise<Subscription>` - Subscribe to updates
+- `broadcast(method, params): Promise<void>` - System-wide broadcast
 - `getAvailableServices(): string[]` - Get list of available services
 
 ### Functions
@@ -746,6 +917,20 @@ Factory function for creating Kafka client providers.
 #### `createKafkaMicroservice(options)`
 
 Bootstrap function for starting NestJS microservices with Kafka transport.
+
+## Examples
+
+### Kafka
+- `examples/user` - standard Kafka microservice
+
+### NATS
+- `examples/nats-user` - NATS request/response + publish/subscribe + broadcast
+
+### HTTP (SSE)
+- `examples/http-user` - HTTP query/emit + SSE subscribe + broadcast + discovery
+
+### Socket.IO
+- `examples/socket-user` - Socket.IO transport with subscribe/broadcast
 
 ## Troubleshooting
 

@@ -9,10 +9,22 @@ export interface MessagePayload {
   value: string
 }
 
+export type MessageType = "query" | "emit" | "sub" | "broadcast" | "discovery"
+
+export interface MessageMeta {
+  type?: MessageType
+  service?: string
+  ts?: number
+  auth?: {
+    token?: string
+  }
+}
+
 export interface MessageRequest<T = unknown> {
   uuid: string
   method: string
   params: T
+  meta?: MessageMeta
 }
 
 export interface MessageResponse<T = unknown> {
@@ -22,6 +34,7 @@ export interface MessageResponse<T = unknown> {
     result: T | "error"
     error?: ErrorDetails
   }
+  meta?: MessageMeta
 }
 
 export interface ErrorDetails {
@@ -37,6 +50,7 @@ export interface HookContext {
   serviceName: string
   uuid: string
   rawData: unknown
+  meta?: MessageMeta
 }
 
 export interface BeforeHookContext extends HookContext {
@@ -70,18 +84,75 @@ export interface ServiceMethodMapping {
 
 export interface TransportClientOptions {
   clientId?: string
+  serviceName?: string
+  authToken?: string
   timeout?: number
   debug?: boolean
+  backoff?: {
+    enabled?: boolean
+    baseMs?: number
+    maxMs?: number
+    maxAttempts?: number
+    jitter?: boolean
+  }
+  discovery?: {
+    enabled?: boolean
+    heartbeatIntervalMs?: number
+    ttlMs?: number
+  }
   [key: string]: any
 }
 
 export interface TransportServerOptions {
   serviceName: string
   debug?: boolean
+  authToken?: string
   [key: string]: any
 }
 
 export interface MicroserviceConfig {
   serviceName: string
   clientName: string
+}
+
+export interface SubscriptionOptions {
+  ack?: boolean
+  durableKey?: string
+  groupId?: string
+  fromBeginning?: boolean
+}
+
+export interface SubscriptionContext {
+  ack(): Promise<void>
+  nack?(reason?: string): Promise<void>
+  meta: MessageMeta
+}
+
+export interface Subscription {
+  unsubscribe(): Promise<void>
+}
+
+export interface AccessRule {
+  topic?: string
+  method?: string
+  allow?: string[]
+  deny?: string[]
+}
+
+export interface AccessControlConfig {
+  rules?: AccessRule[]
+  allowAllByDefault?: boolean
+  logDenied?: boolean
+}
+
+export interface DiscoveryAnnouncement {
+  serviceName: string
+  clientId?: string
+  transport: string
+  ts: number
+  meta?: Record<string, unknown>
+}
+
+export interface DiscoveryEntry extends DiscoveryAnnouncement {
+  lastSeen: number
 }

@@ -1,11 +1,22 @@
 import { randomUUID } from "node:crypto"
 import { ErrorCode } from "../common"
 import { MessagingError } from "./errors"
-import { MessagePayload, MessageRequest, MicroserviceConfig, TransportClientOptions } from "./types"
+import {
+  MessagePayload,
+  MessageRequest,
+  MicroserviceConfig,
+  TransportClientOptions,
+  MessageType,
+  Subscription,
+  SubscriptionOptions,
+  SubscriptionContext
+} from "./types"
 
 export abstract class BaseMessagingClient {
   protected readonly options: TransportClientOptions
   protected readonly microservices: Map<string, string> = new Map()
+  protected readonly serviceName?: string
+  protected readonly authToken?: string
 
   protected constructor(options?: TransportClientOptions) {
     this.options = {
@@ -13,6 +24,8 @@ export abstract class BaseMessagingClient {
       debug: false,
       ...options
     }
+    this.serviceName = this.options.serviceName || this.options.clientId
+    this.authToken = this.options.authToken
   }
 
   protected registerMicroservices(configs: MicroserviceConfig[]): void {
@@ -43,9 +56,21 @@ export abstract class BaseMessagingClient {
     return this._emitToMicroservice(clientName, method, params)
   }
 
-  protected createMessagePayload(method: string, params: any): MessagePayload {
+  protected createMessagePayload(method: string, params: any, type: MessageType = "emit"): MessagePayload {
     const uuid = randomUUID()
-    const request: MessageRequest = { uuid, method, params }
+    const request: MessageRequest = {
+      uuid,
+      method,
+      params,
+      meta: {
+        type,
+        service: this.serviceName,
+        ts: Date.now(),
+        auth: {
+          token: this.authToken
+        }
+      }
+    }
 
     return {
       key: uuid,
@@ -55,4 +80,12 @@ export abstract class BaseMessagingClient {
 
   protected abstract _queryMicroservice<T>(clientName: string, method: string, params: any): Promise<T>
   protected abstract _emitToMicroservice(clientName: string, method: string, params: any): Promise<void>
+  protected abstract _publishToMicroservice(clientName: string, method: string, params: any): Promise<void>
+  protected abstract _broadcast(method: string, params: any): Promise<void>
+  protected abstract _subscribeToMicroservice<T>(
+    clientName: string,
+    method: string,
+    options: SubscriptionOptions | undefined,
+    handler: (data: T, context: SubscriptionContext) => Promise<void> | void
+  ): Promise<Subscription>
 }

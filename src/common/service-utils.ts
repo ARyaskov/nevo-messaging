@@ -72,6 +72,14 @@ export const createServiceClient = <T extends ServiceMethodMap>(serviceName: str
   // @ts-ignore
   emit: <M extends keyof T & string>(method: M, params: T[M]["params"]): Promise<void> => {
     throw new Error("Implementation required in subclass")
+  },
+  // @ts-ignore
+  publish: <M extends keyof T & string>(method: M, params: T[M]["params"]): Promise<void> => {
+    throw new Error("Implementation required in subclass")
+  },
+  // @ts-ignore
+  subscribe: <M extends keyof T & string>(method: M, handler: (data: T[M]["result"]) => void): Promise<void> => {
+    throw new Error("Implementation required in subclass")
   }
 })
 
