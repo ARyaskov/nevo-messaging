@@ -1,5 +1,13 @@
 import { Type } from "@nestjs/common"
-import { BeforeHook, AfterHook, stringifyWithBigInt, serializeBigInt, AccessControlConfig, MessageMeta } from "./common"
+import {
+  BeforeHook,
+  AfterHook,
+  stringifyWithBigInt,
+  serializeBigInt,
+  AccessControlConfig,
+  MessageMeta,
+  MessageResponse
+} from "./common"
 import { createAccessDeniedError, extractCallerService, isAccessAllowed, logAccessDenied } from "./common/access-control"
 import { ErrorCode } from "./common"
 import { getClassSignals } from "./signal.decorator"
@@ -215,7 +223,7 @@ export function createSignalRouterDecorator(
           console.log(`[${eventPattern}] Result:`, stringifyWithBigInt(serializedResult))
         }
 
-        let response = {
+        let response: MessageResponse = {
           uuid,
           method,
           params: { result: serializedResult },
