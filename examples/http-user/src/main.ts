@@ -1,13 +1,11 @@
-import { NestFactory } from "@nestjs/core"
-import { FastifyAdapter, NestFastifyApplication } from "@nestjs/platform-fastify"
+import { createHttpMicroservice } from "@riaskov/nevo-messaging"
 import { AppModule } from "./app.module"
 
-async function bootstrap() {
-  const app = await NestFactory.create<NestFastifyApplication>(AppModule, new FastifyAdapter())
-  await app.listen(8090, "0.0.0.0")
-  console.log("HTTP user service listening on http://localhost:8090")
-}
-
-bootstrap().catch((error) => {
+createHttpMicroservice({
+  microserviceName: "user",
+  module: AppModule,
+  port: 8090,
+  host: "0.0.0.0"
+}).catch((error) => {
   console.error(error)
 })

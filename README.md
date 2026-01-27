@@ -114,15 +114,14 @@ Start your service:
 
 ```typescript
 // main.ts
-import { NestFactory } from "@nestjs/core"
+import { createNatsMicroservice } from "@riaskov/nevo-messaging"
 import { AppModule } from "./app.module"
 
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule)
-  await app.listen(8086)
-}
-
-bootstrap()
+createNatsMicroservice({
+  microserviceName: "user",
+  module: AppModule,
+  port: 8086
+}).then()
 ```
 ## Core Concepts
 
@@ -426,6 +425,14 @@ createKafkaMicroservice({
 })
 ```
 
+Same options apply to:
+
+```typescript
+createNatsMicroservice({ microserviceName: "user", module: AppModule, port: 8087 }).then()
+createSocketMicroservice({ microserviceName: "user", module: AppModule, port: 8088 }).then()
+createHttpMicroservice({ microserviceName: "user", module: AppModule, port: 8089 }).then()
+```
+
 ## Transports
 
 | Transport | Patterns | Discovery | Infra | Notes |
@@ -445,6 +452,12 @@ createNevoNatsClient(["USER", "COORDINATOR"], {
 })
 ```
 
+Quick bootstrap:
+
+```typescript
+createNatsMicroservice({ microserviceName: "user", module: AppModule, port: 8087 }).then()
+```
+
 Controller decorator:
 
 ```typescript
@@ -461,6 +474,12 @@ Socket.IO server is started inside the router decorator:
 ```typescript
 @SocketSignalRouter([UserService], { serviceName: "user", port: 8093 })
 export class UserController {}
+```
+
+Quick bootstrap:
+
+```typescript
+createSocketMicroservice({ microserviceName: "user", module: AppModule, port: 8092 }).then()
 ```
 
 Client:
@@ -484,6 +503,12 @@ Include transport controller to enable SSE + publish endpoints:
 
 ```typescript
 controllers: [UserController, HttpTransportController]
+```
+
+Quick bootstrap:
+
+```typescript
+createHttpMicroservice({ microserviceName: "user", module: AppModule, port: 8090 }).then()
 ```
 
 Client:

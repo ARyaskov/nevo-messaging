@@ -1,16 +1,8 @@
-import { INestApplication, Type } from "@nestjs/common"
+import { INestApplication } from "@nestjs/common"
 import { NestFactory } from "@nestjs/core"
 import { FastifyAdapter, NestFastifyApplication } from "@nestjs/platform-fastify"
 import { MicroserviceOptions, Transport } from "@nestjs/microservices"
-
-export interface NestApplicationOptions {
-  microserviceName: string
-  module: Type<any>
-  port?: number
-  host?: string
-  debug?: boolean
-  onInit?: (app: INestApplication) => Promise<void>
-}
+import { NestApplicationOptions } from "../microservice.options"
 
 export async function createKafkaMicroservice(options: NestApplicationOptions): Promise<INestApplication> {
   // @ts-ignore
