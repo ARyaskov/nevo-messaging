@@ -6,6 +6,15 @@ import { getNatsModule } from "../optional-deps"
 
 export interface NatsSignalRouterOptions extends SignalRouterOptions {
   servers?: string[]
+  reconnect?: {
+    enabled?: boolean
+    maxAttempts?: number
+    timeWaitMs?: number
+    jitterMs?: number
+    jitterTlsMs?: number
+    waitOnFirstConnect?: boolean
+    lazyConnect?: boolean
+  }
 }
 
 export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?: NatsSignalRouterOptions) {
@@ -32,7 +41,21 @@ export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?:
         await originalOnModuleInit.call(this)
 
         const servers = options?.servers && options.servers.length > 0 ? options.servers : ["nats://127.0.0.1:4222"]
-        const nc: NatsConnection = await connect({ servers })
+        const reconnectEnabled = options?.reconnect?.enabled !== false
+        const maxAttempts = options?.reconnect?.maxAttempts ?? -1
+        const timeWaitMs = options?.reconnect?.timeWaitMs ?? 5000
+        const jitterMs = options?.reconnect?.jitterMs
+        const jitterTlsMs = options?.reconnect?.jitterTlsMs
+        const lazyConnect = options?.reconnect?.lazyConnect === true
+        const waitOnFirstConnect = options?.reconnect?.waitOnFirstConnect ?? !lazyConnect
+        const nc: NatsConnection = await connect({
+          servers,
+          maxReconnectAttempts: reconnectEnabled ? maxAttempts : 0,
+          reconnectTimeWait: timeWaitMs,
+          reconnectJitter: jitterMs,
+          reconnectJitterTLS: jitterTlsMs,
+          waitOnFirstConnect
+        })
         this.natsConnection = nc
 
         const sub: Subscription = nc.subscribe(eventPattern)

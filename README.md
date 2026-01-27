@@ -446,6 +446,20 @@ createSocketMicroservice({ microserviceName: "user", module: AppModule, port: 80
 createHttpMicroservice({ microserviceName: "user", module: AppModule, port: 8089 }).then()
 ```
 
+NATS reconnect + lazy connect:
+
+```typescript
+createNevoNatsClient(["COORDINATOR"], {
+  clientIdPrefix: "user",
+  servers: ["nats://127.0.0.1:4222"],
+  reconnect: {
+    timeWaitMs: 5000,
+    maxAttempts: -1,
+    lazyConnect: true
+  }
+})
+```
+
 ## Transports
 
 | Transport | Patterns | Discovery | Infra | Notes |
@@ -461,7 +475,12 @@ Client factory:
 ```typescript
 createNevoNatsClient(["USER", "COORDINATOR"], {
   clientIdPrefix: "user",
-  servers: ["nats://127.0.0.1:4222"]
+  servers: ["nats://127.0.0.1:4222"],
+  reconnect: {
+    timeWaitMs: 5000,
+    maxAttempts: -1,
+    lazyConnect: true
+  }
 })
 ```
 
