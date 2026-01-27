@@ -24,6 +24,15 @@ export interface NevoNatsClientOptions {
   debug?: boolean
   serviceName?: string
   authToken?: string
+  reconnect?: {
+    enabled?: boolean
+    maxAttempts?: number
+    timeWaitMs?: number
+    jitterMs?: number
+    jitterTlsMs?: number
+    waitOnFirstConnect?: boolean
+    lazyConnect?: boolean
+  }
   backoff?: {
     enabled?: boolean
     baseMs?: number
@@ -84,8 +93,20 @@ export class NevoNatsClient {
 
   static async create(serviceNames: string[], options?: NevoNatsClientOptions): Promise<NevoNatsClient> {
     const { connect } = getNatsModule()
+    const reconnectEnabled = options?.reconnect?.enabled !== false
+    const maxAttempts = options?.reconnect?.maxAttempts ?? -1
+    const timeWaitMs = options?.reconnect?.timeWaitMs ?? 5000
+    const jitterMs = options?.reconnect?.jitterMs
+    const jitterTlsMs = options?.reconnect?.jitterTlsMs
+    const lazyConnect = options?.reconnect?.lazyConnect === true
+    const waitOnFirstConnect = options?.reconnect?.waitOnFirstConnect ?? !lazyConnect
     const nc = await connect({
-      servers: options?.servers && options.servers.length > 0 ? options.servers : ["nats://127.0.0.1:4222"]
+      servers: options?.servers && options.servers.length > 0 ? options.servers : ["nats://127.0.0.1:4222"],
+      maxReconnectAttempts: reconnectEnabled ? maxAttempts : 0,
+      reconnectTimeWait: timeWaitMs,
+      reconnectJitter: jitterMs,
+      reconnectJitterTLS: jitterTlsMs,
+      waitOnFirstConnect
     })
     return new NevoNatsClient(nc, serviceNames, options)
   }
@@ -298,7 +319,11 @@ export class NevoNatsClient {
         transport: "nats",
         ts: Date.now()
       }
-      this.nc.publish(DEFAULT_DISCOVERY_TOPIC, this.codec.encode(stringifyWithBigInt(announcement)))
+      try {
+        this.nc.publish(DEFAULT_DISCOVERY_TOPIC, this.codec.encode(stringifyWithBigInt(announcement)))
+      } catch (error) {
+        console.error("[NevoNatsClient] Discovery publish failed", error)
+      }
     }, this.discoveryHeartbeatIntervalMs)
   }
 }

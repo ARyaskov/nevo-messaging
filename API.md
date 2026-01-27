@@ -26,7 +26,7 @@ Common options for all signal routers.
 
 ### `@NatsSignalRouter(serviceTypes, options?)`
 
-**Options:** `SignalRouterOptions` + `servers?: string[]`
+**Options:** `SignalRouterOptions` + `servers?: string[]` + `reconnect?: { enabled?, maxAttempts?, timeWaitMs?, jitterMs?, jitterTlsMs?, waitOnFirstConnect?, lazyConnect? }`
 
 ### `@KafkaSignalRouter(serviceTypes, options?)`
 
@@ -48,6 +48,15 @@ Common options for all signal routers.
 - `NatsClientBase` - base class with the same protected methods
 - `createNevoNatsClient(serviceNames, options)` - Nest provider (`NEVO_NATS_CLIENT`)
 - `createNatsMicroservice(options)` - Nest bootstrap for NATS transport
+
+`NevoNatsClientOptions.reconnect`:
+- `enabled?: boolean` (default `true`)
+- `maxAttempts?: number` (default `-1`)
+- `timeWaitMs?: number` (default `5000`)
+- `jitterMs?: number`
+- `jitterTlsMs?: number`
+- `waitOnFirstConnect?: boolean`
+- `lazyConnect?: boolean` (if `true`, sets `waitOnFirstConnect` to `false` by default)
 
 ### Kafka
 
