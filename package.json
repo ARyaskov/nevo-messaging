@@ -1,6 +1,6 @@
 {
   "name": "@riaskov/nevo-messaging",
-  "version": "1.1.3",
+  "version": "1.1.4",
   "description": "Microservices messaging framework for NestJS with NATS/Kafka/SocketIO transport",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -34,6 +34,20 @@
     "reflect-metadata": "^0.2.2",
     "socket.io": "^4.8.1",
     "socket.io-client": "^4.8.1"
+  },
+  "peerDependenciesMeta": {
+    "kafkajs": {
+      "optional": true
+    },
+    "nats": {
+      "optional": true
+    },
+    "socket.io": {
+      "optional": true
+    },
+    "socket.io-client": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@nestjs/common": "11.1.0",

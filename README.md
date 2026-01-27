@@ -28,7 +28,20 @@ npm install @riaskov/nevo-messaging
 ### Peer Dependencies
 
 ```bash
-npm install @nestjs/common @nestjs/core @nestjs/microservices @nestjs/config @nestjs/platform-fastify kafkajs nats socket.io socket.io-client rxjs reflect-metadata
+npm install @nestjs/common @nestjs/core @nestjs/microservices @nestjs/config @nestjs/platform-fastify rxjs reflect-metadata
+```
+
+Transport-specific deps (install only what you use):
+
+```bash
+# Kafka
+npm install kafkajs
+
+# NATS
+npm install nats
+
+# Socket.IO
+npm install socket.io socket.io-client
 ```
 
 ## Quick Start
