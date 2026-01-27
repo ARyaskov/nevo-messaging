@@ -1,6 +1,6 @@
 # Nevo Messaging
 
-A powerful microservices messaging framework for NestJS 11+ with Kafka 4+ transport, designed for building scalable distributed systems with type-safe inter-service communication.
+A powerful microservices messaging framework for NestJS 11+ with multi-transport support (NATS, Kafka, Socket.IO, HTTP/SSE), designed for building scalable distributed systems with type-safe inter-service communication.
 
 ## Features
 
@@ -12,7 +12,7 @@ A powerful microservices messaging framework for NestJS 11+ with Kafka 4+ transp
 - 📡 **Kafka transport** - Production-ready Apache Kafka integration
 - 🧭 **Service discovery** - Heartbeat-based registry topic
 - 🔐 **Access control** - Topic + method + service-level ACLs
-- 🔌 **Multiple transports** - Kafka, NATS, HTTP (SSE), Socket.IO
+- 🔌 **Multiple transports** - NATS, Kafka, Socket.IO, HTTP (SSE)
 - 🔧 **Auto-configuration** - Automatic topic creation and client setup
 - 🛡️ **Error handling** - Comprehensive error propagation and timeout management
 - 📊 **BigInt support** - Native handling of large integers across services
@@ -33,18 +33,18 @@ npm install @nestjs/common @nestjs/core @nestjs/microservices @nestjs/config @ne
 
 ## Quick Start
 
-### 1. Basic Service Setup
+### 1. Basic Service Setup (NATS)
 
 Create a simple microservice that responds to messages:
 
 ```typescript
 // user.service.ts
 import { Injectable, Inject } from "@nestjs/common"
-import { KafkaClientBase, NevoKafkaClient } from "@riaskov/nevo-messaging"
+import { NatsClientBase, NevoNatsClient } from "@riaskov/nevo-messaging"
 
 @Injectable()
-export class UserService extends KafkaClientBase {
-  constructor(@Inject("NEVO_KAFKA_CLIENT") nevoClient: NevoKafkaClient) {
+export class UserService extends NatsClientBase {
+  constructor(@Inject("NEVO_NATS_CLIENT") nevoClient: NevoNatsClient) {
     super(nevoClient)
   }
 
@@ -66,11 +66,11 @@ Map service methods to external signals using the `@Signal` decorator:
 ```typescript
 // user.controller.ts
 import { Controller, Inject } from "@nestjs/common"
-import { KafkaSignalRouter, Signal } from "@riaskov/nevo-messaging"
+import { NatsSignalRouter, Signal } from "@riaskov/nevo-messaging"
 import { UserService } from "./user.service"
 
 @Controller()
-@KafkaSignalRouter([UserService])
+@NatsSignalRouter([UserService])
 export class UserController {
   constructor(@Inject(UserService) private readonly userService: UserService) {}
 
@@ -84,13 +84,13 @@ export class UserController {
 
 ### 3. Module Configuration
 
-Configure the module with Kafka client:
+Configure the module with the NATS client:
 
 ```typescript
 // user.module.ts
 import { Module } from "@nestjs/common"
 import { ConfigModule } from "@nestjs/config"
-import { createNevoKafkaClient } from "@riaskov/nevo-messaging"
+import { createNevoNatsClient } from "@riaskov/nevo-messaging"
 import { UserController } from "./user.controller"
 import { UserService } from "./user.service"
 
@@ -99,8 +99,9 @@ import { UserService } from "./user.service"
   controllers: [UserController],
   providers: [
     UserService,
-    createNevoKafkaClient(["COORDINATOR"], {
-      clientIdPrefix: "user"
+    createNevoNatsClient(["COORDINATOR"], {
+      clientIdPrefix: "user",
+      servers: ["nats://127.0.0.1:4222"]
     })
   ]
 })
@@ -109,20 +110,20 @@ export class UserModule {}
 
 ### 4. Application Bootstrap
 
-Start your microservice:
+Start your service:
 
 ```typescript
 // main.ts
-import { createKafkaMicroservice } from "@riaskov/nevo-messaging"
+import { NestFactory } from "@nestjs/core"
 import { AppModule } from "./app.module"
 
-createKafkaMicroservice({
-  microserviceName: "user",
-  module: AppModule,
-  port: 8086
-}).then()
-```
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule)
+  await app.listen(8086)
+}
 
+bootstrap()
+```
 ## Core Concepts
 
 ### Signal Routing
@@ -376,7 +377,7 @@ const services = this.getDiscoveredServices()
 const isUserAvailable = this.isServiceAvailable("user")
 ```
 
-Discovery is enabled by default for Kafka/NATS. HTTP and Socket.IO discovery are currently disabled.
+Discovery is enabled by default for Kafka/NATS. HTTP and Socket.IO discovery are available when enabled (HTTP requires `discoveryUrl`).
 
 ## Configuration
 
@@ -427,10 +428,14 @@ createKafkaMicroservice({
 
 ## Transports
 
-### Kafka (default)
-Use `createKafkaMicroservice` + `KafkaSignalRouter` as before.
+| Transport | Patterns | Discovery | Infra | Notes |
+| --- | --- | --- | --- | --- |
+| NATS | query/emit/publish/subscribe/broadcast | on by default | NATS server | Lowest latency, simple ops |
+| Kafka | query/emit/publish/subscribe/broadcast | on by default | Kafka broker | Durable log, topic setup |
+| Socket.IO | query/emit/publish/subscribe/broadcast | optional | Socket.IO server | WebSocket-friendly apps |
+| HTTP (SSE) | query/emit + SSE subscribe/broadcast | optional | HTTP server | Simple HTTP/SSE integration |
 
-### NATS
+### NATS (priority)
 Client factory:
 
 ```typescript
@@ -445,6 +450,26 @@ Controller decorator:
 ```typescript
 @NatsSignalRouter([UserService])
 export class UserController {}
+```
+
+### Kafka
+Use `createKafkaMicroservice` + `KafkaSignalRouter` as before.
+
+### Socket.IO
+Socket.IO server is started inside the router decorator:
+
+```typescript
+@SocketSignalRouter([UserService], { serviceName: "user", port: 8093 })
+export class UserController {}
+```
+
+Client:
+
+```typescript
+createNevoSocketClient(
+  { coordinator: "http://127.0.0.1:8094" },
+  { clientIdPrefix: "user" }
+)
 ```
 
 ### HTTP (SSE)
@@ -469,24 +494,6 @@ createNevoHttpClient(
   { clientIdPrefix: "user" }
 )
 ```
-
-### Socket.IO
-Socket.IO server is started inside the router decorator:
-
-```typescript
-@SocketSignalRouter([UserService], { serviceName: "user", port: 8093 })
-export class UserController {}
-```
-
-Client:
-
-```typescript
-createNevoSocketClient(
-  { coordinator: "http://127.0.0.1:8094" },
-  { clientIdPrefix: "user" }
-)
-```
-
 ## BigInt Support
 
 The framework automatically handles BigInt serialization across service boundaries:
@@ -860,78 +867,21 @@ createNevoKafkaClient(["HIGH_VOLUME_SERVICE"], {
 
 ## API Reference
 
-### Decorators
-
-#### `@Signal(signalName, methodName?, paramTransformer?, resultTransformer?)`
-
-Maps external signals to service methods.
-
-**Parameters:**
-- `signalName` (string): External signal identifier
-- `methodName` (string, optional): Service method name (defaults to signalName)
-- `paramTransformer` (function, optional): Transform incoming parameters
-- `resultTransformer` (function, optional): Transform outgoing results
-
-#### `@KafkaSignalRouter(serviceTypes, options?)`
-
-Class decorator for signal routing setup.
-
-**Parameters:**
-- `serviceTypes` (Type<any> | Type<any>[]): Service classes to route to
-- `options` (object, optional): Configuration options
-
-### Classes
-
-#### `KafkaClientBase`
-
-Base class for services that need to communicate with other microservices.
-
-**Methods:**
-- `query<T>(serviceName, method, params): Promise<T>` - Request-response communication
-- `emit(serviceName, method, params): Promise<void>` - Fire-and-forget communication
-- `publish(serviceName, method, params): Promise<void>` - Publish to subscriptions
-- `subscribe(serviceName, method, options, handler): Promise<Subscription>` - Subscribe to updates
-- `broadcast(method, params): Promise<void>` - System-wide broadcast
-- `getAvailableServices(): string[]` - List registered services
-- `getDiscoveredServices(): DiscoveryEntry[]` - Service registry snapshot
-- `isServiceAvailable(serviceName): boolean` - Availability check
-
-#### `NevoKafkaClient`
-
-Universal Kafka client for multi-service communication.
-
-**Methods:**
-- `query<T>(serviceName, method, params): Promise<T>` - Send query to service
-- `emit(serviceName, method, params): Promise<void>` - Emit event to service
-- `publish(serviceName, method, params): Promise<void>` - Publish to subscriptions
-- `subscribe(serviceName, method, options, handler): Promise<Subscription>` - Subscribe to updates
-- `broadcast(method, params): Promise<void>` - System-wide broadcast
-- `getAvailableServices(): string[]` - Get list of available services
-
-### Functions
-
-#### `createNevoKafkaClient(serviceNames, options)`
-
-Factory function for creating Kafka client providers.
-
-#### `createKafkaMicroservice(options)`
-
-Bootstrap function for starting NestJS microservices with Kafka transport.
+See `API.md`.
 
 ## Examples
-
-### Kafka
-- `examples/user` - standard Kafka microservice
 
 ### NATS
 - `examples/nats-user` - NATS request/response + publish/subscribe + broadcast
 
-### HTTP (SSE)
-- `examples/http-user` - HTTP query/emit + SSE subscribe + broadcast + discovery
+### Kafka
+- `examples/user` - standard Kafka microservice
 
 ### Socket.IO
 - `examples/socket-user` - Socket.IO transport with subscribe/broadcast
 
+### HTTP (SSE)
+- `examples/http-user` - HTTP query/emit + SSE subscribe + broadcast + discovery
 ## Troubleshooting
 
 ### Common Issues
