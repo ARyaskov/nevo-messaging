@@ -47,6 +47,7 @@ Common options for all signal routers.
 - `NevoNatsClient` (methods: `query`, `emit`, `publish`, `subscribe`, `broadcast`, `getAvailableServices`, `getDiscoveredServices`, `isServiceAvailable`)
 - `NatsClientBase` - base class with the same protected methods
 - `createNevoNatsClient(serviceNames, options)` - Nest provider (`NEVO_NATS_CLIENT`)
+- `createNatsMicroservice(options)` - Nest bootstrap for NATS transport
 
 ### Kafka
 
@@ -60,12 +61,14 @@ Common options for all signal routers.
 - `NevoSocketClient` (methods: `query`, `emit`, `publish`, `subscribe`, `broadcast`, `getAvailableServices`, `getDiscoveredServices`, `isServiceAvailable`)
 - `SocketClientBase` - base class with the same protected methods
 - `createNevoSocketClient(serviceUrls, options)` - Nest provider (`NEVO_SOCKET_CLIENT`)
+- `createSocketMicroservice(options)` - Nest bootstrap for Socket.IO transport
 
 ### HTTP (SSE)
 
 - `NevoHttpClient` (methods: `query`, `emit`, `publish`, `subscribe`, `broadcast`, `getAvailableServices`, `getDiscoveredServices`, `isServiceAvailable`)
 - `HttpClientBase` - base class with the same protected methods
 - `createNevoHttpClient(serviceUrls, options)` - Nest provider (`NEVO_HTTP_CLIENT`)
+- `createHttpMicroservice(options)` - Nest bootstrap for HTTP transport
 - `HttpTransportController` - adds HTTP/SSE endpoints:
   - `POST /:service-events` for query/emit
   - `POST /__nevo/publish` and `GET /__nevo/subscribe` for subscriptions
