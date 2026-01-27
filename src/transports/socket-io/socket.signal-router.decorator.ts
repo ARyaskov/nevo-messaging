@@ -1,8 +1,8 @@
 import { Type } from "@nestjs/common"
 import { createServer, Server as HttpServer } from "node:http"
-import { Server as SocketServer } from "socket.io"
 import { createSignalRouterDecorator, SignalRouterOptions } from "../../signal-router.utils"
 import { DEFAULT_DISCOVERY_TOPIC, DEFAULT_SUBSCRIPTION_SUFFIX, stringifyWithBigInt } from "../../common"
+import { getSocketIoModule } from "../optional-deps"
 
 export interface SocketSignalRouterOptions extends SignalRouterOptions {
   port?: number
@@ -40,6 +40,7 @@ export function SocketSignalRouter(serviceType: Type<any> | Type<any>[], options
         const port = options?.port || 3100
         const path = options?.path || "/socket.io"
         const httpServer: HttpServer = createServer()
+        const { Server: SocketServer } = getSocketIoModule()
         const io = new SocketServer(httpServer, {
           path,
           cors: options?.cors || { origin: "*" }

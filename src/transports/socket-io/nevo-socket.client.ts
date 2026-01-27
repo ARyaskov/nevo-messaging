@@ -1,4 +1,4 @@
-import { io, Socket } from "socket.io-client"
+import type { Socket } from "socket.io-client"
 import {
   DEFAULT_BROADCAST_TOPIC,
   DEFAULT_DISCOVERY_TOPIC,
@@ -16,6 +16,7 @@ import {
   SubscriptionOptions
 } from "../../common"
 import { randomUUID } from "node:crypto"
+import { getSocketIoClientModule } from "../optional-deps"
 
 export interface NevoSocketClientOptions {
   timeoutMs?: number
@@ -116,6 +117,7 @@ export class NevoSocketClient {
 
     let socket = this.sockets.get(normalized)
     if (!socket) {
+      const { io } = getSocketIoClientModule()
       socket = io(url, { transports: ["websocket"] })
       this.sockets.set(normalized, socket)
 

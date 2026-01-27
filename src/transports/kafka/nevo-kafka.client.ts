@@ -17,7 +17,8 @@ import {
   DiscoveryAnnouncement
 } from "../../common"
 import { randomUUID } from "node:crypto"
-import { Kafka, Consumer, Producer } from "kafkajs"
+import type { Consumer, Producer } from "kafkajs"
+import { getKafkaModule } from "../optional-deps"
 
 export interface NevoKafkaClientOptions {
   timeoutMs?: number
@@ -267,6 +268,7 @@ export class NevoKafkaClient {
       })
     }
 
+    const { Kafka } = getKafkaModule()
     const kafka = new Kafka({
       clientId: `${this.serviceName || "nevo"}-sub-${randomUUID()}`,
       brokers: this.brokers
@@ -346,6 +348,7 @@ export class NevoKafkaClient {
 
   private async initDiscovery(): Promise<void> {
     try {
+      const { Kafka } = getKafkaModule()
       const kafka = new Kafka({
         clientId: `${this.serviceName || "nevo"}-discovery`,
         brokers: this.brokers

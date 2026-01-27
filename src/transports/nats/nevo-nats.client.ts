@@ -1,4 +1,4 @@
-import { connect, NatsConnection, StringCodec, Subscription as NatsSubscription } from "nats"
+import type { NatsConnection, Subscription as NatsSubscription } from "nats"
 import {
   DEFAULT_BROADCAST_TOPIC,
   DEFAULT_DISCOVERY_TOPIC,
@@ -16,6 +16,7 @@ import {
   SubscriptionOptions
 } from "../../common"
 import { randomUUID } from "node:crypto"
+import { getNatsModule } from "../optional-deps"
 
 export interface NevoNatsClientOptions {
   servers?: string[]
@@ -39,7 +40,7 @@ export interface NevoNatsClientOptions {
 
 export class NevoNatsClient {
   private readonly nc: NatsConnection
-  private readonly codec = StringCodec()
+  private readonly codec: { encode: (input: string) => Uint8Array; decode: (input: Uint8Array) => string }
   private readonly serviceNames: string[]
   private readonly timeoutMs: number
   private readonly debug: boolean
@@ -59,12 +60,14 @@ export class NevoNatsClient {
   private discoverySubscription?: NatsSubscription
 
   constructor(nc: NatsConnection, serviceNames: string[], options?: NevoNatsClientOptions) {
+    const { StringCodec } = getNatsModule()
     this.nc = nc
     this.serviceNames = serviceNames.map((name) => name.toLowerCase())
     this.timeoutMs = options?.timeoutMs || 20000
     this.debug = options?.debug || false
     this.serviceName = options?.serviceName
     this.authToken = options?.authToken
+    this.codec = StringCodec()
     this.backoffEnabled = options?.backoff?.enabled !== false
     this.backoffBaseMs = options?.backoff?.baseMs || 100
     this.backoffMaxMs = options?.backoff?.maxMs || 2000
@@ -80,6 +83,7 @@ export class NevoNatsClient {
   }
 
   static async create(serviceNames: string[], options?: NevoNatsClientOptions): Promise<NevoNatsClient> {
+    const { connect } = getNatsModule()
     const nc = await connect({
       servers: options?.servers && options.servers.length > 0 ? options.servers : ["nats://127.0.0.1:4222"]
     })
