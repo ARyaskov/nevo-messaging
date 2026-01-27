@@ -1,7 +1,8 @@
 import { Type } from "@nestjs/common"
-import { connect, NatsConnection, StringCodec, Subscription } from "nats"
+import type { NatsConnection, Subscription } from "nats"
 import { createSignalRouterDecorator, SignalRouterOptions } from "../../signal-router.utils"
 import { parseWithBigInt, stringifyWithBigInt } from "../../common"
+import { getNatsModule } from "../optional-deps"
 
 export interface NatsSignalRouterOptions extends SignalRouterOptions {
   servers?: string[]
@@ -21,6 +22,7 @@ export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?:
       }
     },
     (target, eventPattern, handlerName) => {
+      const { connect, StringCodec } = getNatsModule()
       const codec = StringCodec()
       target.prototype.natsConnection = null
       target.prototype.natsSubscription = null

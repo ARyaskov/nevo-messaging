@@ -2,7 +2,7 @@ import { Type } from "@nestjs/common"
 import { MessagePattern } from "@nestjs/microservices"
 import { createSignalRouterDecorator, SignalRouterOptions } from "../../signal-router.utils"
 import { parseWithBigInt, stringifyWithBigInt } from "../../common"
-import { Kafka } from "kafkajs"
+import { getKafkaModule } from "../optional-deps"
 
 export function KafkaSignalRouter(serviceType: Type<any> | Type<any>[], options?: SignalRouterOptions) {
   return createSignalRouterDecorator(
@@ -35,6 +35,7 @@ export function KafkaSignalRouter(serviceType: Type<any> | Type<any>[], options?
         const kafkaHost = process.env["KAFKA_HOST"] || "localhost"
         const kafkaPort = process.env["KAFKA_PORT"] || "9092"
 
+        const { Kafka } = getKafkaModule()
         const kafka = new Kafka({
           clientId: `${eventPattern}-producer`,
           brokers: [`${kafkaHost}:${kafkaPort}`]

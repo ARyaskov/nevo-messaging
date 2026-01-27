@@ -1,7 +1,7 @@
 import { Transport } from "@nestjs/microservices"
-import { Partitioners } from "kafkajs"
 import { NevoKafkaClient } from "./nevo-kafka.client"
 import { DEFAULT_BROADCAST_TOPIC, DEFAULT_DISCOVERY_TOPIC, DEFAULT_SUBSCRIPTION_SUFFIX } from "../../common"
+import { getKafkaModule } from "../optional-deps"
 
 export interface KafkaClientFactoryOptions {
   clientIdPrefix: string
@@ -223,6 +223,7 @@ export const createNevoKafkaClient = (serviceNames: string[], options: KafkaClie
         }
       }
 
+      const { Partitioners } = getKafkaModule()
       const kafkaClientConfig = {
         transport: Transport.KAFKA,
         options: {
