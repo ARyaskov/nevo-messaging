@@ -1,6 +1,6 @@
 {
   "name": "@riaskov/nevo-messaging",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "description": "Microservices messaging framework for NestJS with NATS/Kafka/SocketIO transport",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
