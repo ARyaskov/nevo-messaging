@@ -7,9 +7,9 @@
   },
   "scripts": {
     "format": "prettier --write \"src/**/*.ts\"",
-    "start": "npx rimraf ./dist/ && yarn type:check && nest start --builder swc",
+    "start": "npx rimraf ./dist/ && pnpm type:check && nest start --builder swc",
     "type:check": "npx tsc --noEmit",
-    "build": "yarn type:check && nest build --builder swc"
+    "build": "pnpm type:check && nest build --builder swc"
   },
   "dependencies": {
     "@nestjs/common": "11.1.4",
@@ -21,7 +21,8 @@
     "reflect-metadata": "0.2.2",
     "rxjs": "7.8.2",
     "socket.io": "4.8.1",
-    "socket.io-client": "4.8.1"
+    "socket.io-client": "4.8.1",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@nestjs/cli": "11.0.10",
@@ -30,6 +31,6 @@
     "@types/node": "24.0.14",
     "prettier": "3.6.2",
     "rimraf": "6.0.1",
-    "typescript": "5.9.2"
+    "typescript": "^6.0.0"
   }
 }

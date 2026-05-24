@@ -1,7 +1,9 @@
 import "reflect-metadata"
 import { Controller, Type } from "@nestjs/common"
-import { BeforeHook, AfterHook, ServiceMethodMapping } from "./types"
-import { getClassSignals, SignalMetadata } from "../signal.decorator"
+import { BeforeHook, AfterHook, ServiceMethodMapping, AccessControlConfig, IdempotencyOptions, SecurityOptions, MetricsOptions, TracingOptions } from "./types"
+import { getClassSignals, getNevoServiceName, SignalMetadata } from "../signal.decorator"
+import { DEFAULT_METHOD_VERSION } from "./version"
+import type { RateLimiter, RateLimiterOptions } from "./rate-limit"
 
 export function createSignalRouterDecorator<T>(
   controllerClass: Type<T>,
@@ -11,6 +13,14 @@ export function createSignalRouterDecorator<T>(
     after?: AfterHook
     debug?: boolean
     eventPattern?: string
+    serviceName?: string
+    accessControl?: AccessControlConfig
+    idempotency?: IdempotencyOptions
+    security?: SecurityOptions
+    metrics?: MetricsOptions
+    tracing?: TracingOptions
+    defaultVersion?: string
+    rateLimit?: RateLimiterOptions | RateLimiter
   }
 ) {
   return function (target: any): any {
@@ -26,20 +36,30 @@ export function createSignalRouterDecorator<T>(
             originalPrototype.onModuleInit.call(this)
           }
 
-          const serviceInstances = Array.isArray(serviceType)
-            ? // @ts-ignore
-              serviceType.map((type) => this[findPropertyNameByType(this, type)]).filter(Boolean)
-            : // @ts-ignore
-              [this[findPropertyNameByType(this, serviceType)]].filter(Boolean)
+          const types = Array.isArray(serviceType) ? serviceType : [serviceType]
+          const serviceInstances: any[] = []
+          for (const t of types) {
+            const propName = findPropertyNameByType(this, t)
+            if (propName && this[propName]) serviceInstances.push(this[propName])
+          }
 
           const signals = getClassSignals(target)
 
-          const serviceName = options?.eventPattern || target.name.toLowerCase().replace("controller", "")
+          const explicit = options?.serviceName || options?.eventPattern?.replace(/-events$/, "") || getNevoServiceName(target)
+          const fallback = (target.name as string | undefined)?.toLowerCase().replace("controller", "") || "service"
+          const serviceName = explicit || fallback
 
-          const controller: any = new controllerClass(serviceName, serviceInstances, createHandlersFromSignals(signals), {
+          const controller: any = new (controllerClass as any)(serviceName, serviceInstances, createHandlersFromSignals(signals), {
             onBefore: options?.before,
             onAfter: options?.after,
-            debug: options?.debug
+            debug: options?.debug,
+            accessControl: options?.accessControl,
+            idempotency: options?.idempotency,
+            security: options?.security,
+            metrics: options?.metrics,
+            tracing: options?.tracing,
+            defaultVersion: options?.defaultVersion ?? DEFAULT_METHOD_VERSION,
+            rateLimit: options?.rateLimit
           })
 
           Object.getOwnPropertyNames(controller).forEach((key) => {
@@ -79,8 +99,10 @@ function createHandlersFromSignals(signals: SignalMetadata[]): ServiceMethodMapp
       serviceMethod: signal.methodName,
       paramTransformer: signal.paramTransformer,
       resultTransformer: signal.resultTransformer,
-      options: signal.options
-    } as any
+      options: signal.options,
+      schema: signal.options?.schema,
+      version: signal.version || signal.options?.version
+    }
     return handlers
   }, {} as ServiceMethodMapping)
 }

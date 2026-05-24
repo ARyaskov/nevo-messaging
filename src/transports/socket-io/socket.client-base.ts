@@ -1,4 +1,5 @@
 import { NevoSocketClient } from "./nevo-socket.client"
+import type { ClientCallOptions } from "../nats/nats.client-base"
 
 export abstract class SocketClientBase {
   protected readonly universalClient: NevoSocketClient
@@ -7,20 +8,20 @@ export abstract class SocketClientBase {
     this.universalClient = universalClient
   }
 
-  protected async query<T = any>(serviceName: string, method: string, params: any): Promise<T> {
-    return this.universalClient.query(serviceName, method, params)
+  protected async query<T = any>(serviceName: string, method: string, params: any, opts?: ClientCallOptions): Promise<T> {
+    return this.universalClient.query<T>(serviceName, method, params, opts)
   }
 
-  protected async emit(serviceName: string, method: string, params: any): Promise<void> {
-    return this.universalClient.emit(serviceName, method, params)
+  protected async emit(serviceName: string, method: string, params: any, opts?: ClientCallOptions): Promise<void> {
+    return this.universalClient.emit(serviceName, method, params, opts)
   }
 
-  protected async publish(serviceName: string, method: string, params: any): Promise<void> {
-    return this.universalClient.publish(serviceName, method, params)
+  protected async publish(serviceName: string, method: string, params: any, opts?: ClientCallOptions): Promise<void> {
+    return this.universalClient.publish(serviceName, method, params, opts)
   }
 
-  protected async broadcast(method: string, params: any): Promise<void> {
-    return this.universalClient.broadcast(method, params)
+  protected async broadcast(method: string, params: any, opts?: ClientCallOptions): Promise<void> {
+    return this.universalClient.broadcast(method, params, opts)
   }
 
   protected async subscribe<T = any>(

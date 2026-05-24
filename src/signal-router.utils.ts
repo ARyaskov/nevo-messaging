@@ -1,15 +1,59 @@
 import { Type } from "@nestjs/common"
-import { BeforeHook, AfterHook, stringifyWithBigInt, serializeBigInt, AccessControlConfig, MessageMeta, MessageResponse } from "./common"
+import {
+  BeforeHook,
+  AfterHook,
+  AccessControlConfig,
+  MessageMeta,
+  MessageResponse,
+  IdempotencyOptions,
+  SecurityOptions,
+  MetricsOptions,
+  TracingOptions
+} from "./common"
+import { IS_PROD } from "./common/env"
 import { createAccessDeniedError, extractCallerService, isAccessAllowed, logAccessDenied } from "./common/access-control"
 import { ErrorCode } from "./common"
-import { getClassSignals } from "./signal.decorator"
+import { getClassSignals, getNevoServiceName, SignalMetadata } from "./signal.decorator"
+import { suggestClosestMethod } from "./common/levenshtein"
+import { getDefaultLogger, NevoLogger } from "./common/logger"
+import { LruIdempotencyCache } from "./common/idempotency"
+import { ReplayGuard } from "./common/replay-protection"
+import { getSchemaFor, toValidator } from "./common/schema"
+import { parseMethod, isVersionCompatible, DEFAULT_METHOD_VERSION } from "./common/version"
+import { getDefaultMetrics, NEVO_METRIC_NAMES } from "./common/metrics"
+import { getDefaultTracer } from "./common/tracing"
+import { matchesFilter } from "./common/subscription-filters"
+import { DlqRouter } from "./common/dlq"
+import { MessagingError } from "./common/errors"
+import { RateLimiter, resolveRateLimiter, RateLimiterOptions } from "./common/rate-limit"
+import { NEVO_CONTRACT_METHOD, buildContract, ContractMethodDescriptor } from "./common/contract"
+import { NEVO_HEALTH_METHOD, NEVO_LIVENESS_METHOD, NEVO_READINESS_METHOD, HealthRegistry } from "./common/health"
+import { getDevToolsBus, DevToolsBus } from "./common/devtools"
+import { getDevToolsRegistry, describeMethodsFromSignals } from "./common/devtools-registry"
+import { getMethodRateLimit, getMethodCacheable, rateLimitToOptions } from "./common/method-decorators"
+import { LruIdempotencyCache as LruCache } from "./common/idempotency"
+import { runInChain, resolveInboundChainId } from "./common/chain-context"
 
 export interface SignalRouterOptions {
   before?: BeforeHook
   after?: AfterHook
   debug?: boolean
   eventPattern?: string
+  serviceName?: string
   accessControl?: AccessControlConfig
+  idempotency?: IdempotencyOptions
+  security?: SecurityOptions
+  metrics?: MetricsOptions
+  tracing?: TracingOptions
+  logger?: NevoLogger
+  dlq?: DlqRouter | { enabled?: boolean }
+  defaultVersion?: string
+  rateLimit?: RateLimiterOptions | RateLimiter
+  health?: HealthRegistry
+  serviceVersion?: string
+  capabilities?: string[]
+  instanceId?: string
+  devtools?: DevToolsBus | boolean
 }
 
 export interface MessageData {
@@ -31,78 +75,38 @@ export function findPropertyByType(obj: any, type: Type<any>): string | null {
 }
 
 export function findServiceInstances(instance: any, serviceType: Type<any> | Type<any>[]): any[] {
-  return Array.isArray(serviceType)
-    ? // @ts-ignore
-      serviceType.map((type) => instance[findPropertyByType(instance, type)]).filter(Boolean)
-    : // @ts-ignore
-      [instance[findPropertyByType(instance, serviceType)]].filter(Boolean)
+  const types = Array.isArray(serviceType) ? serviceType : [serviceType]
+  const out: any[] = []
+  for (const type of types) {
+    const propName = findPropertyByType(instance, type)
+    if (propName && instance[propName]) {
+      out.push(instance[propName])
+    }
+  }
+  return out
 }
 
-export function createErrorResponse(message: string, uuid?: string, method?: string, code: number = 0) {
+export function createErrorResponse(message: string, uuid?: string, method?: string, code: number = ErrorCode.UNKNOWN, meta?: MessageMeta) {
   return {
     uuid,
     method,
     params: {
       result: "error",
-      error: {
-        message,
-        code
-      }
-    }
+      error: { message, code }
+    },
+    meta
   }
 }
 
-function levenshteinDistance(a: string, b: string): number {
-  if (a === b) {
-    return 0
-  }
-  if (!a.length) {
-    return b.length
-  }
-  if (!b.length) {
-    return a.length
-  }
-
-  const matrix: number[][] = Array.from({ length: a.length + 1 }, () => [])
-
-  for (let i = 0; i <= a.length; i++) {
-    matrix[i][0] = i
-  }
-  for (let j = 0; j <= b.length; j++) {
-    matrix[0][j] = j
-  }
-
-  for (let i = 1; i <= a.length; i++) {
-    for (let j = 1; j <= b.length; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1
-      matrix[i][j] = Math.min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j - 1] + cost)
-    }
-  }
-
-  return matrix[a.length][b.length]
-}
-
-function suggestClosestMethod(method: string, candidates: string[]): string | null {
-  if (!candidates.length) {
-    return null
-  }
-
-  const normalized = method.toLowerCase()
-  let best: { name: string; score: number } | null = null
-
-  for (const candidate of candidates) {
-    const score = levenshteinDistance(normalized, candidate.toLowerCase())
-    if (!best || score < best.score) {
-      best = { name: candidate, score }
-    }
-  }
-
-  if (!best) {
-    return null
-  }
-
-  const threshold = Math.max(2, Math.floor(method.length * 0.4))
-  return best.score <= threshold ? best.name : null
+function deriveServiceName(target: any, options: SignalRouterOptions | undefined): string {
+  if (options?.serviceName) return options.serviceName
+  if (options?.eventPattern) return options.eventPattern.replace(/-events$/, "")
+  const fromMeta = getNevoServiceName(target)
+  if (fromMeta) return fromMeta
+  const className = (target?.name as string | undefined) ?? "unknown"
+  const lower = className.toLowerCase()
+  if (lower.endsWith("controller")) return lower.slice(0, -"controller".length) || lower
+  return lower
 }
 
 export function createSignalRouterDecorator(
@@ -111,139 +115,380 @@ export function createSignalRouterDecorator(
   messageExtractor: MessageExtractor,
   registerHandler: (target: any, eventPattern: string, handlerName: string, context?: any) => void
 ) {
-  const debug = options?.debug || process.env["NODE_ENV"] !== "production"
+  const debug = options?.debug || !IS_PROD
+  const logger = options?.logger || getDefaultLogger().child({ component: "signal-router" })
+  const metrics = getDefaultMetrics()
+  const tracer = options?.tracing?.enabled !== false ? getDefaultTracer() : null
 
   return function (target: any): any {
-    const eventPattern = options?.eventPattern || target.name.toLowerCase().replace("controller", "") + "-events"
-
+    const serviceNameFromMeta = deriveServiceName(target, options)
+    const eventPattern = options?.eventPattern || `${serviceNameFromMeta}-events`
     const handlerName = "handleSignalMessage"
+    const debugEnabled = debug && (logger.isLevelEnabled?.("debug") ?? true)
+
+    const idempotency = new LruIdempotencyCache<MessageResponse>(options.idempotency)
+    const replayGuard = new ReplayGuard({
+      enabled: (options.security?.replayWindowMs ?? 0) > 0,
+      windowMs: options.security?.replayWindowMs
+    })
+    const dlq = options.dlq instanceof DlqRouter ? options.dlq : new DlqRouter({ enabled: (options.dlq as any)?.enabled === true })
+    const defaultVersion = options.defaultVersion || DEFAULT_METHOD_VERSION
+    const rateLimiter = options.rateLimit !== undefined ? resolveRateLimiter(options.rateLimit) : new RateLimiter()
+    const devtoolsBus: DevToolsBus | null = options.devtools === false ? null : (options.devtools instanceof Object ? (options.devtools as DevToolsBus) : getDevToolsBus())
+    const methodLimiters = new Map<string, RateLimiter>()
+    const methodCaches = new Map<string, LruCache<unknown>>()
+
+    const allSignals = getClassSignals(target) as SignalMetadata[]
+    const signalsByName = new Map<string, SignalMetadata[]>()
+    const contractDescriptors: ContractMethodDescriptor[] = []
+    const signalNames: string[] = []
+    for (const s of allSignals) {
+      let arr = signalsByName.get(s.signalName)
+      if (!arr) { arr = []; signalsByName.set(s.signalName, arr) }
+      arr.push(s)
+      if (!s.signalName.startsWith("nevo.")) {
+        contractDescriptors.push({ signalName: s.signalName, version: s.version || DEFAULT_METHOD_VERSION })
+        signalNames.push(s.signalName)
+      }
+    }
+    contractDescriptors.sort((a, b) => a.signalName.localeCompare(b.signalName))
+
+    try {
+      getDevToolsRegistry().registerService({
+        serviceName: serviceNameFromMeta,
+        instanceId: options.instanceId,
+        transport: undefined,
+        topic: eventPattern,
+        capabilities: options.capabilities,
+        methods: describeMethodsFromSignals(allSignals),
+        accessControl: options.accessControl
+      })
+    } catch {}
 
     target.prototype[handlerName] = async function (data: any) {
+      // Peek at the envelope just enough to seed the chain context — every
+      // outbound call made inside the handler will inherit this chain id via
+      // AsyncLocalStorage, which is what makes the DevTools /traces view
+      // possible.
+      let peekedMeta: MessageMeta | undefined
+      let peekedUuid: string | undefined
       try {
-        if (debug) {
-          console.log(`[${eventPattern}] Received message:`, stringifyWithBigInt(data))
+        const peek = messageExtractor(data)
+        peekedMeta = peek?.meta
+        peekedUuid = peek?.uuid
+      } catch {}
+      const chainId = resolveInboundChainId(peekedMeta?.nevoChainId)
+
+      return runInChain({ chainId, parentUuid: peekedUuid }, async () => {
+      const startMs = Date.now()
+      const nowMs = Date.now()
+      let response: MessageResponse | undefined
+      let messageData: MessageData | undefined
+
+      try {
+        if (debugEnabled) {
+          logger.debug({ event: "signal.received", topic: eventPattern })
         }
 
-        const messageData = messageExtractor(data)
+        messageData = messageExtractor(data)
         const { method, params, uuid, meta } = messageData
 
         if (!method) {
-          console.error("Missing 'method' field in message")
-          return createErrorResponse("Invalid message format")
+          logger.error({ event: "signal.invalid", topic: eventPattern }, "Missing 'method' field in message")
+          return createErrorResponse("Invalid message format", undefined, undefined, ErrorCode.BAD_REQUEST)
         }
 
-        if (debug) {
-          console.log(`[${eventPattern}] Invoking method:`, method)
+        const parsed = parseMethod(method)
+        const requestedVersion = parsed.version
+
+        if (parsed.name === NEVO_CONTRACT_METHOD) {
+          const contract = {
+            protocol: "1",
+            serviceName: serviceNameFromMeta,
+            serviceVersion: options.serviceVersion,
+            instanceId: options.instanceId,
+            capabilities: options.capabilities,
+            generatedAt: nowMs,
+            methods: contractDescriptors
+          }
+          return { uuid, method, params: { result: contract as any }, meta }
+        }
+        if (options.health) {
+          if (parsed.name === NEVO_HEALTH_METHOD) {
+            const report = await options.health.report()
+            return { uuid, method, params: { result: report as any }, meta }
+          }
+          if (parsed.name === NEVO_LIVENESS_METHOD) {
+            const report = await options.health.liveness()
+            return { uuid, method, params: { result: report as any }, meta }
+          }
+          if (parsed.name === NEVO_READINESS_METHOD) {
+            const report = await options.health.readiness()
+            return { uuid, method, params: { result: report as any }, meta }
+          }
+        }
+
+        try {
+          replayGuard.check(uuid, meta?.ts)
+        } catch (err: any) {
+          await dlq.route({
+            topic: eventPattern,
+            reason: "replay",
+            error: err instanceof MessagingError ? { code: err.code, message: err.message } : { message: String(err) },
+            meta,
+            rawPayload: data,
+            ts: nowMs
+          })
+          return createErrorResponse(err.message, uuid, method, ErrorCode.REPLAY_DETECTED, meta)
+        }
+
+        if (uuid && idempotency.isEnabled() && idempotency.has(uuid)) {
+          const cached = idempotency.get(uuid)
+          if (cached) return cached
+        }
+
+        if (debugEnabled) {
+          logger.debug({ event: "signal.invoke", topic: eventPattern, method })
         }
 
         const serviceInstances = findServiceInstances(this, serviceType)
         if (serviceInstances.length === 0) {
-          console.error(`No service instances found for:`, serviceType)
-          return createErrorResponse("Service not found", uuid, method)
+          logger.error({ event: "signal.no_service", topic: eventPattern, serviceType: String(serviceType) }, "No service instances found")
+          return createErrorResponse("Service not found", uuid, method, ErrorCode.SERVICE_NOT_FOUND, meta)
         }
 
-        const callerService = extractCallerService(meta)
+        const callerService = await extractCallerService(meta, options.accessControl?.jwtVerifier)
         const topic = eventPattern
 
-        if (!isAccessAllowed(options.accessControl, topic, method, callerService)) {
-          logAccessDenied(options.accessControl, { topic, method, serviceName: eventPattern, callerService })
-          return {
+        if (rateLimiter.isEnabled()) {
+          try {
+            rateLimiter.check({ topic, method: parsed.name, callerService, tenantId: meta?.tenantId, meta })
+          } catch (err: any) {
+            if (err instanceof MessagingError && err.code === ErrorCode.RATE_LIMITED) {
+              return { uuid, method, params: { result: "error", error: err.toJSON() }, meta }
+            }
+            throw err
+          }
+        }
+
+        if (!isAccessAllowed(options.accessControl, topic, parsed.name, callerService)) {
+          logAccessDenied(options.accessControl, { topic, method, serviceName: serviceNameFromMeta, callerService })
+          response = {
             uuid,
             method,
             params: {
               result: "error",
-              error: createAccessDeniedError(method, eventPattern, callerService)
+              error: createAccessDeniedError(method, serviceNameFromMeta, callerService)
             },
             meta
           }
+          return response
         }
 
         let processedParams = params
         if (options.before) {
-          const hookResult = await options.before({
+          const baseContext = {
             method,
-            serviceName: eventPattern,
+            serviceName: serviceNameFromMeta,
             uuid,
             rawData: data,
             params,
             meta
-          })
-          if (hookResult !== undefined) {
-            processedParams = hookResult
+          }
+          const hookResult = await options.before(baseContext)
+          if (hookResult !== undefined) processedParams = hookResult
+        }
+
+        const candidates = signalsByName.get(parsed.name)
+        let signalHandler: SignalMetadata | undefined
+
+        if (!candidates || candidates.length === 0) {
+          const suggestion = suggestClosestMethod(parsed.name, signalNames)
+          const message = suggestion ? `Invalid method name '${parsed.name}', did you mean '${suggestion}'?` : `Method ${parsed.name} not found`
+          return createErrorResponse(message, uuid, method, ErrorCode.METHOD_NOT_FOUND, meta)
+        } else {
+          if (requestedVersion) {
+            signalHandler = candidates.find((c) => (c.version || defaultVersion) === requestedVersion)
+          } else {
+            signalHandler = candidates.find((c) => (c.version || defaultVersion) === defaultVersion) || candidates[0]
+          }
+          if (!signalHandler) {
+            return createErrorResponse(`No handler matching version ${requestedVersion} for ${parsed.name}`, uuid, method, ErrorCode.UNSUPPORTED_VERSION, meta)
+          }
+          if (!isVersionCompatible(requestedVersion, signalHandler.version || defaultVersion)) {
+            return createErrorResponse(
+              `Method ${parsed.name} version mismatch (requested ${requestedVersion}, available ${signalHandler.version || defaultVersion})`,
+              uuid,
+              method,
+              ErrorCode.UNSUPPORTED_VERSION,
+              meta
+            )
           }
         }
 
-        const signals = getClassSignals(target)
-        const signalHandler = signals.find((s) => s.signalName === method)
-
-        if (!signalHandler) {
-          console.error(`No handler found for method:`, method)
-          const suggestion = suggestClosestMethod(
-            method,
-            signals.map((s) => s.signalName)
-          )
-          const message = suggestion ? `Invalid method name '${method}', did you mean '${suggestion}'?` : `Method ${method} not found`
-          return createErrorResponse(message, uuid, method)
-        }
-
-        let serviceInstance = null
         const serviceMethod = signalHandler.methodName
-
-        for (let s of serviceInstances) {
-          if (s[serviceMethod]) {
+        let serviceInstance: any = null
+        for (const s of serviceInstances) {
+          if (s && typeof s[serviceMethod] === "function") {
             serviceInstance = s
+            break
+          }
+        }
+        if (!serviceInstance) {
+          logger.error({ event: "signal.method_not_found", serviceMethod }, "Method not found on any service instance")
+          return createErrorResponse(`Method ${serviceMethod} does not exist`, uuid, method, ErrorCode.METHOD_NOT_FOUND, meta)
+        }
+
+        const methodRateLimit = getMethodRateLimit(serviceInstance, serviceMethod)
+        if (methodRateLimit) {
+          let mLimiter = methodLimiters.get(serviceMethod)
+          if (!mLimiter) {
+            mLimiter = new RateLimiter(rateLimitToOptions(methodRateLimit))
+            methodLimiters.set(serviceMethod, mLimiter)
+          }
+          try {
+            mLimiter.check({ topic: eventPattern, method: parsed.name, callerService, tenantId: meta?.tenantId, meta })
+          } catch (err: any) {
+            if (err instanceof MessagingError && err.code === ErrorCode.RATE_LIMITED) {
+              return { uuid, method, params: { result: "error", error: err.toJSON() }, meta }
+            }
+            throw err
           }
         }
 
-        if (!serviceInstance[serviceMethod]) {
-          console.error(`Method ${serviceMethod} not found in service`)
-          return createErrorResponse(`Method ${serviceMethod} does not exist`, uuid, method)
+        const cacheable = getMethodCacheable(serviceInstance, serviceMethod)
+        let cacheKey: string | null = null
+        let methodCache: LruCache<unknown> | undefined
+        if (cacheable) {
+          methodCache = methodCaches.get(serviceMethod)
+          if (!methodCache) {
+            methodCache = new LruCache<unknown>({ enabled: true, ttlMs: cacheable.ttlMs ?? 60_000, maxEntries: cacheable.maxEntries ?? 1024 })
+            methodCaches.set(serviceMethod, methodCache)
+          }
+          cacheKey = cacheable.keyBy ? cacheable.keyBy(processedParams) : `${parsed.name}::${JSON.stringify(processedParams ?? {})}`
+          if (methodCache.has(cacheKey)) {
+            const cached = methodCache.get(cacheKey)
+            return { uuid, method, params: { result: cached as any }, meta }
+          }
+        }
+
+        const schema = signalHandler.options?.schema ?? getSchemaFor(serviceInstance, serviceMethod)
+        if (schema) {
+          const validator = toValidator(schema)
+          if (validator) {
+            try {
+              processedParams = validator.parse(processedParams)
+            } catch (err: any) {
+              const errPayload = err instanceof MessagingError
+                ? err.toJSON()
+                : { code: ErrorCode.VALIDATION_FAILED, message: err?.message || "validation failed" }
+              return { uuid, method, params: { result: "error", error: errPayload }, meta }
+            }
+          }
         }
 
         const args = signalHandler.paramTransformer ? signalHandler.paramTransformer(processedParams) : [processedParams]
 
-        if (debug) {
-          console.log(`[${eventPattern}] Calling ${serviceMethod} with parameters:`, stringifyWithBigInt(args))
+        if (debugEnabled) {
+          logger.debug({ event: "signal.call", topic: eventPattern, serviceMethod })
         }
 
-        const result = await serviceInstance[serviceMethod](...args)
+        const span = tracer?.startSpan(`nevo.serve ${eventPattern}.${method}`, {
+          "nevo.method": method,
+          "nevo.service": serviceNameFromMeta,
+          "nevo.uuid": uuid ?? "",
+          "nevo.caller": callerService ?? ""
+        })
+
+        let result: unknown
+        try {
+          result = await serviceInstance[serviceMethod](...args)
+          span?.setStatus({ code: 1 })
+        } catch (err) {
+          span?.recordException(err)
+          span?.setStatus({ code: 2, message: (err as Error)?.message })
+          throw err
+        } finally {
+          span?.end()
+        }
 
         const transformedResult = signalHandler.resultTransformer ? signalHandler.resultTransformer(result) : result
-        const serializedResult = serializeBigInt(transformedResult)
-
-        if (debug) {
-          console.log(`[${eventPattern}] Result:`, stringifyWithBigInt(serializedResult))
+        if (debugEnabled) {
+          logger.debug({ event: "signal.result", topic: eventPattern })
         }
 
-        let response: MessageResponse = {
+        response = {
           uuid,
           method,
-          params: { result: serializedResult },
+          params: { result: transformedResult },
           meta
         }
 
         if (options.after) {
-          const hookResponse = await options.after({
+          const responseContext = {
             method,
-            serviceName: eventPattern,
+            serviceName: serviceNameFromMeta,
             uuid,
             rawData: data,
             params: processedParams,
-            result: serializedResult,
+            result: transformedResult,
             response,
             meta
-          })
-          if (hookResponse !== undefined) {
-            response = hookResponse
           }
+          const hookResponse = await options.after(responseContext)
+          if (hookResponse !== undefined) response = hookResponse
         }
 
+        if (uuid && idempotency.isEnabled()) idempotency.set(uuid, response)
+        if (methodCache && cacheKey && response.params.result !== "error") {
+          methodCache.set(cacheKey, response.params.result)
+        }
         return response
       } catch (error: any) {
         const errorMessage = error instanceof Error ? error.message : "Unknown error"
-        console.error(`[${eventPattern}] Processing error:`, error)
-        return createErrorResponse(errorMessage, data.uuid, data.method, error.code || ErrorCode.UNKNOWN)
+        const code = error instanceof MessagingError ? error.code : error?.code ?? ErrorCode.UNKNOWN
+        logger.error({ event: "signal.error", topic: eventPattern, method: messageData?.method, code, err: errorMessage }, "Processing error")
+        try {
+          await dlq.route({
+            topic: eventPattern,
+            reason: "handler-error",
+            error: error instanceof MessagingError ? error.toJSON() : { message: errorMessage },
+            meta: messageData?.meta,
+            rawPayload: data,
+            ts: nowMs
+          })
+        } catch {}
+        return createErrorResponse(errorMessage, messageData?.uuid ?? (data as any)?.uuid, messageData?.method ?? (data as any)?.method, code, messageData?.meta)
+      } finally {
+        const durationMs = Date.now() - startMs
+        const success = response?.params?.result !== "error"
+        const labels = {
+          service: serviceNameFromMeta,
+          method: messageData?.method ?? "unknown",
+          status: success ? "ok" : "error"
+        }
+        metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, labels)
+        if (!success) metrics.incCounter(NEVO_METRIC_NAMES.requestErrors, labels)
+        metrics.observeHistogram(NEVO_METRIC_NAMES.requestDuration, labels, durationMs / 1000)
+        if (devtoolsBus) {
+          try {
+            const errPayload = (response as any)?.params?.error as any
+            devtoolsBus.publish({
+              ts: nowMs,
+              type: success ? "response" : "error",
+              service: serviceNameFromMeta,
+              method: messageData?.method,
+              uuid: messageData?.uuid,
+              chainId: messageData?.meta?.nevoChainId ?? chainId,
+              parentUuid: (messageData?.meta?.nevoParentUuid as string | undefined) ?? undefined,
+              durationMs,
+              status: success ? "ok" : "error",
+              error: errPayload ? { code: errPayload.code, message: errPayload.message } : undefined
+            })
+          } catch {}
+        }
       }
+      })
     }
 
     registerHandler(target, eventPattern, handlerName)
@@ -251,3 +496,5 @@ export function createSignalRouterDecorator(
     return target
   }
 }
+
+export { matchesFilter, parseMethod, DEFAULT_METHOD_VERSION }

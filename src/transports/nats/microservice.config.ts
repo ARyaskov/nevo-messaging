@@ -4,8 +4,7 @@ import { FastifyAdapter, NestFastifyApplication } from "@nestjs/platform-fastify
 import { NestApplicationOptions } from "../microservice.options"
 
 export async function createNatsMicroservice(options: NestApplicationOptions): Promise<INestApplication> {
-  // @ts-ignore
-  const { microserviceName, module, port = 3000, host = "0.0.0.0", debug = process.env["NODE_ENV"] !== "production", onInit } = options
+  const { module, port = 3000, host = "0.0.0.0", onInit } = options
 
   const app = await NestFactory.create<NestFastifyApplication>(module, new FastifyAdapter())
 

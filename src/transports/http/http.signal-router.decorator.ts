@@ -1,13 +1,14 @@
-import { Type } from "@nestjs/common"
-import { Post } from "@nestjs/common"
+import { Type, Post } from "@nestjs/common"
 import { createSignalRouterDecorator, SignalRouterOptions } from "../../signal-router.utils"
 
-export function HttpSignalRouter(serviceType: Type<any> | Type<any>[], options?: SignalRouterOptions) {
+export interface HttpSignalRouterOptions extends SignalRouterOptions {}
+
+export function HttpSignalRouter(serviceType: Type<any> | Type<any>[], options?: HttpSignalRouterOptions) {
   return createSignalRouterDecorator(
     serviceType,
     options,
     (data) => {
-      const messageData = data || {}
+      const messageData: any = data || {}
       return {
         method: messageData.method,
         params: messageData.params,

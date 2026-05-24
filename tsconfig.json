@@ -1,8 +1,9 @@
 {
   "compilerOptions": {
-    "target": "ES2020",
+    "target": "ES2024",
     "module": "commonjs",
-    "lib": ["ES2020"],
+    "lib": ["ESNext"],
+    "types": ["node"],
     "declaration": true,
     "outDir": "./dist",
     "rootDir": "./src",
@@ -13,8 +14,9 @@
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true,
     "resolveJsonModule": true,
-    "noEmitOnError": true
+    "noEmitOnError": true,
+    "noImplicitAny": false
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "**/*.test.ts", "**/*.spec.ts"]
+  "exclude": ["node_modules", "dist", "devtools", "test", "examples", "**/*.test.ts", "**/*.spec.ts"]
 }
