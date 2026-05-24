@@ -11,3 +11,5 @@ coverage/
 .DS_Store
 Thumbs.db
 *sync/
+.pnpm-store/
+pnpm_store/

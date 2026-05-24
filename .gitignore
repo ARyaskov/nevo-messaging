@@ -260,3 +260,5 @@ dist
 
 kafka-data/
 *sync/
+.pnpm-store/
+pnpm_store/
