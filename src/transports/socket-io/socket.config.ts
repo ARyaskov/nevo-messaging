@@ -1,12 +1,14 @@
 import { NevoSocketClient, NevoSocketClientOptions } from "./nevo-socket.client"
 
+export const NEVO_SOCKET_CLIENT_TOKEN = "NEVO_SOCKET_CLIENT"
+
 export interface SocketClientFactoryOptions extends NevoSocketClientOptions {
   clientIdPrefix: string
 }
 
 export const createNevoSocketClient = (serviceUrls: Record<string, string>, options: SocketClientFactoryOptions) => {
   return {
-    provide: "NEVO_SOCKET_CLIENT",
+    provide: NEVO_SOCKET_CLIENT_TOKEN,
     useFactory: async () => {
       return new NevoSocketClient(serviceUrls, {
         ...options,

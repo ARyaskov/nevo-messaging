@@ -12,6 +12,39 @@ export type ServiceMethod<TParams = unknown, TResult = unknown> = {
 
 export type ServiceMethodMap = Record<string, ServiceMethod>
 
+export interface TypedServiceClient<T extends ServiceMethodMap> {
+  query<M extends keyof T & string>(method: M, params: T[M]["params"], opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<T[M]["result"]>
+  emit<M extends keyof T & string>(method: M, params: T[M]["params"], opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<void>
+  publish<M extends keyof T & string>(method: M, params: T[M]["params"], opts?: { version?: string; headers?: Record<string, string> }): Promise<void>
+  subscribe<M extends keyof T & string>(method: M, handler: (data: T[M]["result"]) => void | Promise<void>, opts?: { ack?: boolean; durableKey?: string }): Promise<{ unsubscribe: () => Promise<void> }>
+}
+
+export interface ClientTransportLike {
+  query(serviceName: string, method: string, params: any, opts?: any): Promise<any>
+  emit(serviceName: string, method: string, params: any, opts?: any): Promise<void>
+  publish?(serviceName: string, method: string, params: any, opts?: any): Promise<void>
+  subscribe?(serviceName: string, method: string, options: any, handler: any): Promise<any>
+}
+
+export function createServiceClient<T extends ServiceMethodMap>(serviceName: string, client: ClientTransportLike): TypedServiceClient<T> {
+  return {
+    query<M extends keyof T & string>(method: M, params: T[M]["params"], opts?: any) {
+      return client.query(serviceName, method as string, params as any, opts) as Promise<T[M]["result"]>
+    },
+    emit<M extends keyof T & string>(method: M, params: T[M]["params"], opts?: any) {
+      return client.emit(serviceName, method as string, params as any, opts) as Promise<void>
+    },
+    publish<M extends keyof T & string>(method: M, params: T[M]["params"], opts?: any) {
+      if (!client.publish) throw new Error("Transport does not support publish")
+      return client.publish(serviceName, method as string, params as any, opts) as Promise<void>
+    },
+    subscribe<M extends keyof T & string>(method: M, handler: (data: T[M]["result"]) => void | Promise<void>, opts?: { ack?: boolean; durableKey?: string }) {
+      if (!client.subscribe) throw new Error("Transport does not support subscribe")
+      return client.subscribe(serviceName, method as string, opts, (data: any) => handler(data)) as Promise<{ unsubscribe: () => Promise<void> }>
+    }
+  }
+}
+
 export function mapServiceMethods<T>(
   service: T,
   customMappings?: Record<
@@ -48,40 +81,20 @@ export function mapServiceMethods<T>(
         ;[methodPrefix, options] = mapping
       }
 
-      const matchingMethod = serviceMethods.find((method) => method.toLowerCase().startsWith(methodPrefix.toLowerCase()))
+      const matchingMethod = serviceMethods.find((m) => m.toLowerCase().startsWith(methodPrefix.toLowerCase()))
 
       if (matchingMethod) {
         resultMappings[eventName] = {
           serviceMethod: matchingMethod,
           paramTransformer: options?.paramTransformer,
           resultTransformer: options?.resultTransformer
-        } as any
+        }
       }
     })
   }
 
   return resultMappings
 }
-
-// @ts-ignore
-export const createServiceClient = <T extends ServiceMethodMap>(serviceName: string) => ({
-  // @ts-ignore
-  query: <M extends keyof T & string>(method: M, params: T[M]["params"]): Promise<T[M]["result"]> => {
-    throw new Error("Implementation required in subclass")
-  },
-  // @ts-ignore
-  emit: <M extends keyof T & string>(method: M, params: T[M]["params"]): Promise<void> => {
-    throw new Error("Implementation required in subclass")
-  },
-  // @ts-ignore
-  publish: <M extends keyof T & string>(method: M, params: T[M]["params"]): Promise<void> => {
-    throw new Error("Implementation required in subclass")
-  },
-  // @ts-ignore
-  subscribe: <M extends keyof T & string>(method: M, handler: (data: T[M]["result"]) => void): Promise<void> => {
-    throw new Error("Implementation required in subclass")
-  }
-})
 
 export function createMethodHandlers(
   mappings: Record<string, [string, ((params: unknown) => unknown[])?, ((result: unknown) => unknown)?]>
@@ -93,7 +106,7 @@ export function createMethodHandlers(
       serviceMethod,
       paramTransformer,
       resultTransformer
-    } as any
+    }
 
     return handlers
   }, {} as ServiceMethodMapping)

@@ -1,0 +1,135 @@
+:root {
+  color-scheme: light dark;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --bg: #0b0d10;
+  --panel: #131720;
+  --panel-2: #1a1f2b;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #4f8bff;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --err: #f85149;
+  --border: #2a2f3a;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); min-height: 100vh; }
+
+.nv-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--border);
+}
+.nv-brand { display: flex; gap: 8px; align-items: center; font-weight: 600; }
+.nv-logo { font-size: 18px; }
+.nv-header nav a {
+  color: var(--text); text-decoration: none; padding: 6px 10px; border-radius: 6px;
+  margin-left: 4px;
+}
+.nv-header nav a:hover { background: var(--panel-2); }
+
+.nv-main { padding: 20px; max-width: 1400px; margin: 0 auto; }
+
+.nv-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+.nv-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+.nv-card h2 { margin: 0 0 8px; font-size: 14px; color: var(--muted); font-weight: 500; }
+.nv-card .nv-value { font-size: 28px; font-weight: 600; }
+
+.nv-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.nv-table th, .nv-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.nv-table th { color: var(--muted); font-weight: 500; }
+.nv-table tr:hover td { background: var(--panel-2); }
+
+.nv-badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; }
+.nv-badge.ok { background: rgba(63, 185, 80, 0.15); color: var(--ok); }
+.nv-badge.warn { background: rgba(210, 153, 34, 0.15); color: var(--warn); }
+.nv-badge.err { background: rgba(248, 81, 73, 0.15); color: var(--err); }
+
+/* Event-type badges — distinct hues for each DevToolsEventType.
+   `request`  = outbound RPC from this process    → blue
+   `response` = inbound RPC handled by this process → purple
+   Others are colored softly to keep the dashboard readable. */
+.nv-badge.req       { background: rgba(79, 139, 255, 0.18); color: #6ea8ff; }
+.nv-badge.resp      { background: rgba(178, 132, 255, 0.18); color: #b284ff; }
+.nv-badge.evt-error { background: rgba(248, 81, 73, 0.18);  color: var(--err); }
+.nv-badge.circuit   { background: rgba(210, 153, 34, 0.18); color: var(--warn); }
+.nv-badge.discovery { background: rgba(112, 192, 174, 0.18); color: #70c0ae; }
+.nv-badge.ratelim   { background: rgba(255, 153, 102, 0.18); color: #ff9966; }
+.nv-badge.custom    { background: rgba(139, 148, 158, 0.18); color: var(--muted); }
+
+/* Row highlight — flash a row after deep-link navigation (e.g. clicking a
+   method on the dashboard to jump to its row on the Methods page). Fades
+   out over 3s and settles into a soft persistent tint so the user can
+   still spot the row after the animation. */
+@keyframes nv-row-flash {
+  0%   { background: rgba(79, 139, 255, 0.32); }
+  100% { background: rgba(79, 139, 255, 0.08); }
+}
+.nv-table tr.nv-highlight td {
+  background: rgba(79, 139, 255, 0.08);
+  animation: nv-row-flash 3s ease-out;
+}
+.nv-table tr.nv-highlight:hover td { background: rgba(79, 139, 255, 0.16); }
+
+.nv-mono { font-family: ui-monospace, "SF Mono", monospace; }
+.nv-muted { color: var(--muted); }
+.nv-row { display: flex; align-items: center; gap: 12px; }
+.nv-h1 { margin: 0 0 16px; font-size: 22px; }
+
+.nv-empty {
+  padding: 28px; text-align: center; color: var(--muted);
+  border: 1px dashed var(--border); border-radius: 10px;
+}
+
+/* Generic button styles — used by the modal and tied to the dark theme.
+   Kept minimal so they don't fight existing inline-styled buttons. */
+.nv-btn {
+  padding: 6px 12px; border-radius: 6px; cursor: pointer;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); font-size: 12px;
+}
+.nv-btn:hover { background: var(--border); }
+.nv-btn-icon {
+  width: 28px; height: 28px; border-radius: 6px; cursor: pointer;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); font-size: 18px; line-height: 1;
+}
+.nv-btn-icon:hover { background: var(--border); }
+
+/* Per-row "view body" trigger inside <td>. Compact monospace `{}` so it
+   reads as "look inside" and doesn't widen the column. */
+.nv-view-body {
+  font-family: ui-monospace, "SF Mono", monospace;
+  font-size: 12px; padding: 2px 8px; cursor: pointer;
+  background: transparent; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 4px;
+}
+.nv-view-body:hover { color: var(--text); background: var(--panel-2); }
+
+/* Modal — full-screen backdrop + centred card with copy-friendly readonly body. */
+.nv-modal-backdrop {
+  position: fixed; inset: 0; z-index: 100;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, 0.55); backdrop-filter: blur(2px);
+  padding: 24px;
+}
+.nv-modal {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; width: min(900px, 95vw); max-height: 80vh;
+  display: flex; flex-direction: column;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.5);
+}
+.nv-modal-header {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 16px; border-bottom: 1px solid var(--border);
+}
+.nv-modal-title {
+  font-size: 13px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.nv-modal-body {
+  flex: 1; min-height: 200px; padding: 12px 16px;
+  background: var(--bg); color: var(--text);
+  border: none; outline: none; resize: none;
+  font-size: 12px; line-height: 1.5;
+}

@@ -1,12 +1,33 @@
+import { setTimeout as sleep } from "node:timers/promises"
 import { Transport } from "@nestjs/microservices"
 import { NevoKafkaClient } from "./nevo-kafka.client"
-import { DEFAULT_BROADCAST_TOPIC, DEFAULT_DISCOVERY_TOPIC, DEFAULT_SUBSCRIPTION_SUFFIX } from "../../common"
+import {
+  DEFAULT_BROADCAST_TOPIC,
+  DEFAULT_DISCOVERY_TOPIC,
+  DEFAULT_SUBSCRIPTION_SUFFIX,
+  Codec,
+  BackoffOptions,
+  RetryOptions,
+  CircuitBreakerOptions,
+  IdempotencyOptions,
+  CompressionOptions,
+  SecurityOptions,
+  TracingOptions,
+  NevoLogger
+} from "../../common"
 import { getKafkaModule } from "../optional-deps"
+
+export const NEVO_KAFKA_CLIENT_TOKEN = "NEVO_KAFKA_CLIENT"
+
+interface TopicCacheEntry { topics: Set<string>; fetchedAt: number }
+const ADMIN_TOPICS_CACHE = new Map<string, TopicCacheEntry>()
+const ADMIN_TOPICS_CACHE_TTL_MS = 60_000
 
 export interface KafkaClientFactoryOptions {
   clientIdPrefix: string
   groupIdPrefix?: string
   serviceName?: string
+  instanceId?: string
   sessionTimeout?: number
   allowAutoTopicCreation?: boolean
   retryAttempts?: number
@@ -15,10 +36,26 @@ export interface KafkaClientFactoryOptions {
   kafkaPort?: string
   debug?: boolean
   authToken?: string
+  codec?: Codec | string
+  logger?: NevoLogger
+  retry?: RetryOptions
+  backoff?: BackoffOptions
+  circuitBreaker?: CircuitBreakerOptions
+  idempotency?: IdempotencyOptions
+  compression?: CompressionOptions
+  security?: SecurityOptions
+  tracing?: TracingOptions
+  timeoutMs?: number
+  dlq?: { enabled?: boolean }
   discovery?: {
     enabled?: boolean
     heartbeatIntervalMs?: number
     ttlMs?: number
+    pruneIntervalMs?: number
+    capabilities?: string[]
+    host?: string
+    port?: number
+    version?: string
   }
 }
 
@@ -45,16 +82,31 @@ async function createKafkaTopics(serviceNames: string[], options: KafkaClientFac
     await admin.connect()
     console.log(`[KafkaAdmin] Connected to Kafka broker at ${host}:${port}`)
 
-    const existingTopics = await admin.listTopics()
+    const cacheKey = `${host}:${port}`
+    const cached = ADMIN_TOPICS_CACHE.get(cacheKey)
+    const now = Date.now()
+    let existingTopics: string[]
+    if (cached && now - cached.fetchedAt < ADMIN_TOPICS_CACHE_TTL_MS) {
+      existingTopics = [...cached.topics]
+    } else {
+      existingTopics = await admin.listTopics()
+      ADMIN_TOPICS_CACHE.set(cacheKey, { topics: new Set(existingTopics), fetchedAt: now })
+    }
     console.log(`[KafkaAdmin] Existing topics:`, existingTopics)
 
-    const topicsToCreate = serviceNames.flatMap((serviceName) => {
+    type KafkaTopicConfig = {
+      topic: string
+      numPartitions: number
+      replicationFactor: number
+      configEntries: { name: string; value: string }[]
+    }
+    const topicsToCreate: KafkaTopicConfig[] = serviceNames.flatMap<KafkaTopicConfig>((serviceName) => {
       const normalizedServiceName = serviceName.toLowerCase()
       const eventsTopic = `${normalizedServiceName}-events`
       const replyTopic = `${eventsTopic}.reply`
       const subscriptionTopic = `${normalizedServiceName}${DEFAULT_SUBSCRIPTION_SUFFIX}`
 
-      const topics = []
+      const topics: KafkaTopicConfig[] = []
 
       if (!existingTopics.includes(eventsTopic)) {
         topics.push({
@@ -141,7 +193,7 @@ async function createKafkaTopics(serviceNames: string[], options: KafkaClientFac
       )
 
       // Wait a bit for topics to be fully initialized
-      await new Promise((resolve) => setTimeout(resolve, 2000))
+      await sleep(2000)
 
       // Verify topics were created
       const updatedTopics = await admin.listTopics()
@@ -195,7 +247,7 @@ export const createNevoKafkaClient = (serviceNames: string[], options: KafkaClie
   const mergedOptions = { ...defaultOptions, ...options }
 
   return {
-    provide: "NEVO_KAFKA_CLIENT",
+    provide: NEVO_KAFKA_CLIENT_TOKEN,
     useFactory: async () => {
       const host = process.env[mergedOptions.kafkaHost || "KAFKA_HOST"] || "localhost"
       const port = parseInt(process.env[mergedOptions.kafkaPort || "KAFKA_PORT"] || "9092")
@@ -219,7 +271,7 @@ export const createNevoKafkaClient = (serviceNames: string[], options: KafkaClie
           }
 
           // Wait before retrying
-          await new Promise((resolve) => setTimeout(resolve, 2000 * topicCreationAttempts))
+          await sleep(2000 * topicCreationAttempts)
         }
       }
 
@@ -263,9 +315,20 @@ export const createNevoKafkaClient = (serviceNames: string[], options: KafkaClie
         timeoutMs: mergedOptions.timeoutMs,
         debug: mergedOptions.debug,
         serviceName: mergedOptions.serviceName || mergedOptions.clientIdPrefix,
+        instanceId: mergedOptions.instanceId,
         authToken: mergedOptions.authToken,
         brokers: [`${host}:${port}`],
-        discovery: mergedOptions.discovery
+        discovery: mergedOptions.discovery,
+        codec: mergedOptions.codec,
+        logger: mergedOptions.logger,
+        retry: mergedOptions.retry,
+        backoff: mergedOptions.backoff,
+        circuitBreaker: mergedOptions.circuitBreaker,
+        idempotency: mergedOptions.idempotency,
+        compression: mergedOptions.compression,
+        security: mergedOptions.security,
+        tracing: mergedOptions.tracing,
+        dlq: mergedOptions.dlq
       })
     }
   }

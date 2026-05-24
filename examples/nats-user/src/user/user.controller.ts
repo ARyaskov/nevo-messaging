@@ -4,9 +4,23 @@ import { UserService } from "./user.service"
 
 @Controller()
 @NatsSignalRouter([UserService], {
+  // Plain caller-based ACL.
   accessControl: {
-    rules: [{ topic: "user-events", method: "*", allow: ["frontend", "coordinator"] }],
-    logDenied: true
+    rules: [
+      { topic: "user-events", method: "*", allow: ["frontend", "coordinator"] },
+      // Stricter rule on the destructive call.
+      { topic: "user-events", method: "user.delete", allow: ["coordinator"] }
+    ],
+    logDenied: true,
+    allowAllByDefault: false
+  },
+  // Audit hook — log every dispatch with redaction handled upstream.
+  before: async (ctx) => {
+    if (process.env.NEVO_DEBUG_HOOKS === "1") {
+      const meta = (ctx.rawData as any)?.meta
+      console.log(`[router] ${ctx.method} from ${meta?.callerService ?? "?"}`)
+    }
+    return ctx.params
   }
 })
 export class UserController {

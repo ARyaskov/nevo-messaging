@@ -1,11 +1,41 @@
-import { createSocketMicroservice } from "@riaskov/nevo-messaging"
+import {
+  GracefulShutdown,
+  HealthRegistry,
+  createLogger,
+  createSocketMicroservice,
+  setDefaultLogger
+} from "@riaskov/nevo-messaging"
 import { AppModule } from "./app.module"
 
-createSocketMicroservice({
-  microserviceName: "user",
-  module: AppModule,
-  port: 8092,
-  host: "0.0.0.0"
-}).catch((error) => {
-  console.error(error)
+async function bootstrap() {
+  setDefaultLogger(createLogger({ name: "user", level: (process.env.LOG_LEVEL as any) ?? "info" }))
+
+  const app = await createSocketMicroservice({
+    microserviceName: "user",
+    module: AppModule,
+    port: 8092,
+    host: "0.0.0.0"
+  })
+
+  const shutdown = new GracefulShutdown()
+  const health = app.get(HealthRegistry)
+  health.register(
+    "not-draining",
+    () => ({ status: shutdown.isShuttingDown() ? "down" : "ok" }),
+    { kind: "readiness" }
+  )
+  shutdown.register("close nest app", () => app.close())
+
+  for (const sig of ["SIGTERM", "SIGINT"] as const) {
+    process.on(sig, async () => {
+      if (shutdown.isShuttingDown()) return
+      await shutdown.shutdown(30_000)
+      process.exit(0)
+    })
+  }
+}
+
+bootstrap().catch((err) => {
+  console.error(err)
+  process.exit(1)
 })
