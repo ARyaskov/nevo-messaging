@@ -172,7 +172,7 @@ export class NevoHttp2Client {
             const v = h["content-encoding"]
             respEncoding = typeof v === "string" ? v : Array.isArray(v) ? v[0] : undefined
           })
-          stream.on("data", (c) => chunks.push(c))
+          stream.on("data", (c) => chunks.push(c as any))
           stream.on("end", () => {
             clearTimeout(timer)
             try {
