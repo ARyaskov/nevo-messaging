@@ -31,11 +31,15 @@ import {
   maybeCompress,
   maybeCompressAsync,
   maybeDecompress,
+  maybeDecompressAsync,
+  shouldDecompressAsync,
+  enforcePayloadLimit,
   DEFAULT_MAX_PAYLOAD_BYTES,
   getDefaultTracer,
   NevoTracer,
   getDefaultMetrics,
   NEVO_METRIC_NAMES,
+  methodLabel,
   MetricsRegistry,
   GracefulShutdown,
   LruIdempotencyCache,
@@ -69,7 +73,13 @@ interface StickyGroup {
   consumer: Consumer
   dispatcher: Map<string, Set<StickyHandlerEntry>>
   manualAck: boolean
+  deliveryCounts: Map<string, number>
 }
+
+// Defensive upper bound on a consumer's deliveryCounts map. Entries are normally
+// dropped on success / DLQ / max-delivery / no-match, so this only ever bites a
+// pathological stream that accumulates in-flight retries faster than they resolve.
+const MAX_DELIVERY_COUNTS = 10_000
 
 export class NevoKafkaClient {
   private readonly kafkaClient: ClientKafka
@@ -216,10 +226,22 @@ export class NevoKafkaClient {
     return { key: uuid, value: compressed.data, meta, uuid, method: versioned }
   }
 
-  private decodePayload<T = any>(data: Uint8Array | Buffer | string, encoding?: string): T {
+  private decodePayload<T = any>(data: Uint8Array | Buffer | string, encoding?: string): T | Promise<T> {
     const buf = typeof data === "string" ? Buffer.from(data, "utf8") : Buffer.from(data as any)
     this.metrics.observeHistogram(NEVO_METRIC_NAMES.payloadBytes, { direction: "in", service: this.serviceName ?? "unknown" }, buf.byteLength)
-    const decompressed = encoding ? maybeDecompress(buf, encoding) : buf
+    // Tiny / identity payloads inflate synchronously; larger compressed buffers
+    // offload to the worker pool via maybeDecompressAsync.
+    if (!shouldDecompressAsync(buf.byteLength, encoding)) {
+      const decompressed = maybeDecompress(buf, encoding, this.maxPayloadBytes)
+      enforcePayloadLimit(decompressed, this.maxPayloadBytes)
+      return this.codec.decode<T>(decompressed)
+    }
+    return this.decodePayloadAsync<T>(buf, encoding)
+  }
+
+  private async decodePayloadAsync<T = any>(buf: Buffer, encoding?: string): Promise<T> {
+    const decompressed = await maybeDecompressAsync(buf, encoding, this.maxPayloadBytes)
+    enforcePayloadLimit(decompressed, this.maxPayloadBytes)
     return this.codec.decode<T>(decompressed)
   }
 
@@ -231,7 +253,7 @@ export class NevoKafkaClient {
     return normalized
   }
 
-  async query<T = any>(serviceName: string, method: string, params: any, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; tenantId?: string; timeoutMs?: number }): Promise<T> {
+  async query<T = unknown>(serviceName: string, method: string, params: unknown, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; tenantId?: string; timeoutMs?: number }): Promise<T> {
     const normalized = this.ensureServiceRegistered(serviceName)
     const topic = `${normalized}-events`
     const cbKey = `${normalized}:${method}`
@@ -254,7 +276,7 @@ export class NevoKafkaClient {
           const span = this.tracer.startSpan(`nevo.client.query ${normalized}.${method}`, { "nevo.method": method, "nevo.service": normalized, "nevo.attempt": attempt })
           try {
             const response: any = await lastValueFrom(this.kafkaClient.send<any>(topic, { key, value: Buffer.from(value) }).pipe(timeout(opts?.timeoutMs ?? this.timeoutMs)))
-            const payload = typeof response === "string" || response instanceof Uint8Array ? this.decodePayload(response as any) : response
+            const payload = typeof response === "string" || response instanceof Uint8Array ? await this.decodePayload(response as any) : response
             if (payload?.params?.result === "error" && payload?.params?.error) {
               const err = payload.params.error
               throw new MessagingError(err.code, err.details ?? { message: err.message }, err.service || normalized)
@@ -270,8 +292,8 @@ export class NevoKafkaClient {
             throw err
           } finally {
             span.end()
-            this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, { transport: "kafka", service: normalized, method, role: "client" })
-            if (attempt > 1) this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "kafka", service: normalized, method })
+            this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, { transport: "kafka", service: normalized, method: methodLabel(method), role: "client" })
+            if (attempt > 1) this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "kafka", service: normalized, method: methodLabel(method) })
           }
         } catch (err: any) {
           this.circuitBreaker.onFailure(cbKey, err)
@@ -289,17 +311,21 @@ export class NevoKafkaClient {
     })())
   }
 
-  async emit(serviceName: string, method: string, params: any, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<void> {
+  async emit(serviceName: string, method: string, params: unknown, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<void> {
     const normalized = this.ensureServiceRegistered(serviceName)
     const topic = `${normalized}-events`
     const { key, value } = await this.encodeRequest(method, params, "emit", opts)
     this.kafkaClient.emit(topic, { key, value: Buffer.from(value) })
   }
 
-  async emitBatch(items: Array<{ serviceName: string; method: string; params: any; opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> } }>): Promise<void> {
+  async emitBatch(items: Array<{ serviceName: string; method: string; params: unknown; opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> } }>): Promise<void> {
     if (items.length === 0) return
     if (!this.batchProducer) {
-      this.batchProducer = this.sharedKafkaForSubs.producer({ allowAutoTopicCreation: true })
+      // Match the server-side producer's durability posture (see kafka.config.ts):
+      // idempotent + single in-flight request guarantees ordered, exactly-once
+      // appends; without these a transient broker hiccup can silently drop or
+      // reorder a batch.
+      this.batchProducer = this.sharedKafkaForSubs.producer({ idempotent: true, maxInFlightRequests: 1, allowAutoTopicCreation: true })
       await this.batchProducer.connect()
     }
     const byTopic = new Map<string, Array<{ key: string; value: Buffer }>>()
@@ -324,24 +350,55 @@ export class NevoKafkaClient {
     }
     const topicMessages: { topic: string; messages: { key: string; value: Buffer }[] }[] = []
     for (const [topic, messages] of byTopic.entries()) topicMessages.push({ topic, messages })
-    await this.batchProducer!.sendBatch({ topicMessages })
+    await this.batchProducer!.sendBatch({ topicMessages, acks: -1 })
   }
 
   getAvailableServices(): string[] { return [...this.serviceNames] }
 
-  async publish(serviceName: string, method: string, params: any, opts?: { version?: string; headers?: Record<string, string> }): Promise<void> {
+  async publish(serviceName: string, method: string, params: unknown, opts?: { version?: string; headers?: Record<string, string> }): Promise<void> {
     const normalized = this.ensureServiceRegistered(serviceName)
     const topic = `${normalized}${DEFAULT_SUBSCRIPTION_SUFFIX}`
     const { key, value } = await this.encodeRequest(method, params, "sub", opts)
     this.kafkaClient.emit(topic, { key, value: Buffer.from(value) })
   }
 
-  async broadcast(method: string, params: any, opts?: { version?: string; headers?: Record<string, string> }): Promise<void> {
+  async broadcast(method: string, params: unknown, opts?: { version?: string; headers?: Record<string, string> }): Promise<void> {
     const { key, value } = await this.encodeRequest(method, params, "broadcast", opts)
     this.kafkaClient.emit(DEFAULT_BROADCAST_TOPIC, { key, value: Buffer.from(value) })
   }
 
-  async subscribe<T = any>(
+  // Evict the oldest entries once the per-consumer counter map exceeds its cap.
+  // Map preserves insertion order, so iterating keys() yields oldest-first.
+  private boundDeliveryCounts(counts: Map<string, number>): void {
+    if (counts.size <= MAX_DELIVERY_COUNTS) return
+    for (const key of counts.keys()) {
+      counts.delete(key)
+      if (counts.size <= MAX_DELIVERY_COUNTS) break
+    }
+  }
+
+  private resumeBackoffMs(attempts: number): number {
+    const exp = this.retryOptions.baseMs * Math.pow(2, Math.max(0, attempts - 1))
+    return Math.min(this.retryOptions.maxMs, exp)
+  }
+
+  // kafkajs pause() is sticky: the partition stays paused until resume() runs.
+  // Capture the resume thunk it returns and re-enable consumption after a backoff
+  // so the failed message is redelivered instead of stalling the partition forever.
+  private scheduleResume(pause: () => () => void, attempts: number): void {
+    let resume: () => void
+    try {
+      resume = pause()
+    } catch {
+      return
+    }
+    const timer = setTimeout(() => {
+      try { resume() } catch {}
+    }, this.resumeBackoffMs(attempts))
+    if (typeof timer.unref === "function") timer.unref()
+  }
+
+  async subscribe<T = unknown>(
     serviceName: string,
     method: string,
     options: SubscriptionOptions | undefined,
@@ -375,7 +432,7 @@ export class NevoKafkaClient {
         let payload: any
         try {
           const encoding = message.headers?.["content-encoding"]?.toString?.()
-          payload = this.decodePayload(message.value, encoding)
+          payload = await this.decodePayload(message.value, encoding)
         } catch (err) {
           this.logger.error({ event: "kafka.parse_error", topic, err: (err as Error)?.message }, "Failed to parse subscription message")
           await this.dlq.route({ topic, reason: "parse-error", error: { message: (err as Error)?.message }, ts: Date.now() })
@@ -387,6 +444,7 @@ export class NevoKafkaClient {
         const msgKey = `${topic}:${partition}:${message.offset}`
         const attempts = (deliveryCounts.get(msgKey) ?? 0) + 1
         deliveryCounts.set(msgKey, attempts)
+        this.boundDeliveryCounts(deliveryCounts)
 
         const context: SubscriptionContext = {
           meta: payload.meta || {},
@@ -422,8 +480,10 @@ export class NevoKafkaClient {
             }
             return
           }
+          // Keep the counter (attempts must accumulate toward maxAttempts) and
+          // resume the partition after a backoff so the message is redelivered.
           if (manualAck) {
-            try { pause() } catch {}
+            this.scheduleResume(pause, attempts)
           }
         }
       }
@@ -485,7 +545,7 @@ export class NevoKafkaClient {
     const dispatcher = new Map<string, Set<StickyHandlerEntry>>()
     const deliveryCounts = new Map<string, number>()
 
-    group = { consumer, dispatcher, manualAck }
+    group = { consumer, dispatcher, manualAck, deliveryCounts }
     this.stickyGroups.set(groupId, group)
     this.subscriptionConsumers.add(consumer)
 
@@ -497,7 +557,7 @@ export class NevoKafkaClient {
         let payload: any
         try {
           const encoding = message.headers?.["content-encoding"]?.toString?.()
-          payload = this.decodePayload(message.value, encoding)
+          payload = await this.decodePayload(message.value, encoding)
         } catch (err) {
           this.logger.error({ event: "kafka.parse_error", topic, err: (err as Error)?.message })
           await this.dlq.route({ topic, reason: "parse-error", error: { message: (err as Error)?.message }, ts: Date.now() })
@@ -507,12 +567,12 @@ export class NevoKafkaClient {
         const msgKey = `${topic}:${partition}:${message.offset}`
         const attempts = (deliveryCounts.get(msgKey) ?? 0) + 1
         deliveryCounts.set(msgKey, attempts)
+        this.boundDeliveryCounts(deliveryCounts)
 
-        let anyDelivered = false
+        let retryScheduled = false
         for (const entry of entries) {
           if (entry.method && payload.method !== entry.method && payload.method?.split("@")[0] !== entry.method) continue
           if (!matchesFilter(entry.filter, payload.meta)) continue
-          anyDelivered = true
 
           const context: SubscriptionContext = {
             meta: payload.meta || {},
@@ -540,12 +600,18 @@ export class NevoKafkaClient {
                 rawPayload: payload,
                 ts: Date.now()
               })
-            } else if (manualAck) {
-              try { pause() } catch {}
+            } else if (manualAck && !retryScheduled) {
+              // Pause once for the whole batch of matching handlers and resume
+              // after a backoff; the counter is retained below so attempts grow.
+              this.scheduleResume(pause, attempts)
+              retryScheduled = true
             }
           }
         }
-        if (anyDelivered) deliveryCounts.delete(msgKey)
+        // Drop the per-offset counter unless a redelivery is pending. This covers
+        // both successful delivery and messages that matched no handler (which
+        // previously leaked one entry per message on busy topics).
+        if (!retryScheduled) deliveryCounts.delete(msgKey)
       }
     })
 

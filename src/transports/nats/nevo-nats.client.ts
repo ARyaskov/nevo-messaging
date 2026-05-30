@@ -23,16 +23,20 @@ import {
   getDefaultLogger,
   CircuitBreakerRegistry,
   resolveRetryOptions,
-  withRetry,
+  runClientPipeline,
   resolveCompressionOptions,
   maybeCompress,
   maybeCompressAsync,
   maybeDecompress,
+  maybeDecompressAsync,
+  shouldDecompressAsync,
+  enforcePayloadLimit,
   DEFAULT_MAX_PAYLOAD_BYTES,
   getDefaultTracer,
   NevoTracer,
   getDefaultMetrics,
   NEVO_METRIC_NAMES,
+  methodLabel,
   MetricsRegistry,
   GracefulShutdown,
   LruIdempotencyCache,
@@ -263,9 +267,21 @@ export class NevoNatsClient {
     return { payload: compressed.data, uuid, method: versionedMethod, meta }
   }
 
-  private decodePayload<T = any>(data: Uint8Array, encoding?: string): T {
+  private decodePayload<T = any>(data: Uint8Array, encoding?: string): T | Promise<T> {
     this.metrics.observeHistogram(NEVO_METRIC_NAMES.payloadBytes, { direction: "in", service: this.serviceName ?? "unknown" }, data.byteLength)
-    const decompressed = maybeDecompress(data, encoding)
+    // Tiny / identity payloads inflate synchronously (no event-loop hop on the
+    // common path); larger compressed buffers offload to the worker pool.
+    if (!shouldDecompressAsync(data.byteLength, encoding)) {
+      const decompressed = maybeDecompress(data, encoding, this.maxPayloadBytes)
+      enforcePayloadLimit(decompressed, this.maxPayloadBytes)
+      return this.codec.decode<T>(decompressed)
+    }
+    return this.decodePayloadAsync<T>(data, encoding)
+  }
+
+  private async decodePayloadAsync<T = any>(data: Uint8Array, encoding?: string): Promise<T> {
+    const decompressed = await maybeDecompressAsync(data, encoding, this.maxPayloadBytes)
+    enforcePayloadLimit(decompressed, this.maxPayloadBytes)
     return this.codec.decode<T>(decompressed)
   }
 
@@ -277,10 +293,12 @@ export class NevoNatsClient {
     return normalized
   }
 
-  async query<T = any>(serviceName: string, method: string, params: any, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; tenantId?: string; timeoutMs?: number }): Promise<T> {
+  async query<T = unknown>(serviceName: string, method: string, params: unknown, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; tenantId?: string; timeoutMs?: number }): Promise<T> {
     const normalized = this.ensureServiceRegistered(serviceName)
     const subject = `${normalized}-events`
     const cbKey = `${normalized}:${method}`
+    // Version-stripped label so `foo@v1`/`foo@v2` don't split into separate series.
+    const metricMethod = methodLabel(method)
 
     return this.shutdown.trackInflight((async () => {
       const idempotencyKey = opts?.idempotencyKey
@@ -288,8 +306,11 @@ export class NevoNatsClient {
         return this.idempotencyCache.get(idempotencyKey) as T
       }
 
-      const result = await withRetry(async (attempt) => {
-        this.circuitBreaker.before(cbKey)
+      // Breaker wraps the *entire* retried operation through the shared client
+      // pipeline, so one logical call records exactly one breaker outcome — not
+      // one per `withRetry` attempt (which previously tripped it ~maxAttempts×
+      // too early). Per-attempt spans / DevTools events / metrics stay inside.
+      const result = await runClientPipeline<T>(this.circuitBreaker, this.retryOptions, cbKey, async (attempt) => {
         const startMs = Date.now()
         let lastUuid: string | undefined
         let lastChainId: string | undefined
@@ -306,12 +327,11 @@ export class NevoNatsClient {
           })
           try {
             const msg = await nc.request(subject, payload, { timeout: opts?.timeoutMs ?? this.timeoutMs, headers: this.toNatsHeaders(meta.headers) })
-            const response: any = this.decodePayload(msg.data, (meta.headers as any)?.["content-encoding"] || meta.contentEncoding)
+            const response: any = await this.decodePayload(msg.data, (meta.headers as any)?.["content-encoding"] || meta.contentEncoding)
             if (response?.params?.result === "error" && response?.params?.error) {
               const errorData = response.params.error
               throw new MessagingError(errorData.code, errorData.details ?? { message: errorData.message }, errorData.service || normalized)
             }
-            this.circuitBreaker.onSuccess(cbKey)
             span.setStatus({ code: 1 })
             publishClientEvent(this.devtoolsBus, { service: normalized, method, uuid, chainId: meta.nevoChainId, durationMs: Date.now() - startMs, status: "ok", transport: "nats", origin: this.serviceName })
             return response?.params?.result as T
@@ -322,11 +342,10 @@ export class NevoNatsClient {
             throw err
           } finally {
             span.end()
-            this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, { transport: "nats", service: normalized, method, role: "client" })
-            if (attempt > 1) this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "nats", service: normalized, method })
+            this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, { transport: "nats", service: normalized, method: metricMethod, role: "client" })
+            if (attempt > 1) this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "nats", service: normalized, method: metricMethod })
           }
         } catch (err: any) {
-          this.circuitBreaker.onFailure(cbKey, err)
           publishClientEvent(this.devtoolsBus, {
             service: normalized,
             method,
@@ -340,7 +359,7 @@ export class NevoNatsClient {
           })
           throw err
         }
-      }, this.retryOptions)
+      })
 
       if (idempotencyKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(idempotencyKey, result)
       return result
@@ -360,7 +379,7 @@ export class NevoNatsClient {
     return undefined
   }
 
-  async emit(serviceName: string, method: string, params: any, opts?: { version?: string; headers?: Record<string, string>; idempotencyKey?: string }): Promise<void> {
+  async emit(serviceName: string, method: string, params: unknown, opts?: { version?: string; headers?: Record<string, string>; idempotencyKey?: string }): Promise<void> {
     const normalized = this.ensureServiceRegistered(serviceName)
     const subject = `${normalized}-events`
     const nc = await this.ensureConnection()
@@ -368,7 +387,7 @@ export class NevoNatsClient {
     nc.publish(subject, payload, { headers: this.toNatsHeaders(meta.headers) })
   }
 
-  async publish(serviceName: string, method: string, params: any, opts?: { version?: string; headers?: Record<string, string> }): Promise<void> {
+  async publish(serviceName: string, method: string, params: unknown, opts?: { version?: string; headers?: Record<string, string> }): Promise<void> {
     const normalized = this.ensureServiceRegistered(serviceName)
     const subject = `${normalized}${DEFAULT_SUBSCRIPTION_SUFFIX}`
     const nc = await this.ensureConnection()
@@ -376,16 +395,16 @@ export class NevoNatsClient {
     nc.publish(subject, payload, { headers: this.toNatsHeaders(meta.headers) })
   }
 
-  async broadcast(method: string, params: any, opts?: { version?: string; headers?: Record<string, string> }): Promise<void> {
+  async broadcast(method: string, params: unknown, opts?: { version?: string; headers?: Record<string, string> }): Promise<void> {
     const nc = await this.ensureConnection()
     const { payload, meta } = await this.encodeRequest(method, params, "broadcast", opts)
     nc.publish(DEFAULT_BROADCAST_TOPIC, payload, { headers: this.toNatsHeaders(meta.headers) })
   }
 
-  async requestMany<T = any>(
+  async requestMany<T = unknown>(
     serviceName: string,
     method: string,
-    params: any,
+    params: unknown,
     opts?: { version?: string; headers?: Record<string, string>; tenantId?: string; timeoutMs?: number; maxMessages?: number; maxWait?: number }
   ): Promise<T[]> {
     const normalized = this.ensureServiceRegistered(serviceName)
@@ -401,7 +420,7 @@ export class NevoNatsClient {
     for await (const msg of iter) {
       try {
         const encoding = getNatsHeader(msg.headers, "content-encoding") || meta.contentEncoding
-        const response: any = this.decodePayload(msg.data, encoding)
+        const response: any = await this.decodePayload(msg.data, encoding)
         if (response?.params?.result === "error") continue
         results.push(response?.params?.result as T)
       } catch {
@@ -411,7 +430,7 @@ export class NevoNatsClient {
     return results
   }
 
-  async subscribeWildcard<T = any>(
+  async subscribeWildcard<T = unknown>(
     pattern: string,
     handler: (data: T, context: SubscriptionContext & { subject: string; method: string }) => Promise<void> | void
   ): Promise<Subscription> {
@@ -422,7 +441,7 @@ export class NevoNatsClient {
       for await (const msg of sub) {
         try {
           const encoding = getNatsHeader(msg.headers, "content-encoding")
-          const payload: any = this.decodePayload(msg.data, encoding)
+          const payload: any = await this.decodePayload(msg.data, encoding)
           const ctx = {
             meta: payload.meta || {},
             ack: async () => {},
@@ -439,10 +458,10 @@ export class NevoNatsClient {
     return { unsubscribe: async () => { this.subscriptions.delete(sub); sub.unsubscribe() } }
   }
 
-  async subscribeQuery<T = any>(
+  async subscribeQuery<T = unknown>(
     serviceName: string,
     method: string,
-    params: any,
+    params: unknown,
     onChunk: (chunk: T) => Promise<void> | void,
     onEnd?: (summary: { count: number; durationMs: number }) => void,
     opts?: { version?: string; headers?: Record<string, string>; timeoutMs?: number }
@@ -472,7 +491,7 @@ export class NevoNatsClient {
           if (cancelled) break
           try {
             const encoding = getNatsHeader(msg.headers, "content-encoding")
-            const response: any = this.decodePayload(msg.data, encoding)
+            const response: any = await this.decodePayload(msg.data, encoding)
             if (response?.meta?.headers?.["nevo-stream-end"] === "1") break
             if (response?.params?.result === undefined) continue
             count++
@@ -494,7 +513,7 @@ export class NevoNatsClient {
     }
   }
 
-  async emitBatch(items: Array<{ serviceName: string; method: string; params: any; opts?: { version?: string; headers?: Record<string, string>; idempotencyKey?: string } }>): Promise<void> {
+  async emitBatch(items: Array<{ serviceName: string; method: string; params: unknown; opts?: { version?: string; headers?: Record<string, string>; idempotencyKey?: string } }>): Promise<void> {
     if (items.length === 0) return
     const nc = await this.ensureConnection()
     if (this.compression.async && this.compression.enabled) {
@@ -517,7 +536,7 @@ export class NevoNatsClient {
     await nc.flush()
   }
 
-  async publishBatch(items: Array<{ serviceName: string; method: string; params: any; opts?: { version?: string; headers?: Record<string, string> } }>): Promise<void> {
+  async publishBatch(items: Array<{ serviceName: string; method: string; params: unknown; opts?: { version?: string; headers?: Record<string, string> } }>): Promise<void> {
     if (items.length === 0) return
     const nc = await this.ensureConnection()
     if (!(this.compression.async && this.compression.enabled)) {
@@ -548,7 +567,7 @@ export class NevoNatsClient {
     await this.nc.flush()
   }
 
-  async subscribe<T = any>(
+  async subscribe<T = unknown>(
     serviceName: string,
     method: string,
     options: SubscriptionOptions | undefined,
@@ -576,7 +595,7 @@ export class NevoNatsClient {
         }
         try {
           const encoding = getNatsHeader(msg.headers, "content-encoding")
-          const payload: any = this.decodePayload(msg.data, encoding)
+          const payload: any = await this.decodePayload(msg.data, encoding)
           if (method && payload.method !== method && payload.method?.split("@")[0] !== method) continue
           if (!matchesFilter(options?.filter, payload.meta)) continue
           if (options?.room && payload.meta?.headers?.["room"] !== options.room) continue
@@ -652,14 +671,6 @@ export class NevoNatsClient {
       this.nc = null
     }
   }
-}
-
-function extractNatsHeaders(h: any): Record<string, string> | undefined {
-  try {
-    const out: Record<string, string> = {}
-    for (const k of h.keys()) out[k] = h.get(k)
-    return out
-  } catch { return undefined }
 }
 
 function getNatsHeader(h: any, key: string): string | undefined {

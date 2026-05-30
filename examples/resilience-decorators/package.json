@@ -1,0 +1,33 @@
+{
+  "name": "@riaskov/nevo-messaging-resilience-decorators-example",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "type:check": "npx tsc --noEmit",
+    "start": "npx rimraf ./dist/ && pnpm type:check && nest start --builder swc",
+    "build": "pnpm type:check && nest build --builder swc"
+  },
+  "dependencies": {
+    "@nestjs/common": "11.1.4",
+    "@nestjs/config": "4.0.2",
+    "@nestjs/core": "11.1.4",
+    "@nestjs/platform-fastify": "11.1.4",
+    "@riaskov/nevo-messaging": "../../",
+    "@nats-io/transport-node": "^3.0.0",
+    "@nats-io/nats-core": "^3.0.0",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2",
+    "ioredis": "^5.4.1"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "11.0.10",
+    "@swc/cli": "0.7.8",
+    "@swc/core": "1.13.4",
+    "@types/node": "24.0.14",
+    "rimraf": "6.0.1",
+    "typescript": "^6.0.0"
+  }
+}

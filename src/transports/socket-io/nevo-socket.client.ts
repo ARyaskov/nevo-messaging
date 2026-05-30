@@ -31,6 +31,7 @@ import {
   NevoTracer,
   getDefaultMetrics,
   NEVO_METRIC_NAMES,
+  methodLabel,
   MetricsRegistry,
   GracefulShutdown,
   LruIdempotencyCache,
@@ -116,7 +117,7 @@ export class NevoSocketClient {
     return this.tracer.inject(baseMeta)
   }
 
-  private buildEnvelope(method: string, params: any, type: MessageType, opts?: any) {
+  private buildEnvelope(method: string, params: unknown, type: MessageType, opts?: any) {
     const uuid = uuidv7()
     const meta = this.buildMeta(type, opts)
     const versioned = method.includes("@") ? method : formatMethod(method, opts?.version || DEFAULT_METHOD_VERSION)
@@ -154,7 +155,7 @@ export class NevoSocketClient {
     return socket
   }
 
-  async query<T = any>(serviceName: string, method: string, params: any, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; timeoutMs?: number; tenantId?: string }): Promise<T> {
+  async query<T = unknown>(serviceName: string, method: string, params: unknown, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; timeoutMs?: number; tenantId?: string }): Promise<T> {
     const cbKey = `${normalizeServiceName(serviceName)}:${method}`
     return this.shutdown.trackInflight((async () => {
       if (opts?.idempotencyKey && this.idempotencyCache.isEnabled() && this.idempotencyCache.has(opts.idempotencyKey)) {
@@ -176,13 +177,13 @@ export class NevoSocketClient {
               return
             }
             this.circuitBreaker.onSuccess(cbKey)
-            this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, { transport: "socketio", service: serviceName, method, role: "client" })
+            this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, { transport: "socketio", service: serviceName, method: methodLabel(method), role: "client" })
             resolve(response?.params?.result as T)
           })
           return await promise
         } catch (err) {
           this.circuitBreaker.onFailure(cbKey, err)
-          if (attempt > 1) this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "socketio", service: serviceName, method })
+          if (attempt > 1) this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "socketio", service: serviceName, method: methodLabel(method) })
           throw err
         }
       }, this.retryOptions)
@@ -191,19 +192,19 @@ export class NevoSocketClient {
     })())
   }
 
-  async emit(serviceName: string, method: string, params: any, opts?: any): Promise<void> {
+  async emit(serviceName: string, method: string, params: unknown, opts?: any): Promise<void> {
     const socket = this.getSocket(serviceName)
     const { env } = this.buildEnvelope(method, params, "emit", opts)
     socket.emit("nevo:emit", env)
   }
 
-  async publish(serviceName: string, method: string, params: any, opts?: any): Promise<void> {
+  async publish(serviceName: string, method: string, params: unknown, opts?: any): Promise<void> {
     const socket = this.getSocket(serviceName)
     const { env } = this.buildEnvelope(method, params, "sub", opts)
     socket.emit("nevo:publish", env)
   }
 
-  async broadcast(method: string, params: any, opts?: any): Promise<void> {
+  async broadcast(method: string, params: unknown, opts?: any): Promise<void> {
     const first = this.serviceUrls.keys().toArray()[0]
     if (!first) throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, { message: "No base URL available for broadcast" })
     const socket = this.getSocket(first)
@@ -211,7 +212,7 @@ export class NevoSocketClient {
     socket.emit("nevo:broadcast", env)
   }
 
-  async subscribe<T = any>(
+  async subscribe<T = unknown>(
     serviceName: string,
     method: string,
     options: SubscriptionOptions | undefined,

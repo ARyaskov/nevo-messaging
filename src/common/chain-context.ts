@@ -30,6 +30,26 @@ export interface ChainContext {
 const als = new AsyncLocalStorage<ChainContext>()
 
 /**
+ * Upper bound on an inbound chain id we are willing to honor. A UUIDv7 is 36
+ * chars; 64 leaves room for prefixed / trace-style correlation ids from other
+ * systems while still capping memory and log-injection blast radius.
+ */
+const MAX_CHAIN_ID_LEN = 64
+
+/**
+ * Characters allowed in an inbound chain id. Permissive enough for UUIDs,
+ * OpenTelemetry trace ids and common prefixed ids (`-` `_` `.` `:`), but no
+ * whitespace, control chars or other content an attacker could smuggle into
+ * logs / dashboards.
+ */
+const CHAIN_ID_RE = /^[A-Za-z0-9._:-]+$/
+
+/** True when an inbound chain id is a sane, bounded token we can trust. */
+export function isValidChainId(id: string): boolean {
+  return id.length > 0 && id.length <= MAX_CHAIN_ID_LEN && CHAIN_ID_RE.test(id)
+}
+
+/**
  * Generate a fresh chain identifier. UUIDv7 is used so chain ids embed a
  * timestamp and sort naturally by start time when grouped in the dashboard.
  */
@@ -63,7 +83,10 @@ export function runInChain<T>(ctx: ChainContext, fn: () => T): T {
  *   3. Otherwise mint a new chain id (this is the entry-point of a chain).
  */
 export function resolveInboundChainId(metaChainId: unknown): string {
-  if (typeof metaChainId === "string" && metaChainId.length > 0) return metaChainId
+  // The inbound chain id is attacker-controlled, so only honor it when it is a
+  // sane, bounded token (see isValidChainId). An over-long or junk value is
+  // discarded in favor of inheriting from ALS or minting a fresh id.
+  if (typeof metaChainId === "string" && isValidChainId(metaChainId)) return metaChainId
   const current = getCurrentChainId()
   if (current) return current
   return newChainId()

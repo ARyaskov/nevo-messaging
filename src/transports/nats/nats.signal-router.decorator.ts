@@ -20,6 +20,10 @@ import {
   getDefaultCodec,
   maybeCompress,
   maybeDecompress,
+  maybeDecompressAsync,
+  shouldDecompressAsync,
+  enforcePayloadLimit,
+  DEFAULT_MAX_PAYLOAD_BYTES,
   resolveCompressionOptions,
   getDefaultLogger,
   DlqRouter,
@@ -51,6 +55,7 @@ const DEFAULT_NATS_CLIENT_TOKEN = "NEVO_NATS_CLIENT"
 export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?: NatsSignalRouterOptions) {
   const codec: Codec = typeof options?.codec === "string" ? getCodec(options.codec) : (options?.codec as Codec) || getDefaultCodec()
   const compression = resolveCompressionOptions(options?.compression)
+  const maxPayloadBytes = options?.security?.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES
   const logger = options?.logger || getDefaultLogger().child({ component: "nats-router" })
   const dlq = options?.dlq instanceof DlqRouter ? options.dlq : new DlqRouter({ enabled: (options?.dlq as any)?.enabled === true })
 
@@ -149,7 +154,10 @@ export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?:
           for await (const msg of sub) {
             try {
               const encoding = msg.headers?.get?.("content-encoding")
-              const raw = encoding ? maybeDecompress(msg.data, encoding) : msg.data
+              const raw = shouldDecompressAsync(msg.data.byteLength, encoding)
+                ? await maybeDecompressAsync(msg.data, encoding, maxPayloadBytes)
+                : maybeDecompress(msg.data, encoding, maxPayloadBytes)
+              enforcePayloadLimit(raw, maxPayloadBytes)
               const payload = codec.decode(raw)
               const result = await ctx[handlerName](payload)
               if (msg.reply && result) {

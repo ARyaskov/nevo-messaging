@@ -13,14 +13,16 @@ Nevo separates the two and ships pluggable check builders for common dependencie
 import {
   HealthRegistry,
   NEVO_HEALTH_METHOD, NEVO_LIVENESS_METHOD, NEVO_READINESS_METHOD,
-  pgPing, redisPing, kafkaProducerPing, natsPing, httpPing,
+  pgPing, redisPing, kafkaAdminPing, natsPing, httpPing,
   memoryUsagePing, eventLoopLagPing
 } from "@riaskov/nevo-messaging"
 
 const reg = new HealthRegistry({
   serviceName: "user",
   instanceId: process.env.HOSTNAME,
-  version: "2.0.0"
+  version: "2.0.0",
+  timeoutMs: 3_000, // default per-check timeout when none is set on register()
+  cacheMs: 1_000    // serve a cached result for this long so rapid probes coalesce
 })
 
 reg.register("eventLoop", eventLoopLagPing(100), { kind: "liveness" })
@@ -29,7 +31,7 @@ reg.register("memory",    memoryUsagePing(1024),  { kind: "liveness" })
 reg.register("pg",    pgPing(pgClient),                                 { kind: "readiness" })
 reg.register("redis", redisPing(redisClient),                           { kind: "readiness" })
 reg.register("nats",  natsPing(natsConnection),                         { kind: "readiness", timeoutMs: 2_000 })
-reg.register("kafka", kafkaProducerPing(producer, { topic: "__health" }), { kind: "readiness" })
+reg.register("kafka", kafkaAdminPing(kafkaAdmin),                       { kind: "readiness" })
 reg.register("auth",  httpPing("https://auth/healthz"),                 { kind: "readiness" })
 ```
 
@@ -37,7 +39,8 @@ reg.register("auth",  httpPing("https://auth/healthz"),                 { kind: 
 
 - `fn` is a function returning `Promise<HealthCheckResult>` (or sync)
 - `opts.kind`: `"liveness"` | `"readiness"` | `"both"` (default `"both"`)
-- `opts.timeoutMs`: per-check timeout — a check that hangs marks itself `down`, not the entire registry
+- `opts.timeoutMs`: per-check timeout — a check that hangs marks itself `down`, not the entire registry (defaults to the registry `timeoutMs`)
+- `opts.cacheMs`: per-check result-cache window — overrides the registry `cacheMs` for this check
 
 `reg.unregister(name)` removes a check.
 
@@ -73,7 +76,7 @@ When the registry is attached to a controller, the framework auto-wires these th
 |---|---|
 | `pgPing(client, { sql? })` | Default `SELECT 1` |
 | `redisPing(client)` | `PING` |
-| `kafkaProducerPing(producer, { topic })` | Sends a tombstone to the topic |
+| `kafkaAdminPing(admin)` | `admin.describeCluster()` — non-mutating |
 | `natsPing(nc)` | RTT roundtrip |
 | `httpPing(url, opts?)` | HTTP 2xx check |
 | `memoryUsagePing(thresholdMb = 1024)` | `rss < threshold` |
@@ -140,4 +143,5 @@ Kubernetes removes the pod from endpoints; liveness keeps the pod alive while it
 
 - **Liveness should never call out.** A flaky DB should not kill your pod.
 - **Readiness should match traffic dependencies.** If handlers need Postgres, Postgres goes in readiness.
-- **Set `timeoutMs` per check.** A hung Redis must not block the probe.
+- **Set `timeoutMs` per check.** A hung Redis must not block the probe. The registry also applies a default `timeoutMs` (3s) so a black-holed connection can never hang `/ready` forever.
+- **Probes coalesce.** `report()` runs every check concurrently and caches each result for `cacheMs`, so frequent probes across replicas don't re-hammer the dependency.

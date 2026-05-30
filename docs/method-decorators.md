@@ -71,7 +71,19 @@ getProfile() {}
 
 ## Method-level decorators
 
-The framework ships exactly two:
+The framework currently ships these:
+
+| Decorator | Purpose | Doc |
+|---|---|---|
+| `@RateLimit` | Token-bucket inbound limiter | [rate-limiting.md](./rate-limiting.md) |
+| `@Cacheable`  | LRU result cache | this file |
+| `@Hedge` | Latency-driven parallel attempts | [hedging.md](./hedging.md) |
+| `@CircuitBreaker` | Sliding-window or count breaker per `service:method` | [circuit-breaker.md](./circuit-breaker.md) |
+| `@Adaptive` | Auto-tune retries/timeout from observed p99 | [adaptive.md](./adaptive.md) |
+| `@Backpressure` | High/low-watermark gate around subscribe handlers | [backpressure.md](./backpressure.md) |
+| `@Schema` | zod / class-validator input validation | [schema.md](./schema.md) |
+
+The four resilience decorators (`@Hedge` / `@CircuitBreaker` / `@Adaptive` / `@Backpressure`) compose: layered top-down as `backpressure → breaker → hedge → invoke` with adaptive feedback. See [resilience-decorators.md](./resilience-decorators.md).
 
 ### `@RateLimit`
 
@@ -99,14 +111,9 @@ async getById(id: bigint) { ... }
 
 ## What the framework does NOT ship
 
-The following decorators were never implemented; please ignore any earlier documentation that referenced them:
+- `@Retry` — retry is a client/option-level concern; see [retry.md](./retry.md).
 
-- `@Hedge` — call `hedge()` directly; see [hedging.md](./hedging.md)
-- `@Retry` — retry is a client/option-level concern; see [retry.md](./retry.md)
-- `@CircuitBreaker` — the breaker is a registry, not a decorator; see [circuit-breaker.md](./circuit-breaker.md)
-- `@Adaptive` — `AdaptiveTuner` is a class; see [adaptive.md](./adaptive.md)
-
-If you want method-level retry/hedging behavior, wrap the handler call site or build a small custom decorator on top of `withRetry()` / `hedge()`.
+If you want truly bespoke method-level behavior beyond what the seven decorators above offer, wrap the handler call site or build a small custom decorator on top of `withRetry()` / `hedge()` / `applyResilience()`.
 
 ## Hook context
 

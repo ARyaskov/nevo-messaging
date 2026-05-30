@@ -21,6 +21,20 @@ test("check timeout marks as down", async () => {
   assert.equal(report.checks?.slow.status, "down")
 })
 
+test("a check exceeding the default timeout fails fast instead of hanging", async () => {
+  const reg = new HealthRegistry({ serviceName: "svc", timeoutMs: 20 })
+  // No per-check timeout: the registry default must still bound this hung probe.
+  reg.register("hang", async () => {
+    await new Promise(() => {})
+    return { status: "ok" }
+  })
+  const start = Date.now()
+  const report = await reg.report()
+  const elapsed = Date.now() - start
+  assert.equal(report.checks?.hang.status, "down")
+  assert.ok(elapsed < 1_000, `expected fast fail, took ${elapsed}ms`)
+})
+
 test("memoryUsagePing reports under threshold", async () => {
   const fn = memoryUsagePing(100_000)
   const r = await fn()

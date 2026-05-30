@@ -17,7 +17,8 @@ export enum ErrorCode {
   INTERNAL = 15,
   CANCELLED = 16,
   UNSUPPORTED_VERSION = 17,
-  ACK_FAILED = 18
+  ACK_FAILED = 18,
+  REMOTE_ERROR = 19
 }
 
 export function isRetryable(code: ErrorCode): boolean {

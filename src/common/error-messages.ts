@@ -19,5 +19,6 @@ export const ErrorMessages: Record<number, string> = {
   [ErrorCode.INTERNAL]: "Internal error",
   [ErrorCode.CANCELLED]: "Request cancelled",
   [ErrorCode.UNSUPPORTED_VERSION]: "Unsupported method version",
-  [ErrorCode.ACK_FAILED]: "Failed to acknowledge message"
+  [ErrorCode.ACK_FAILED]: "Failed to acknowledge message",
+  [ErrorCode.REMOTE_ERROR]: "Remote returned an error response"
 }

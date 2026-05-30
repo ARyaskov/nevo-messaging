@@ -16,23 +16,26 @@ This folder contains the full documentation for `@riaskov/nevo-messaging`. The t
 - [HTTP/2](./basics-http2.md)
 - [WebSocket](./basics-websocket.md)
 - [Socket.IO](./basics-socket.md)
+- [In-memory (testing)](./testing.md)
+- [Transport capability matrix](./capability-matrix.md)
 
 ## Messaging patterns
 
 - [Query, emit, publish/subscribe, broadcast](./messaging-patterns.md)
 - [Signal routing & method decorators](./method-decorators.md)
 - [Subscription filters](./subscription-filters.md)
-- [Discovery & registry](./discovery.md)
+- [Discovery & registry (heartbeat + Consul + Kubernetes DNS)](./discovery.md)
 
 ## Reliability & resilience
 
+- [Resilience decorators (`@Hedge` / `@CircuitBreaker` / `@Adaptive` / `@Backpressure`)](./resilience-decorators.md)
 - [Retry policy](./retry.md)
 - [Circuit breaker (sliding-window, cost-based)](./circuit-breaker.md)
 - [Hedging](./hedging.md)
 - [Adaptive concurrency](./adaptive.md)
 - [Backpressure](./backpressure.md)
 - [Rate limiting](./rate-limiting.md)
-- [Idempotency cache](./idempotency.md)
+- [Idempotency cache (LRU + Redis distributed store)](./idempotency.md)
 - [Replay protection](./replay-protection.md)
 - [Graceful shutdown](./graceful-shutdown.md)
 
@@ -43,6 +46,8 @@ This folder contains the full documentation for `@riaskov/nevo-messaging`. The t
 - [Saga orchestrator](./saga.md)
 - [CQRS bridge & event store](./cqrs.md)
 - [Dead-letter queue (DLQ)](./dlq.md)
+- [Durable workflows (`WorkflowEngine` / `@Workflow`)](./workflow.md)
+- [Scheduler (`@Scheduled`, cron)](./scheduler.md)
 
 ## Codec & wire format
 
@@ -60,16 +65,29 @@ This folder contains the full documentation for `@riaskov/nevo-messaging`. The t
 - [OpenTelemetry tracing](./observability.md)
 - [Health checks — liveness & readiness](./health-checks.md)
 - [PII redaction](./redaction.md)
+- [Chain context (request correlation)](./chain-context.md)
 - [DevTools UI dashboard](./devtools.md)
 
 ## Security
 
 - [Access control (ACL)](./access-control.md)
 - [JWT & JWKS verification](./security.md)
+- [Tenant policy & kill-switch](./tenant-policy.md)
+- [Audit log](./audit-log.md)
 - [Error codes](./error-codes.md)
 
 ## Advanced
 
+- [Production storage matrix (which backend per primitive)](./storage-matrix.md)
+- [Transport capability matrix](./capability-matrix.md)
+- [Testing — in-memory transport, MemoryHarness](./testing.md)
 - [Multi-tenancy](./multi-tenant.md)
 - [Performance tuning](./performance.md)
 - [Environment variables](./environment.md)
+- [Production checklist](./production-checklist.md)
+- [Migration & upgrade notes](./migration.md)
+
+## Reference
+
+- [API reference](../API.md)
+- [Contributing](../CONTRIBUTING.md)

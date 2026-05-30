@@ -7,6 +7,7 @@ export const LEGACY_SIGNALS_METADATA_KEY = "kafka:signals"
 export interface SignalOptions {
   version?: string
   schema?: unknown
+  resultSchema?: unknown
   [key: string]: any
 }
 

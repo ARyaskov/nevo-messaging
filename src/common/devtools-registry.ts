@@ -2,6 +2,7 @@ import { getDevToolsBus, DevToolsBus, DevToolsEvent } from "./devtools"
 import type { AccessControlConfig } from "./types"
 import type { SignalMetadata } from "../signal.decorator"
 import type { CircuitState } from "./circuit-breaker"
+import { getTenantPolicyRegistry, type TenantPolicy } from "./tenant-policy"
 
 export interface ServiceMethodInfo {
   signalName: string
@@ -89,6 +90,23 @@ export class DevToolsRegistry {
   reset(): void {
     this.services.clear()
     this.circuits.clear()
+  }
+
+  // ---------------------------------------------------------------------
+  // Tenant policies — proxied through the global TenantPolicyRegistry so
+  // DevTools `/api/tenants` POST can disable a tenant without restarts.
+  // ---------------------------------------------------------------------
+
+  listTenantPolicies(): Array<TenantPolicy & { serviceName: string; tenantId: string }> {
+    return getTenantPolicyRegistry().list()
+  }
+
+  setTenantPolicy(serviceName: string, tenantId: string, policy: TenantPolicy): void {
+    getTenantPolicyRegistry().set(serviceName, tenantId, policy)
+  }
+
+  setTenantEnabled(serviceName: string, tenantId: string, enabled: boolean, reason?: string): void {
+    getTenantPolicyRegistry().setEnabled(serviceName, tenantId, enabled, reason)
   }
 }
 

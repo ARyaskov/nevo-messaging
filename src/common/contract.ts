@@ -1,5 +1,6 @@
 import type { ServiceMethodHandler, ServiceMethodMapping } from "./types"
 import { DEFAULT_METHOD_VERSION } from "./version"
+import { getDefaultLogger } from "./logger"
 
 export const NEVO_CONTRACT_METHOD = "nevo.contract"
 export const CONTRACT_PROTOCOL_VERSION = "1"
@@ -132,15 +133,57 @@ function serializeZod(zodSchema: unknown, depth = 0): unknown {
       return { type: "object", fields: out }
     }
     case "union":
-      return { type: "union", options: (def.options ?? []).map((o: any) => serializeZod(o, depth + 1)) }
+      return { type: "union", options: unionOptions(def).map((o) => serializeZod(o, depth + 1)) }
+    case "discriminatedunion":
+      // Same wire shape as a plain union; carry the discriminator property name so
+      // consumers can document it if they choose to.
+      return { type: "union", options: unionOptions(def).map((o) => serializeZod(o, depth + 1)), discriminator: def.discriminator }
     case "record": {
       // zod 4: `def.valueType` still exists; some builds use `def.element` for value.
       const valueType = def.valueType ?? def.element
       return { type: "record", valueType: serializeZod(valueType, depth + 1) }
     }
+    case "tuple": {
+      // zod 3 & 4: `def.items` is the array of positional element schemas;
+      // `def.rest`, when present, types the variadic tail.
+      const items = (Array.isArray(def.items) ? def.items : []).map((it: unknown) => serializeZod(it, depth + 1))
+      const node: Record<string, unknown> = { type: "tuple", items }
+      if (def.rest) node.rest = serializeZod(def.rest, depth + 1)
+      return node
+    }
+    case "intersection":
+      return { type: "intersection", left: serializeZod(def.left, depth + 1), right: serializeZod(def.right, depth + 1) }
+    case "map":
+      return { type: "map", keyType: serializeZod(def.keyType, depth + 1), valueType: serializeZod(def.valueType, depth + 1) }
+    case "set":
+      return { type: "set", valueType: serializeZod(def.valueType, depth + 1) }
+    case "default":
+      // `.default()` keeps the inner shape but makes the field omittable on input;
+      // the object serializer treats a "default" node as optional.
+      return { type: "default", inner: serializeZod(def.innerType, depth + 1) }
+    case "effects":
+      // zod 3 refine/transform/preprocess wrapper — `def.schema` is the base schema.
+      return { type: "effects", inner: serializeZod(def.schema ?? def.innerType ?? def.in, depth + 1) }
+    case "pipe":
+    case "pipeline":
+      // zod 3 `ZodPipeline` / zod 4 `ZodPipe`. The wire payload is the input side.
+      return { type: "pipe", inner: serializeZod(def.in ?? def.out, depth + 1) }
+    case "branded":
+    case "readonly":
+    case "catch":
+      // Transparent wrappers with no effect on the wire shape — unwrap them.
+      return serializeZod(def.type ?? def.innerType, depth + 1)
     default:
+      getDefaultLogger().warn({ event: "contract.zod.unhandled", kind }, "Unhandled zod type during contract serialization; emitting kind only")
       return { type: kind }
   }
+}
+
+function unionOptions(def: any): unknown[] {
+  const opts = def.options
+  if (Array.isArray(opts)) return opts
+  if (opts && typeof opts.values === "function") return [...opts.values()]
+  return []
 }
 
 export function buildContract(
@@ -156,7 +199,7 @@ export function buildContract(
       signalName,
       version: h.version || DEFAULT_METHOD_VERSION,
       paramsSchema: describeSchema(h.schema ?? (h.options as any)?.schema),
-      resultSchema: null
+      resultSchema: describeSchema(h.resultSchema ?? (h.options as any)?.resultSchema)
     })
   }
   return {

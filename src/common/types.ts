@@ -105,6 +105,7 @@ export interface ServiceMethodHandler {
   resultTransformer?: (result: unknown) => unknown
   options?: Record<string, unknown>
   schema?: unknown
+  resultSchema?: unknown
   version?: string
 }
 
@@ -190,6 +191,19 @@ export interface KafkaSaslOptions {
 
 export interface MetricsOptions {
   enabled?: boolean
+  /**
+   * Hard cap on the number of distinct label-sets retained per metric. Once a
+   * metric reaches this many series, further new label-sets collapse into a
+   * single `{label="<other>"}` overflow series instead of growing the backing
+   * Map without bound (cardinality-attack guard). Default 2000.
+   */
+  maxSeriesPerMetric?: number
+  /**
+   * Per-metric histogram bucket overrides, keyed by metric name. Lets latency
+   * and byte-size histograms use appropriate boundaries instead of one frozen
+   * global default. Buckets are normalised (ascending, de-duplicated).
+   */
+  buckets?: Record<string, number[]>
 }
 
 export interface TracingOptions {
@@ -226,7 +240,7 @@ export interface TransportClientOptions {
     port?: number
     version?: string
   }
-  [key: string]: any
+  [key: string]: unknown
 }
 
 export interface TransportServerOptions {
@@ -240,7 +254,7 @@ export interface TransportServerOptions {
   metrics?: MetricsOptions
   tracing?: TracingOptions
   dlq?: { enabled?: boolean; topic?: string }
-  [key: string]: any
+  [key: string]: unknown
 }
 
 export interface MicroserviceConfig {

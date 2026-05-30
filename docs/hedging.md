@@ -70,16 +70,30 @@ await hedge(
 
 Hedging adds roughly `copies * tail-probability` extra calls. If your tail is at the 99th percentile, one extra copy adds ~1% overhead on average. Two copies add ~2%. There is no built-in budget cap — keep `copies` small (1 or 2) and only enable hedging on hot, idempotent reads.
 
-## What is not provided
+## Declarative form — `@Hedge`
 
-The framework does not ship:
+Wrapping every call site with `hedge()` gets old. The same options can be declared once on the service method:
 
-- A `defaultHedgingPolicy()` helper
-- An `@Hedge` method decorator
-- A "cancel on first response" flag — cancellation is the default; non-cancellable callers are responsible for their own cleanup
-- A `delays: number[]` array — each subsequent copy uses the same `delayMs` interval
+```ts
+import { Hedge } from "@riaskov/nevo-messaging"
 
-Wrap your `query()` calls with `hedge()` where you want it, or build a small helper that does.
+@Injectable()
+export class UserService extends NatsClientBase {
+  @Hedge({ copies: 1, delayMs: 50 })
+  async getById(id: bigint) {
+    return this.query("user", "user.getById", { id })
+  }
+}
+```
+
+The runtime in [`resilience-runtime.ts`](../src/common/resilience-runtime.ts) reads the metadata, picks up the same `HedgingOptions`, and applies the hedge around `query()` automatically. Combine with `@CircuitBreaker` and `@Adaptive` on the same method — the runtime layers them as `circuit → hedge → invoke` with adaptive feedback after the call.
+
+See [resilience-decorators.md](./resilience-decorators.md) for the full picture.
+
+## What is *still* not provided
+
+- A "cancel on first response" flag — cancellation is the default; non-cancellable callers are responsible for their own cleanup.
+- A `delays: number[]` array — each subsequent copy uses the same `delayMs` interval.
 
 ## See also
 

@@ -25,6 +25,7 @@ import {
   NevoTracer,
   getDefaultMetrics,
   NEVO_METRIC_NAMES,
+  methodLabel,
   MetricsRegistry,
   GracefulShutdown,
   LruIdempotencyCache,
@@ -136,7 +137,7 @@ export class NevoWsClient {
     return this.tracer.inject(baseMeta)
   }
 
-  private buildEnvelope(method: string, params: any, type: MessageType, opts?: any) {
+  private buildEnvelope(method: string, params: unknown, type: MessageType, opts?: any) {
     const uuid = uuidv7()
     const meta = this.buildMeta(type, opts)
     const versioned = method.includes("@") ? method : formatMethod(method, opts?.version || DEFAULT_METHOD_VERSION)
@@ -230,7 +231,7 @@ export class NevoWsClient {
     }
   }
 
-  async query<T = any>(serviceName: string, method: string, params: any, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; timeoutMs?: number; tenantId?: string }): Promise<T> {
+  async query<T = unknown>(serviceName: string, method: string, params: unknown, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; timeoutMs?: number; tenantId?: string }): Promise<T> {
     const cbKey = `${normalizeServiceName(serviceName)}:${method}`
     return this.shutdown.trackInflight((async () => {
       if (opts?.idempotencyKey && this.idempotencyCache.isEnabled() && this.idempotencyCache.has(opts.idempotencyKey)) {
@@ -267,8 +268,8 @@ export class NevoWsClient {
           })
           throw err
         } finally {
-          this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, { transport: "ws", service: serviceName, method, role: "client" })
-          if (attempt > 1) this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "ws", service: serviceName, method })
+          this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, { transport: "ws", service: serviceName, method: methodLabel(method), role: "client" })
+          if (attempt > 1) this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "ws", service: serviceName, method: methodLabel(method) })
         }
       }, this.retryOptions)
       if (opts?.idempotencyKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(opts.idempotencyKey, result)
@@ -276,19 +277,19 @@ export class NevoWsClient {
     })())
   }
 
-  async emit(serviceName: string, method: string, params: any, opts?: any): Promise<void> {
+  async emit(serviceName: string, method: string, params: unknown, opts?: any): Promise<void> {
     const entry = await this.getSocket(serviceName)
     const { data } = this.buildEnvelope(method, params, "emit", opts)
     entry.socket.send(data)
   }
 
-  async publish(serviceName: string, method: string, params: any, opts?: any): Promise<void> {
+  async publish(serviceName: string, method: string, params: unknown, opts?: any): Promise<void> {
     const entry = await this.getSocket(serviceName)
     const { data } = this.buildEnvelope(method, params, "sub", opts)
     entry.socket.send(data)
   }
 
-  async broadcast(method: string, params: any, opts?: any): Promise<void> {
+  async broadcast(method: string, params: unknown, opts?: any): Promise<void> {
     const first = this.serviceUrls.keys().next().value
     if (!first) throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, { message: "No service URL configured" })
     const entry = await this.getSocket(first)
@@ -296,7 +297,7 @@ export class NevoWsClient {
     entry.socket.send(data)
   }
 
-  async subscribe<T = any>(
+  async subscribe<T = unknown>(
     serviceName: string,
     method: string,
     options: SubscriptionOptions | undefined,

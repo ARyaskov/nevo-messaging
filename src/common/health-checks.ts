@@ -24,11 +24,13 @@ export function redisPing(client: { ping: () => Promise<string> }): HealthCheckF
   }
 }
 
-export function kafkaProducerPing(producer: { send: (args: any) => Promise<any> }, opts: { topic: string }): HealthCheckFn {
+export function kafkaAdminPing(admin: { describeCluster: () => Promise<{ brokers: unknown[] }> }): HealthCheckFn {
   return async () => {
     try {
-      await producer.send({ topic: opts.topic, messages: [{ value: Buffer.from("ping") }] })
-      return { status: "ok" }
+      const info = await admin.describeCluster()
+      const brokers = Array.isArray(info?.brokers) ? info.brokers : []
+      if (brokers.length > 0) return { status: "ok", message: `${brokers.length} broker(s)` }
+      return { status: "down", message: "no brokers" }
     } catch (err: any) {
       return { status: "down", message: err?.message ?? "kafka ping failed" }
     }

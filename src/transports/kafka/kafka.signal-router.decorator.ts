@@ -1,7 +1,7 @@
 import { Type } from "@nestjs/common"
 import { MessagePattern } from "@nestjs/microservices"
 import { createSignalRouterDecorator, SignalRouterOptions } from "../../signal-router.utils"
-import { Codec, getCodec, getDefaultCodec, maybeCompress, maybeDecompress, resolveCompressionOptions, getDefaultLogger, DlqRouter } from "../../common"
+import { Codec, getCodec, getDefaultCodec, maybeCompress, maybeDecompress, enforcePayloadLimit, DEFAULT_MAX_PAYLOAD_BYTES, resolveCompressionOptions, getDefaultLogger, DlqRouter } from "../../common"
 import { getKafkaModule } from "../optional-deps"
 
 const DEFAULT_KAFKA_HOST = process.env["KAFKA_HOST"] || "localhost"
@@ -18,6 +18,7 @@ export interface KafkaSignalRouterOptions extends SignalRouterOptions {
 export function KafkaSignalRouter(serviceType: Type<any> | Type<any>[], options?: KafkaSignalRouterOptions) {
   const codec: Codec = typeof options?.codec === "string" ? getCodec(options.codec) : (options?.codec as Codec) || getDefaultCodec()
   const compression = resolveCompressionOptions(options?.compression)
+  const maxPayloadBytes = options?.security?.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES
   const logger = options?.logger || getDefaultLogger().child({ component: "kafka-router" })
   const dlq = options?.dlq instanceof DlqRouter ? options.dlq : new DlqRouter({ enabled: (options?.dlq as any)?.enabled === true })
 
@@ -30,7 +31,8 @@ export function KafkaSignalRouter(serviceType: Type<any> | Type<any>[], options?
         try {
           const buf = data.value instanceof Buffer ? data.value : typeof data.value === "string" ? Buffer.from(data.value, "utf8") : Buffer.from(data.value)
           const encoding = data?.headers?.["content-encoding"]?.toString?.()
-          const decompressed = encoding ? maybeDecompress(buf, encoding) : buf
+          const decompressed = maybeDecompress(buf, encoding, maxPayloadBytes)
+          enforcePayloadLimit(decompressed, maxPayloadBytes)
           messageData = codec.decode(decompressed)
         } catch (e) {
           logger.error({ event: "kafka.decode_error", err: (e as Error)?.message }, "Failed to decode message")

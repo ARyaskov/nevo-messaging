@@ -72,9 +72,16 @@ The caller identity comes from `meta.callerService` (or a verified JWT `sub`). T
 
 ## Per-tenant circuit breakers
 
-Not built in — the circuit breaker keys on `service:method`, not `(service, method, tenant)`. A noisy tenant trips the breaker for everyone.
+The `@CircuitBreaker` decorator **does** accept a `keyBy` (same dimensions as the rate limiter — `"service" | "method" | "callerService" | "tenantId"`), and so do `@Backpressure` and `@Adaptive`:
 
-To isolate, run **one breaker registry per tenant** in your application layer, or extend the framework's breaker to honor a tenant key. The framework does not provide a `keyBy` for breakers today.
+```ts
+@CircuitBreaker({ mode: "sliding", errorRateThreshold: 0.5, keyBy: ["service", "method", "tenantId"] })
+async export(input: ExportDto) { ... }
+```
+
+Caveat: `keyBy` only widens the key when the call site feeds the tenant dimension into the resilience runtime. The **built-in server router currently keys breakers as `service:method`** and does not yet feed tenant dimensions into the resilience context (unlike the rate limiter, which receives `tenantId` server-side). So with the built-in router today, a noisy tenant still trips the breaker for everyone.
+
+To isolate per tenant right now, drive the resilience runtime yourself with a tenant-aware context (`wrapMethodWithResilience` / `makeResilienceRunner`), or run **one breaker registry per tenant** in your application layer. See [circuit-breaker.md](./circuit-breaker.md#per-tenant-keying-keyby).
 
 ## Topic partitioning
 

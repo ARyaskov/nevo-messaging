@@ -43,9 +43,12 @@ Semantics:
 
 ## Caller identity
 
-The caller is identified by `meta.callerService` on the envelope. Each Nevo client sets it to its `clientIdPrefix` by default.
+How the caller identity is derived depends on whether a `jwtVerifier` is configured:
 
-With `jwtVerifier`, the framework also verifies the bearer token from envelope `meta.auth.token` and uses the `sub` claim (or full `VerifiedClaims`) as an additional identity.
+- **`jwtVerifier` configured (authenticated mode).** Identity comes **only** from the cryptographically verified bearer token in `meta.auth.token` — the `service` / `serviceName` / `svc` / `sub` claim, in that order. The client-supplied `meta.service` is **never** trusted as identity (trusting it would let any caller impersonate any service by stamping `meta.service`). A request with no token, or with a token that fails verification, is treated as anonymous (`undefined`). If a caller stamps a `meta.service` that disagrees with the verified identity, the request is rejected with `UNAUTHORIZED`.
+- **No `jwtVerifier` (trusted-network mode).** Identity is taken from `meta.service` on the envelope; each Nevo client sets it to its `clientIdPrefix` by default. An unsigned token in `meta.auth.token` is **ignored** for identity — without a verifier its `alg:none` payload cannot be trusted — and the framework logs a one-time warning that token-based identity requires a verifier.
+
+> Security: never run ACL with `meta.service`-based identity on an untrusted network. Configure a `jwtVerifier` (see [security.md](./security.md)) so identity is bound to a verified token.
 
 ## Programmatic API
 

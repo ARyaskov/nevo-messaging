@@ -46,7 +46,7 @@ interface SchemaDescriptor {
 }
 ```
 
-`paramsSchema` is filled when you annotate the service method with `@Schema(...)`; `resultSchema` is currently always `null` (handlers don't declare a result schema).
+`paramsSchema` is filled when you annotate the service method with `@Schema(...)`. `resultSchema` is filled when the signal declares one via the `resultSchema` option (`@Signal("user.get", "get", { resultSchema: ReplySchema })`); it stays `null` when no result schema is declared.
 
 ## Annotating methods
 
@@ -169,7 +169,7 @@ The contract reports both versions in `methods`. Clients can negotiate the versi
 
 ## What the contract does NOT carry
 
-- **Result schemas** — `resultSchema` is always `null` today; handlers don't declare output types.
+- **Result schemas from `@Schema`** — `@Schema` only describes params. A result schema must be declared explicitly via the signal `resultSchema` option; otherwise `resultSchema` is `null`.
 - **Pattern kind** — the contract does not distinguish `query`, `emit`, `publish`, or `broadcast`. All signals look the same. If that distinction matters, encode it in the signal name (e.g. `*.event.*` for events, `*.broadcast.*` for broadcasts).
 - **Side-effects, idempotency hints, rate limits** — the contract is a wire shape, not a behavior spec.
 

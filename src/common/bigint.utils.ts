@@ -30,19 +30,41 @@ export function makeBigIntReviver(opts?: { acceptLegacy?: boolean }): (key: stri
 const defaultReviver = makeBigIntReviver()
 const legacyReviver = makeBigIntReviver({ acceptLegacy: true })
 
-export function serializeBigInt(obj: any): any {
+/**
+ * Maximum nesting depth walked by serializeBigInt/deserializeBigInt. Without a
+ * cap, a deeply-nested (or maliciously crafted) payload could blow the call
+ * stack; with a WeakSet seen-guard, cyclic input is also caught. Real-world
+ * messaging payloads are nowhere near this deep.
+ */
+const MAX_BIGINT_DEPTH = 512
+
+function serializeBigIntInner(obj: any, depth: number, seen: WeakSet<object>): any {
   if (obj === null || obj === undefined) return obj
   if (typeof obj === "bigint") return `${BIGINT_SENTINEL}${obj.toString()}`
-  if (Array.isArray(obj)) return obj.map(serializeBigInt)
-  if (typeof obj === "object") {
-    const serialized: Record<string, unknown> = {}
-    for (const [key, value] of Object.entries(obj)) serialized[key] = serializeBigInt(value)
-    return serialized
+  if (typeof obj !== "object") return obj
+
+  if (depth >= MAX_BIGINT_DEPTH) {
+    throw new RangeError(`serializeBigInt: maximum nesting depth (${MAX_BIGINT_DEPTH}) exceeded`)
   }
-  return obj
+  if (seen.has(obj)) {
+    throw new TypeError("serializeBigInt: circular reference detected")
+  }
+  seen.add(obj)
+  try {
+    if (Array.isArray(obj)) return obj.map((v) => serializeBigIntInner(v, depth + 1, seen))
+    const serialized: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(obj)) serialized[key] = serializeBigIntInner(value, depth + 1, seen)
+    return serialized
+  } finally {
+    seen.delete(obj)
+  }
 }
 
-export function deserializeBigInt(obj: any, options?: { acceptLegacy?: boolean }): any {
+export function serializeBigInt(obj: any): any {
+  return serializeBigIntInner(obj, 0, new WeakSet<object>())
+}
+
+function deserializeBigIntInner(obj: any, options: { acceptLegacy?: boolean } | undefined, depth: number, seen: WeakSet<object>): any {
   if (obj === null || obj === undefined) return obj
 
   if (typeof obj === "string") {
@@ -57,15 +79,27 @@ export function deserializeBigInt(obj: any, options?: { acceptLegacy?: boolean }
     return obj
   }
 
-  if (Array.isArray(obj)) return obj.map((v) => deserializeBigInt(v, options))
+  if (typeof obj !== "object") return obj
 
-  if (typeof obj === "object") {
-    const deserialized: Record<string, unknown> = {}
-    for (const [key, value] of Object.entries(obj)) deserialized[key] = deserializeBigInt(value, options)
-    return deserialized
+  if (depth >= MAX_BIGINT_DEPTH) {
+    throw new RangeError(`deserializeBigInt: maximum nesting depth (${MAX_BIGINT_DEPTH}) exceeded`)
   }
+  if (seen.has(obj)) {
+    throw new TypeError("deserializeBigInt: circular reference detected")
+  }
+  seen.add(obj)
+  try {
+    if (Array.isArray(obj)) return obj.map((v) => deserializeBigIntInner(v, options, depth + 1, seen))
+    const deserialized: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(obj)) deserialized[key] = deserializeBigIntInner(value, options, depth + 1, seen)
+    return deserialized
+  } finally {
+    seen.delete(obj)
+  }
+}
 
-  return obj
+export function deserializeBigInt(obj: any, options?: { acceptLegacy?: boolean }): any {
+  return deserializeBigIntInner(obj, options, 0, new WeakSet<object>())
 }
 
 export function stringifyWithBigInt(obj: unknown): string {

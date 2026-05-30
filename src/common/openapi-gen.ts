@@ -1,4 +1,5 @@
 import type { ServiceContract, ContractMethodDescriptor, SchemaDescriptor } from "./contract"
+import { getDefaultLogger } from "./logger"
 
 function schemaToJsonSchema(schema?: SchemaDescriptor | null): Record<string, unknown> {
   if (!schema) return { type: "object" }
@@ -22,18 +23,37 @@ function zodShapeToJsonSchema(node: any, depth = 0): Record<string, unknown> {
     case "optional": return zodShapeToJsonSchema(node.inner, depth + 1)
     case "nullable": return { ...zodShapeToJsonSchema(node.inner, depth + 1), nullable: true }
     case "union": return { oneOf: (node.options ?? []).map((o: any) => zodShapeToJsonSchema(o, depth + 1)) }
+    case "intersection": return { allOf: [zodShapeToJsonSchema(node.left, depth + 1), zodShapeToJsonSchema(node.right, depth + 1)] }
     case "record": return { type: "object", additionalProperties: zodShapeToJsonSchema(node.valueType, depth + 1) }
+    case "tuple": {
+      const items = (node.items ?? []).map((it: any) => zodShapeToJsonSchema(it, depth + 1))
+      const out: Record<string, unknown> = { type: "array", prefixItems: items, minItems: items.length }
+      if (node.rest) out.items = zodShapeToJsonSchema(node.rest, depth + 1)
+      else out.maxItems = items.length
+      return out
+    }
+    case "map": return { type: "array", items: { type: "array", prefixItems: [zodShapeToJsonSchema(node.keyType, depth + 1), zodShapeToJsonSchema(node.valueType, depth + 1)], minItems: 2, maxItems: 2 } }
+    case "set": return { type: "array", items: zodShapeToJsonSchema(node.valueType, depth + 1), uniqueItems: true }
+    case "default": return zodShapeToJsonSchema(node.inner, depth + 1)
+    case "effects":
+    case "pipe": return zodShapeToJsonSchema(node.inner, depth + 1)
     case "object": {
       const properties: Record<string, unknown> = {}
       const required: string[] = []
       for (const [k, v] of Object.entries(node.fields ?? {})) {
         properties[k] = zodShapeToJsonSchema(v, depth + 1)
-        if ((v as any)?.type !== "optional") required.push(k)
+        if (!isOptionalField(v)) required.push(k)
       }
       return { type: "object", properties, required: required.length ? required : undefined }
     }
-    default: return {}
+    default:
+      getDefaultLogger().warn({ event: "openapi.zod.unhandled", kind: node?.type }, "Unhandled zod node in JSON-schema conversion; emitting {}")
+      return {}
   }
+}
+
+function isOptionalField(node: any): boolean {
+  return node?.type === "optional" || node?.type === "default"
 }
 
 export interface OpenApiGenOptions {

@@ -1,4 +1,5 @@
 import { isProduction } from "./env"
+import { pinoRedactPaths } from "./redact"
 
 export type NevoLogLevel = "trace" | "debug" | "info" | "warn" | "error" | "fatal"
 
@@ -105,7 +106,7 @@ export function createLogger(opts: NevoLoggerOptions = {}): NevoLogger {
     level: opts.level,
     name: opts.name || "nevo",
     base: opts.base,
-    redact: opts.redact ?? ["*.auth.token", "*.password", "*.secret", "meta.auth.token"],
+    redact: opts.redact ?? pinoRedactPaths(),
     pretty: opts.pretty ?? !isProduction()
   })
   return pinoLogger || new ConsoleLogger(opts)

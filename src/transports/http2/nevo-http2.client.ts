@@ -20,11 +20,13 @@ import {
   resolveCompressionOptions,
   maybeCompress,
   maybeDecompress,
+  enforcePayloadLimit,
   DEFAULT_MAX_PAYLOAD_BYTES,
   getDefaultTracer,
   NevoTracer,
   getDefaultMetrics,
   NEVO_METRIC_NAMES,
+  methodLabel,
   MetricsRegistry,
   GracefulShutdown,
   LruIdempotencyCache,
@@ -106,7 +108,7 @@ export class NevoHttp2Client {
     return this.tracer.inject(baseMeta)
   }
 
-  private createBody(method: string, params: any, type: MessageType, opts?: any) {
+  private createBody(method: string, params: unknown, type: MessageType, opts?: any) {
     const uuid = uuidv7()
     const meta = this.buildMeta(type, opts)
     const versioned = method.includes("@") ? method : formatMethod(method, opts?.version || DEFAULT_METHOD_VERSION)
@@ -137,7 +139,7 @@ export class NevoHttp2Client {
     return entry
   }
 
-  async query<T = any>(serviceName: string, method: string, params: any, opts?: any): Promise<T> {
+  async query<T = unknown>(serviceName: string, method: string, params: unknown, opts?: any): Promise<T> {
     const cbKey = `${normalizeServiceName(serviceName)}:${method}`
     return this.shutdown.trackInflight((async () => {
       if (opts?.idempotencyKey && this.idempotencyCache.isEnabled() && this.idempotencyCache.has(opts.idempotencyKey)) {
@@ -168,7 +170,9 @@ export class NevoHttp2Client {
           const timer = setTimeout(() => { stream.close(http2.constants.NGHTTP2_CANCEL); reject(new TimeoutError(serviceName, method, opts?.timeoutMs ?? this.timeoutMs)) }, opts?.timeoutMs ?? this.timeoutMs)
           const chunks: Buffer[] = []
           let respEncoding: string | undefined
+          let status = 0
           stream.on("response", (h) => {
+            status = Number(h[":status"]) || 0
             const v = h["content-encoding"]
             respEncoding = typeof v === "string" ? v : Array.isArray(v) ? v[0] : undefined
           })
@@ -177,21 +181,34 @@ export class NevoHttp2Client {
             clearTimeout(timer)
             try {
               const respBuf = Buffer.concat(chunks)
-              const decompressed = maybeDecompress(respBuf, respEncoding)
+              const decompressed = maybeDecompress(respBuf, respEncoding, this.maxPayloadBytes)
+              enforcePayloadLimit(decompressed, this.maxPayloadBytes)
               const payload: any = decompressed.byteLength === 0 ? undefined : this.codec.decode(decompressed)
               if (payload?.params?.result === "error" && payload?.params?.error) {
                 const err = payload.params.error
                 reject(new MessagingError(err.code, err.details ?? { message: err.message }, err.service || serviceName))
                 return
               }
+              // A server error status whose body is not a nevo error envelope must not be
+              // resolved as a successful empty result (which would also tell the breaker onSuccess).
+              if (status >= 400) {
+                reject(httpStatusToError(status, serviceName))
+                return
+              }
               this.circuitBreaker.onSuccess(cbKey)
               publishClientEvent(this.devtoolsBus, { service: serviceName, method, uuid, chainId: lastChainId, durationMs: Date.now() - startMs, status: "ok", transport: "http2", origin: this.serviceName })
               resolve(payload?.params?.result as T)
             } catch (err: any) {
-              reject(new MessagingError(ErrorCode.PARSE_ERROR, { message: err?.message ?? "decode failed" }))
+              // A non-nevo error response (proxy/gateway body) may not decode; prefer the
+              // mapped HTTP status over a misleading parse error.
+              if (status >= 400) { reject(httpStatusToError(status, serviceName)); return }
+              reject(err instanceof MessagingError ? err : new MessagingError(ErrorCode.PARSE_ERROR, { message: err?.message ?? "decode failed" }))
             }
           })
-          stream.on("error", (err) => { clearTimeout(timer); reject(err) })
+          stream.on("error", (err: any) => {
+            clearTimeout(timer)
+            reject(err instanceof MessagingError ? err : new MessagingError(ErrorCode.CONNECTION_LOST, { message: err?.message ?? "stream error" }, serviceName))
+          })
           stream.end(buf)
           return await promise
         } catch (err: any) {
@@ -203,8 +220,8 @@ export class NevoHttp2Client {
           })
           throw err
         } finally {
-          this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, { transport: "http2", service: serviceName, method, role: "client" })
-          if (attempt > 1) this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "http2", service: serviceName, method })
+          this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, { transport: "http2", service: serviceName, method: methodLabel(method), role: "client" })
+          if (attempt > 1) this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "http2", service: serviceName, method: methodLabel(method) })
         }
       }, this.retryOptions)
       if (opts?.idempotencyKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(opts.idempotencyKey, result)
@@ -231,5 +248,21 @@ function tryMsgpackOrJson(): Codec {
     return c
   } catch {
     return new JsonCodec()
+  }
+}
+
+// Maps an HTTP error status (>= 400) to a MessagingError. Only gateway/availability
+// statuses (502/503/504) are marked retryable; everything else (incl. 500) is terminal.
+function httpStatusToError(status: number, serviceName: string): MessagingError {
+  switch (status) {
+    case 413:
+      return new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, { message: `Remote returned HTTP ${status}`, httpStatus: status }, serviceName)
+    case 502:
+    case 503:
+      return new MessagingError(ErrorCode.SERVICE_UNAVAILABLE, { message: `Remote returned HTTP ${status}`, httpStatus: status, retryable: true }, serviceName)
+    case 504:
+      return new MessagingError(ErrorCode.TIMEOUT, { message: `Remote returned HTTP ${status}`, httpStatus: status, retryable: true }, serviceName)
+    default:
+      return new MessagingError(ErrorCode.REMOTE_ERROR, { message: `Remote returned HTTP ${status}`, httpStatus: status }, serviceName)
   }
 }

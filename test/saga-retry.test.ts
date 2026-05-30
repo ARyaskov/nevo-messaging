@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { createSaga, InMemorySagaStore, Saga } from "../src/common/saga"
+import { createSaga, InMemorySagaStore, Saga, SagaRecovery, SagaStepRegistry } from "../src/common/saga"
 
 test("step retries on failure", async () => {
   let attempts = 0
@@ -75,4 +75,90 @@ test("saga persists snapshots and can resume", async () => {
   ])
   assert.equal(resumeResult.status, "success")
   assert.ok(resumeResult.executed.includes("fixed"))
+})
+
+test("recovery worker resumes a pending saga from the store after a simulated crash", async () => {
+  const store = new InMemorySagaStore()
+  const sagaId = "saga-recover-1"
+  const sagaType = "order-checkout"
+
+  // Simulate a process that executed step "a", persisted, then crashed before "b".
+  await store.save({
+    sagaId,
+    type: sagaType,
+    steps: ["a", "b"],
+    executed: ["a"],
+    ctx: { done: ["a"] },
+    status: "pending",
+    updatedAt: Date.now()
+  })
+
+  // A fresh process re-registers step definitions by saga type + step name so a
+  // recovered saga can find them again.
+  const ran: string[] = []
+  const registry = new SagaStepRegistry<{ done: string[] }>()
+    .register(sagaType, { name: "a", execute: (c) => { ran.push("a"); c.done.push("a") } })
+    .register(sagaType, { name: "b", execute: (c) => { ran.push("b"); c.done.push("b") } })
+
+  const recovery = new SagaRecovery(store, registry, { intervalMs: 5_000 })
+  const result = await recovery.recoverOnce()
+
+  assert.equal(result.recovered, 1)
+  assert.equal(result.failed, 0)
+  // "a" already ran before the crash, so only "b" executes on resume.
+  assert.deepEqual(ran, ["b"])
+  // A completed saga is deleted from the store.
+  assert.equal(await store.load(sagaId), null)
+
+  // The worker is stoppable: after stop() it ignores new pending sagas.
+  recovery.stop()
+  await store.save({
+    sagaId: "saga-recover-2", type: sagaType, steps: ["a"], executed: [],
+    ctx: { done: [] }, status: "pending", updatedAt: Date.now()
+  })
+  const afterStop = await recovery.recoverOnce()
+  assert.equal(afterStop.recovered, 0)
+})
+
+test("recovery worker skips a saga whose step type is not registered", async () => {
+  const store = new InMemorySagaStore()
+  await store.save({
+    sagaId: "saga-unknown-type", type: "never-registered", steps: ["a"], executed: [],
+    ctx: {}, status: "pending", updatedAt: Date.now()
+  })
+  const registry = new SagaStepRegistry()
+    .register("some-other-type", { name: "a", execute: () => undefined })
+
+  const recovery = new SagaRecovery(store, registry)
+  const result = await recovery.recoverOnce()
+
+  assert.equal(result.recovered, 0)
+  assert.equal(result.skipped, 1)
+  // The saga is left untouched for later (it is not deleted or mutated).
+  const snap = await store.load("saga-unknown-type")
+  assert.equal(snap!.status, "pending")
+})
+
+test("step receives and can observe the abort signal on timeout", async () => {
+  let sawSignal = false
+  let abortedDuringRun = false
+
+  const result = await createSaga<{}>()
+    .step({
+      name: "slow",
+      execute: (_ctx, signal) =>
+        new Promise<void>((resolve) => {
+          sawSignal = signal instanceof AbortSignal
+          // Honour cancellation: stop as soon as the timeout aborts us instead of
+          // running to completion behind a retry (which would double a side effect).
+          signal.addEventListener("abort", () => { abortedDuringRun = true; resolve() }, { once: true })
+        }),
+      timeoutMs: 20,
+      retries: 0
+    })
+    .run({})
+
+  assert.equal(result.status, "failed")
+  assert.ok(sawSignal, "execute should receive an AbortSignal")
+  assert.ok(abortedDuringRun, "the signal should fire when the step times out")
 })

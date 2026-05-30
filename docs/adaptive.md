@@ -75,9 +75,28 @@ const snap = tuner.snapshot()
 
 Export these as gauges for dashboards — see [metrics.md](./metrics.md).
 
-## What is not provided
+## Declarative form — `@Adaptive`
 
-- **No `@Adaptive` decorator.** `AdaptiveTuner` is a class; you wire it in by hand or attach it to a `*ClientBase` extension.
+You no longer have to wire `observe()` by hand. Annotate the method:
+
+```ts
+import { Adaptive } from "@riaskov/nevo-messaging"
+
+@Injectable()
+export class UserService extends NatsClientBase {
+  @Adaptive({ targetP99Ms: 250, minRetries: 1, maxRetries: 4 })
+  async getById(id: bigint) {
+    return this.query("user", "user.getById", { id })
+  }
+}
+```
+
+The resilience runtime starts a wall-clock at the outermost wrapper, calls the inner work, and feeds `observe(durationMs, ok)` automatically when it returns or throws. The tuner state is keyed by `service:method`, so retries and parallel calls share one rolling histogram per method.
+
+To read the tuner state at runtime, use `snapshotResilience().adaptive[key]` — see [resilience-decorators.md](./resilience-decorators.md).
+
+## What is *still* not provided
+
 - **No concurrency limiting.** The tuner adjusts retry/timeout, not in-flight count. For concurrency caps see [backpressure.md](./backpressure.md).
 - **No `ErrorCode.CONCURRENCY_LIMIT`.** Calls that hit the tuner's bounds still get the same `TIMEOUT` or peer-reported error codes; the tuner only reshapes the parameters.
 

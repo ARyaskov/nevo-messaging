@@ -16,11 +16,14 @@ import { ErrorCode } from "./common"
 import { getClassSignals, getNevoServiceName, SignalMetadata } from "./signal.decorator"
 import { suggestClosestMethod } from "./common/levenshtein"
 import { getDefaultLogger, NevoLogger } from "./common/logger"
-import { LruIdempotencyCache } from "./common/idempotency"
+import { TwoTierIdempotency } from "./common/idempotency-runtime"
+import type { IdempotencyStore } from "./common/idempotency-store"
+import { AuditLog } from "./common/audit-log"
+import { assertTenantAllowed } from "./common/tenant-policy"
 import { ReplayGuard } from "./common/replay-protection"
 import { getSchemaFor, toValidator } from "./common/schema"
 import { parseMethod, isVersionCompatible, DEFAULT_METHOD_VERSION } from "./common/version"
-import { getDefaultMetrics, NEVO_METRIC_NAMES } from "./common/metrics"
+import { getDefaultMetrics, NEVO_METRIC_NAMES, methodLabel } from "./common/metrics"
 import { getDefaultTracer } from "./common/tracing"
 import { matchesFilter } from "./common/subscription-filters"
 import { DlqRouter } from "./common/dlq"
@@ -33,6 +36,7 @@ import { getDevToolsRegistry, describeMethodsFromSignals } from "./common/devtoo
 import { getMethodRateLimit, getMethodCacheable, rateLimitToOptions } from "./common/method-decorators"
 import { LruIdempotencyCache as LruCache } from "./common/idempotency"
 import { runInChain, resolveInboundChainId } from "./common/chain-context"
+import { readMethodResilience, applyResilience } from "./common/resilience-runtime"
 
 export interface SignalRouterOptions {
   before?: BeforeHook
@@ -42,6 +46,18 @@ export interface SignalRouterOptions {
   serviceName?: string
   accessControl?: AccessControlConfig
   idempotency?: IdempotencyOptions
+  /**
+   * Optional distributed idempotency backend (Redis, …). On a miss the live
+   * handler claims the key (claim-before-execute) and writes the result through
+   * on success; concurrent duplicates across replicas await the winner's result
+   * instead of re-running. See `idempotency-store.ts`.
+   */
+  idempotencyStore?: IdempotencyStore<MessageResponse>
+  /**
+   * Optional append-only audit log. When set, one redacted entry is recorded per
+   * request (success or failure). See `audit-log.ts`.
+   */
+  auditLog?: AuditLog
   security?: SecurityOptions
   metrics?: MetricsOptions
   tracing?: TracingOptions
@@ -126,7 +142,12 @@ export function createSignalRouterDecorator(
     const handlerName = "handleSignalMessage"
     const debugEnabled = debug && (logger.isLevelEnabled?.("debug") ?? true)
 
-    const idempotency = new LruIdempotencyCache<MessageResponse>(options.idempotency)
+    const idem = new TwoTierIdempotency<MessageResponse>({
+      l1Options: options.idempotency,
+      distributed: options.idempotencyStore,
+      logger
+    })
+    const auditLog = options.auditLog
     const replayGuard = new ReplayGuard({
       enabled: (options.security?.replayWindowMs ?? 0) > 0,
       windowMs: options.security?.replayWindowMs
@@ -152,6 +173,17 @@ export function createSignalRouterDecorator(
       }
     }
     contractDescriptors.sort((a, b) => a.signalName.localeCompare(b.signalName))
+
+    // Methods this service actually serves — used to bucket forged / unregistered
+    // method names (e.g. on METHOD_NOT_FOUND) to a single `<unknown>` metric label
+    // so attacker-chosen strings cannot mint unbounded time series.
+    const knownMethodNames = new Set<string>(signalsByName.keys())
+    knownMethodNames.add(NEVO_CONTRACT_METHOD)
+    if (options.health) {
+      knownMethodNames.add(NEVO_HEALTH_METHOD)
+      knownMethodNames.add(NEVO_LIVENESS_METHOD)
+      knownMethodNames.add(NEVO_READINESS_METHOD)
+    }
 
     try {
       getDevToolsRegistry().registerService({
@@ -183,7 +215,12 @@ export function createSignalRouterDecorator(
       const startMs = Date.now()
       const nowMs = Date.now()
       let response: MessageResponse | undefined
+      let finalResponse: MessageResponse | undefined
       let messageData: MessageData | undefined
+      let auditCaller: string | null = null
+      let idemKey: string | undefined
+      let idemBegan = false
+      let idemCommitted = false
 
       try {
         if (debugEnabled) {
@@ -242,9 +279,16 @@ export function createSignalRouterDecorator(
           return createErrorResponse(err.message, uuid, method, ErrorCode.REPLAY_DETECTED, meta)
         }
 
-        if (uuid && idempotency.isEnabled() && idempotency.has(uuid)) {
-          const cached = idempotency.get(uuid)
-          if (cached) return cached
+        // Idempotency (claim-before-execute): dedup on the wire-level idempotency
+        // key when the client stamped one, falling back to the envelope uuid (so
+        // timeout-retries — which carry a fresh uuid but the same idempotencyKey —
+        // collapse to one execution). A hit returns the stored response; otherwise
+        // we hold the claim until `finally` commits it (success) or releases it.
+        idemKey = meta?.idempotencyKey || uuid
+        if (idemKey && idem.isEnabled()) {
+          const began = await idem.begin(idemKey)
+          if (began.status === "hit") return began.value
+          idemBegan = true
         }
 
         if (debugEnabled) {
@@ -258,6 +302,7 @@ export function createSignalRouterDecorator(
         }
 
         const callerService = await extractCallerService(meta, options.accessControl?.jwtVerifier)
+        auditCaller = callerService ?? null
         const topic = eventPattern
 
         if (rateLimiter.isEnabled()) {
@@ -270,6 +315,12 @@ export function createSignalRouterDecorator(
             throw err
           }
         }
+
+        // Tenant kill-switch — checked after rate-limit (a disabled tenant is
+        // still charged a token) and before dispatch. Throws UNAUTHORIZED, which
+        // the outer catch turns into a clean error response. Mirrors the order in
+        // BaseMessageController.
+        assertTenantAllowed(serviceNameFromMeta, meta?.tenantId)
 
         if (!isAccessAllowed(options.accessControl, topic, parsed.name, callerService)) {
           logAccessDenied(options.accessControl, { topic, method, serviceName: serviceNameFromMeta, callerService })
@@ -400,13 +451,29 @@ export function createSignalRouterDecorator(
           "nevo.caller": callerService ?? ""
         })
 
+        // Materialise any @Hedge/@CircuitBreaker/@Adaptive/@Backpressure on the
+        // target method. When present, the real handler invocation runs through
+        // the resilience runtime (keyed by `service:method`); otherwise it is a
+        // plain call — zero overhead on undecorated handlers.
+        const resilience = readMethodResilience(serviceInstance, serviceMethod)
+
         let result: unknown
         try {
-          result = await serviceInstance[serviceMethod](...args)
+          const invoke = () => serviceInstance[serviceMethod](...args)
+          result = resilience
+            ? await applyResilience({ config: resilience, ctx: { key: `${serviceNameFromMeta}:${parsed.name}` }, invoke })
+            : await invoke()
           span?.setStatus({ code: 1 })
         } catch (err) {
           span?.recordException(err)
           span?.setStatus({ code: 2, message: (err as Error)?.message })
+          // A @Backpressure admission failure surfaces as RATE_LIMITED — that's
+          // intentional load-shedding, not a handler crash, so reply with a
+          // clean error response instead of throwing into the DLQ / error path.
+          if (err instanceof MessagingError && err.code === ErrorCode.RATE_LIMITED) {
+            response = { uuid, method, params: { result: "error", error: err.toJSON() }, meta }
+            return response
+          }
           throw err
         } finally {
           span?.end()
@@ -439,10 +506,17 @@ export function createSignalRouterDecorator(
           if (hookResponse !== undefined) response = hookResponse
         }
 
-        if (uuid && idempotency.isEnabled()) idempotency.set(uuid, response)
+        // Commit the idempotency result (L1 + AWAITED distributed write-through)
+        // so a peer replica observes it before we ack. Errors are not cached —
+        // the `finally` block releases the claim so a retry can re-execute.
+        if (idemKey && idemBegan && response.params.result !== "error") {
+          await idem.commit(idemKey, response)
+          idemCommitted = true
+        }
         if (methodCache && cacheKey && response.params.result !== "error") {
           methodCache.set(cacheKey, response.params.result)
         }
+        finalResponse = response
         return response
       } catch (error: any) {
         const errorMessage = error instanceof Error ? error.message : "Unknown error"
@@ -458,13 +532,16 @@ export function createSignalRouterDecorator(
             ts: nowMs
           })
         } catch {}
-        return createErrorResponse(errorMessage, messageData?.uuid ?? (data as any)?.uuid, messageData?.method ?? (data as any)?.method, code, messageData?.meta)
+        finalResponse = createErrorResponse(errorMessage, messageData?.uuid ?? (data as any)?.uuid, messageData?.method ?? (data as any)?.method, code, messageData?.meta) as MessageResponse
+        return finalResponse
       } finally {
         const durationMs = Date.now() - startMs
-        const success = response?.params?.result !== "error"
+        // Use the final response (the catch path sets `finalResponse`, not
+        // `response`) so handler errors are recorded as errors, not "ok".
+        const success = (finalResponse ?? response)?.params?.result !== "error"
         const labels = {
           service: serviceNameFromMeta,
-          method: messageData?.method ?? "unknown",
+          method: methodLabel(messageData?.method, (name) => knownMethodNames.has(name)),
           status: success ? "ok" : "error"
         }
         metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, labels)
@@ -486,6 +563,32 @@ export function createSignalRouterDecorator(
               error: errPayload ? { code: errPayload.code, message: errPayload.message } : undefined
             })
           } catch {}
+        }
+
+        // Release a still-held idempotency claim when no result was committed
+        // (handler error, policy denial, early return) so a retry can re-execute
+        // instead of polling a stranded sentinel until its TTL expires.
+        if (idemKey && idemBegan && !idemCommitted) {
+          try { await idem.release(idemKey) } catch {}
+        }
+
+        // Append-only audit — fire-and-forget, never block request completion.
+        if (auditLog?.isEnabled()) {
+          const auditResponse = finalResponse ?? response
+          if (auditResponse) {
+            Promise.resolve(
+              auditLog.recordFromResponse({
+                service: serviceNameFromMeta,
+                method: messageData?.method ?? "unknown",
+                uuid: messageData?.uuid ?? "",
+                startedAt: startMs,
+                params: messageData?.params,
+                response: auditResponse,
+                meta: messageData?.meta,
+                caller: auditCaller
+              })
+            ).catch(() => {})
+          }
         }
       }
       })
