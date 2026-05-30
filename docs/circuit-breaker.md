@@ -102,11 +102,51 @@ By default, any rejection from the underlying call counts. Transport-level error
 
 ## Combining with retry
 
-The breaker sees retries as separate attempts. If `retry.maxAttempts: 3` and the breaker opens after attempt 2, attempt 3 rejects immediately with `CIRCUIT_OPEN`. The original error is wrapped on the breaker rejection.
+One logical call is **one** breaker observation, no matter how many internal retries or hedged copies fire underneath it. The breaker records `before` once at the start of the call and a single `onSuccess`/`onFailure` at the end (see `runCircuitHedge` in `resilience-runtime.ts`) — so a call that retries three times and finally succeeds counts as one success, not two failures plus a success, and the breaker cannot flip to open *mid-retry* and reject a later attempt of the same call.
 
-## What is not provided
+(This is a behaviour change from older versions, where each retry attempt was a separate breaker observation and the breaker could open between attempts.)
 
-- Per-tenant keying (`keyBy`) — keys are positional `service:method`. To partition by tenant, you would need to extend the breaker.
+## Declarative form — `@CircuitBreaker`
+
+`before/onSuccess/onFailure` is fine for transport-internal use, but bad for application code: it leaks the lifecycle into the call site. The annotation form does the wiring for you:
+
+```ts
+import { CircuitBreaker } from "@riaskov/nevo-messaging"
+
+@Injectable()
+export class UserService extends NatsClientBase {
+  @CircuitBreaker({
+    mode: "sliding",          // default — pass "count" for the simple variant
+    windowMs: 10_000,
+    errorRateThreshold: 0.5,
+    minSampleSize: 20,
+    resetTimeoutMs: 30_000
+  })
+  async getById(id: bigint) {
+    return this.query("user", "user.getById", { id })
+  }
+}
+```
+
+The resilience runtime maintains one process-wide registry per mode, keyed by `service:method`, so multiple concurrent callers and retries share the same circuit state. `VALIDATION_FAILED` and `UNAUTHORIZED` still don't count as failures.
+
+See [resilience-decorators.md](./resilience-decorators.md) for layering with `@Hedge` / `@Adaptive`.
+
+## Per-tenant keying (`keyBy`)
+
+The `@CircuitBreaker` decorator (like `@Backpressure` and `@Adaptive`) accepts a `keyBy` of `TenantKeyDimension[]` (`"service" | "method" | "callerService" | "tenantId"`), and the resilience runtime widens the breaker key with those dynamic dimensions:
+
+```ts
+@CircuitBreaker({ mode: "sliding", errorRateThreshold: 0.5, keyBy: ["service", "method", "tenantId"] })
+async getById(id: bigint) {
+  return this.query("user", "user.getById", { id })
+}
+```
+
+Caveat: `keyBy` only takes effect when the call site supplies the tenant/caller dimensions to the runtime. The **built-in server router currently keys breakers as `service:method`** — it calls `applyResilience` with just `{ key: "service:method" }` and does not yet feed `tenantId` / `callerService` into the resilience context, so today a noisy tenant still trips the server-side breaker for everyone. The rate limiter, by contrast, *does* receive `tenantId` server-side. To isolate breakers per tenant today, drive the resilience runtime yourself (e.g. via `wrapMethodWithResilience` / `makeResilienceRunner` with a context that includes the tenant), or run one breaker registry per tenant in your application layer.
+
+## What is *still* not provided
+
 - Manual `forceOpen()` / `forceClose()` — there is no kill switch API today. Toggle the `enabled` flag in your options to disable the entire registry if you need an emergency override.
 
 ## See also

@@ -1,21 +1,33 @@
 {
   "name": "@riaskov/nevo-messaging",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "Microservices messaging framework for NestJS with NATS/Kafka/SocketIO/HTTP transport, MessagePack, retry/circuit-breaker, OTel, schema validation, DLQ, idempotency, saga, outbox, metrics, health, DevTools",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json",
+    "./dist/*": "./dist/*.js"
+  },
   "bin": {
     "nevo-contract": "dist/cli/contract.js",
     "nevo-gen": "dist/cli/gen-service.js"
   },
-  "packageManager": "pnpm@9.0.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@11.0.0",
   "scripts": {
-    "build": "tsc && node -e \"try { require('fs').chmodSync('dist/cli/contract.js', 0o755); require('fs').chmodSync('dist/cli/gen-service.js', 0o755) } catch {}\"",
+    "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "pnpm run clean && tsc && node -e \"try { require('fs').chmodSync('dist/cli/contract.js', 0o755); require('fs').chmodSync('dist/cli/gen-service.js', 0o755) } catch {}\"",
     "dev": "tsc --watch",
-    "prepublishOnly": "pnpm run build",
+    "prepublishOnly": "pnpm run clean && pnpm run lint && pnpm run test && pnpm run build",
     "test": "node --import tsx --test \"test/**/*.test.ts\"",
     "test:watch": "node --import tsx --test --watch \"test/**/*.test.ts\"",
-    "lint": "eslint \"src/**/*.ts\" --max-warnings=0 || true",
+    "lint": "eslint \"src/**/*.ts\" --max-warnings=0",
     "format": "prettier --write \"src/**/*.ts\" \"examples/**/*.ts\" \"test/**/*.ts\""
   },
   "keywords": [
@@ -37,72 +49,126 @@
   "author": "Andrei Riaskov <code@riaskov.com>",
   "license": "MIT",
   "peerDependencies": {
+    "@msgpack/msgpack": "^3.1.3",
+    "@napi-rs/zstd": "^1.0.0",
+    "@nats-io/jetstream": "^3.0.0",
+    "@nats-io/nats-core": "^3.0.0",
+    "@nats-io/transport-node": "^3.0.0",
     "@nestjs/common": "^11.1.0",
+    "@nestjs/config": "^4.0.0",
     "@nestjs/core": "^11.1.0",
     "@nestjs/microservices": "^11.1.0",
-    "@nestjs/config": "^4.0.0",
     "@nestjs/platform-fastify": "^11.1.0",
-    "@msgpack/msgpack": "^3.1.3",
     "@opentelemetry/api": "^1.9.0",
+    "cacheable-lookup": "^7.0.0",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.0",
+    "fast-json-stringify": "^6.0.0",
     "kafkajs": "^2.2.4",
-    "@nats-io/transport-node": "^3.0.0",
-    "@nats-io/nats-core": "^3.0.0",
-    "@nats-io/jetstream": "^3.0.0",
     "pino": "^9.0.0",
     "pino-pretty": "^11.0.0",
     "prom-client": "^15.0.0",
-    "rxjs": "^7.8.2",
     "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
     "socket.io": "^4.8.1",
     "socket.io-client": "^4.8.1",
-    "ws": "^8.18.0",
-    "zod": "^4.4.3",
-    "fast-json-stringify": "^6.0.0",
     "undici": "^7.0.0",
-    "cacheable-lookup": "^7.0.0",
-    "@napi-rs/zstd": "^1.0.0"
+    "ws": "^8.18.0",
+    "zod": "^4.4.3"
   },
   "peerDependenciesMeta": {
-    "@msgpack/msgpack": { "optional": true },
-    "@opentelemetry/api": { "optional": true },
-    "class-transformer": { "optional": true },
-    "class-validator": { "optional": true },
-    "kafkajs": { "optional": true },
-    "@nats-io/transport-node": { "optional": true },
-    "@nats-io/nats-core": { "optional": true },
-    "@nats-io/jetstream": { "optional": true },
-    "pino": { "optional": true },
-    "pino-pretty": { "optional": true },
-    "prom-client": { "optional": true },
-    "socket.io": { "optional": true },
-    "socket.io-client": { "optional": true },
-    "ws": { "optional": true },
-    "zod": { "optional": true },
-    "fast-json-stringify": { "optional": true },
-    "undici": { "optional": true },
-    "cacheable-lookup": { "optional": true },
-    "@napi-rs/zstd": { "optional": true }
+    "@nestjs/common": {
+      "optional": false
+    },
+    "@nestjs/core": {
+      "optional": false
+    },
+    "@nestjs/microservices": {
+      "optional": false
+    },
+    "@nestjs/config": {
+      "optional": false
+    },
+    "@nestjs/platform-fastify": {
+      "optional": false
+    },
+    "@msgpack/msgpack": {
+      "optional": true
+    },
+    "@opentelemetry/api": {
+      "optional": true
+    },
+    "class-transformer": {
+      "optional": true
+    },
+    "class-validator": {
+      "optional": true
+    },
+    "kafkajs": {
+      "optional": true
+    },
+    "@nats-io/transport-node": {
+      "optional": true
+    },
+    "@nats-io/nats-core": {
+      "optional": true
+    },
+    "@nats-io/jetstream": {
+      "optional": true
+    },
+    "pino": {
+      "optional": true
+    },
+    "pino-pretty": {
+      "optional": true
+    },
+    "prom-client": {
+      "optional": true
+    },
+    "socket.io": {
+      "optional": true
+    },
+    "socket.io-client": {
+      "optional": true
+    },
+    "ws": {
+      "optional": true
+    },
+    "zod": {
+      "optional": true
+    },
+    "fast-json-stringify": {
+      "optional": true
+    },
+    "undici": {
+      "optional": true
+    },
+    "cacheable-lookup": {
+      "optional": true
+    },
+    "@napi-rs/zstd": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@msgpack/msgpack": "3.1.3",
+    "@nats-io/jetstream": "3.0.0",
+    "@nats-io/nats-core": "3.0.0",
+    "@nats-io/transport-node": "3.0.0",
     "@nestjs/common": "11.1.0",
+    "@nestjs/config": "4.0.2",
     "@nestjs/core": "11.1.0",
     "@nestjs/microservices": "11.1.0",
-    "@nestjs/config": "4.0.2",
     "@nestjs/platform-fastify": "11.1.0",
     "@opentelemetry/api": "1.9.0",
-    "@types/node": "^25.8.0",
-    "@typescript-eslint/eslint-plugin": "^8.0.0",
-    "@typescript-eslint/parser": "^8.0.0",
+    "@types/node": "^25.9.1",
+    "@types/ws": "8.5.13",
+    "@typescript-eslint/eslint-plugin": "^8.60.0",
+    "@typescript-eslint/parser": "^8.60.0",
     "class-transformer": "0.5.1",
     "class-validator": "0.14.1",
     "eslint": "8.57.1",
     "kafkajs": "2.2.4",
-    "@nats-io/transport-node": "3.0.0",
-    "@nats-io/nats-core": "3.0.0",
-    "@nats-io/jetstream": "3.0.0",
     "pino": "9.5.0",
     "pino-pretty": "11.3.0",
     "prettier": "3.5.3",
@@ -111,10 +177,9 @@
     "rxjs": "7.8.2",
     "socket.io": "4.8.1",
     "socket.io-client": "4.8.1",
-    "ws": "8.18.0",
-    "@types/ws": "8.5.13",
     "tsx": "4.19.2",
-    "typescript": "^6.0.0",
+    "typescript": "^6.0.3",
+    "ws": "8.18.0",
     "zod": "4.4.3"
   },
   "files": [

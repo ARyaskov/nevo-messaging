@@ -11,19 +11,21 @@ A microservices messaging framework for NestJS 11+ with multi-transport support 
 - 🎯 Declarative routing via `@Signal` decorator with method versioning
 - 🧱 Pluggable codecs — MessagePack default, JSON, fast-json-stringify
 - 🪶 Compression (gzip, deflate, zstd) with worker-thread offload
-- 🧯 Resilience: retry with jitter, sliding-window circuit breaker, hedging, adaptive concurrency, idempotency LRU, replay protection, rate limiting
-- 🧰 Reliable patterns: transactional outbox, exactly-once inbox, saga with compensation, CQRS bridge, event store
+- 🧯 Resilience: retry with jitter, sliding-window circuit breaker, hedging, adaptive concurrency, idempotency cache (LRU + Redis distributed store), replay protection, rate limiting (in-process **and** Redis-cluster) — usable as `@Hedge`/`@CircuitBreaker`/`@Adaptive`/`@Backpressure` decorators
+- 🧰 Reliable patterns: transactional outbox, effectively-once inbox (with a transactional store — e.g. `PgInboxStore`), saga with compensation, CQRS bridge, event store — in-memory + SQLite + **Postgres production stores**
+- 🧪 In-memory transport (`createMemoryTransport()`) + `MemoryHarness` for unit tests with no broker dependency
 - 📈 Observability: pino, Prometheus metrics, OpenTelemetry, structured DLQ
 - 🪟 DevTools UI — live Next.js 16 dashboard with circuits/methods/errors/trace/replay
 - 🔐 Security: ACL, JWT/JWKS, mTLS, PII redaction
 - 🩺 Liveness + readiness probes with pluggable checks (pg/redis/nats/kafka/http)
+- 🌐 Service discovery — built-in heartbeat + pluggable Consul / Kubernetes DNS providers
 - 🛡️ Graceful shutdown, BigInt support, did-you-mean suggestions
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ## Requirements
 
-- Node.js **≥ 24** (tested on 26)
+- Node.js **≥ 24** (tested on 26) — enforced by the package's `engines` field, so older runtimes are refused at install time. The built-in `node:sqlite` store and several runtime APIs require Node 24.
 - TypeScript **≥ 6**
 - NestJS **≥ 11**
 
@@ -185,7 +187,12 @@ See [docs/messaging-patterns.md](./docs/messaging-patterns.md).
 | Other transports (Kafka, HTTP, HTTP/2, WS, Socket.IO) | [docs/](./docs/README.md) |
 | DevTools live dashboard | [docs/devtools.md](./docs/devtools.md) |
 | Reliable patterns (outbox, inbox, saga, CQRS, DLQ) | [docs/outbox.md](./docs/outbox.md) |
+| Resilience decorators (`@Hedge`, `@CircuitBreaker`, `@Adaptive`, `@Backpressure`) | [docs/resilience-decorators.md](./docs/resilience-decorators.md) |
 | Resilience (retry, breaker, hedging, rate limit) | [docs/retry.md](./docs/retry.md) |
+| Distributed idempotency (Redis store) | [docs/idempotency.md](./docs/idempotency.md) |
+| Service discovery (Consul, Kubernetes DNS, Etcd, Eureka, AWS Cloud Map, Nomad) | [docs/discovery.md](./docs/discovery.md) |
+| Production storage matrix (Postgres, Redis, SQLite) | [docs/storage-matrix.md](./docs/storage-matrix.md) |
+| Testing with in-memory transport | [docs/testing.md](./docs/testing.md) |
 | Observability (OTel, metrics, health probes) | [docs/observability.md](./docs/observability.md) |
 | Security (ACL, JWT/JWKS, mTLS) | [docs/security.md](./docs/security.md) |
 | Performance tuning | [docs/performance.md](./docs/performance.md) |
@@ -198,6 +205,7 @@ Full index: **[docs/README.md](./docs/README.md)**.
 - `examples/user` — standard Kafka microservice
 - `examples/socket-user` — Socket.IO transport
 - `examples/http-user` — HTTP query/emit + SSE subscribe + broadcast
+- `examples/resilience-decorators` — `@Hedge` / `@CircuitBreaker` / `@Adaptive` / `@Backpressure` plus the Redis idempotency store and Consul / Kubernetes DNS discovery providers
 
 ## Contributing
 

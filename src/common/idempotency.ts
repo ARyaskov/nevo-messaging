@@ -83,7 +83,7 @@ export class LruIdempotencyCache<T = unknown> {
     if (!this.enabled) return false
     const node = this.map.get(key)
     if (!node) return false
-    if (performance.now() > node.expiresAt) {
+    if (Date.now() > node.expiresAt) {
       this.detach(node)
       this.map.delete(key)
       return false
@@ -96,7 +96,7 @@ export class LruIdempotencyCache<T = unknown> {
     if (!this.enabled) return undefined
     const node = this.map.get(key)
     if (!node) return undefined
-    if (performance.now() > node.expiresAt) {
+    if (Date.now() > node.expiresAt) {
       this.detach(node)
       this.map.delete(key)
       return undefined
@@ -109,7 +109,9 @@ export class LruIdempotencyCache<T = unknown> {
     if (!this.enabled) return
     const detached = detachBuffers(value) as T
     const existing = this.map.get(key)
-    const expiresAt = performance.now() + this.ttlMs
+    // Wall-clock (Date.now), matching the replay-guard freshness window, so the dedup
+    // TTL and the window are measured on one consistent clock.
+    const expiresAt = Date.now() + this.ttlMs
     if (existing) {
       existing.value = detached
       existing.expiresAt = expiresAt
@@ -120,6 +122,20 @@ export class LruIdempotencyCache<T = unknown> {
     this.map.set(key, node)
     this.appendHead(node)
     if (this.map.size > this.maxEntries) this.dropTail()
+  }
+
+  /**
+   * Remove `key` entirely (unlink the node + drop the map entry) so a later
+   * {@link has}/{@link get} reports absent. Distinct from `set(key, undefined)`,
+   * which would leave a live tombstone node that `has` still counts as present.
+   * Returns true when an entry was removed.
+   */
+  delete(key: string): boolean {
+    const node = this.map.get(key)
+    if (!node) return false
+    this.detach(node)
+    this.map.delete(key)
+    return true
   }
 
   clear(): void {

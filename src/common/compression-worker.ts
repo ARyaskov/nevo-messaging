@@ -9,8 +9,10 @@ const { gzipSync, gunzipSync, deflateSync, inflateSync } = require("node:zlib")
 const zlib = require("node:zlib")
 
 parentPort.on("message", (msg) => {
+  // Destructure outside the try so 'id' is in scope for the catch — a decompress
+  // that overflows maxOutputLength throws here, and the reply must carry the id.
+  const { id, op, data, encoding, level, maxOutputBytes } = msg
   try {
-    const { id, op, data, encoding, level } = msg
     let result
     if (op === "compress") {
       if (encoding === "gzip") result = gzipSync(data, { level })
@@ -18,14 +20,15 @@ parentPort.on("message", (msg) => {
       else if (encoding === "zstd" && typeof zlib.zstdCompressSync === "function") result = zlib.zstdCompressSync(data)
       else result = data
     } else {
-      if (encoding === "gzip") result = gunzipSync(data)
-      else if (encoding === "deflate") result = inflateSync(data)
-      else if (encoding === "zstd" && typeof zlib.zstdDecompressSync === "function") result = zlib.zstdDecompressSync(data)
+      const limit = maxOutputBytes != null ? { maxOutputLength: maxOutputBytes } : undefined
+      if (encoding === "gzip") result = gunzipSync(data, limit)
+      else if (encoding === "deflate") result = inflateSync(data, limit)
+      else if (encoding === "zstd" && typeof zlib.zstdDecompressSync === "function") result = zlib.zstdDecompressSync(data, limit)
       else result = data
     }
     parentPort.postMessage({ id, ok: true, data: result }, [result.buffer])
   } catch (err) {
-    parentPort.postMessage({ id, ok: false, err: err && err.message ? err.message : String(err) })
+    parentPort.postMessage({ id, ok: false, err: err && err.message ? err.message : String(err), code: err && err.code ? err.code : undefined })
   }
 })
 `
@@ -57,7 +60,11 @@ function getPool(size: number): PooledWorker[] {
       if (!job) return
       pending.delete(msg.id)
       if (msg.ok) job.resolve(new Uint8Array(msg.data))
-      else job.reject(new Error(msg.err))
+      else {
+        const err = new Error(msg.err) as Error & { code?: string }
+        if (msg.code) err.code = msg.code
+        job.reject(err)
+      }
     })
     w.unref()
   }
@@ -109,11 +116,13 @@ export async function workerCompress(data: Uint8Array, encoding: "gzip" | "defla
     pooled.busy = false
     throw err
   }
-  promise.finally(() => { pooled.busy = false })
-  return promise
+  // Return the chained promise so the caller's await/catch also covers the busy
+  // reset — a bare `promise.finally(...)` would orphan its rejection and surface
+  // as an unhandledRejection when a job rejects (e.g. a decompression-bomb cap).
+  return promise.finally(() => { pooled.busy = false })
 }
 
-export async function workerDecompress(data: Uint8Array, encoding: "gzip" | "deflate" | "zstd"): Promise<Uint8Array> {
+export async function workerDecompress(data: Uint8Array, encoding: "gzip" | "deflate" | "zstd", maxOutputBytes?: number): Promise<Uint8Array> {
   const pooled = pickWorker()
   if (!pooled) throw new Error("Compression worker pool not initialized; call configureCompressionWorker first")
   const id = ++jobCounter
@@ -122,14 +131,13 @@ export async function workerDecompress(data: Uint8Array, encoding: "gzip" | "def
   pending.set(id, { resolve, reject })
   pooled.busy = true
   try {
-    pooled.worker.postMessage({ id, op: "decompress", data, encoding }, [data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer])
+    pooled.worker.postMessage({ id, op: "decompress", data, encoding, maxOutputBytes }, [data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer])
   } catch (err) {
     pending.delete(id)
     pooled.busy = false
     throw err
   }
-  promise.finally(() => { pooled.busy = false })
-  return promise
+  return promise.finally(() => { pooled.busy = false })
 }
 
 export async function shutdownCompressionWorker(): Promise<void> {

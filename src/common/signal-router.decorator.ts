@@ -101,6 +101,7 @@ function createHandlersFromSignals(signals: SignalMetadata[]): ServiceMethodMapp
       resultTransformer: signal.resultTransformer,
       options: signal.options,
       schema: signal.options?.schema,
+      resultSchema: signal.options?.resultSchema,
       version: signal.version || signal.options?.version
     }
     return handlers

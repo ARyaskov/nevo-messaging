@@ -10,6 +10,42 @@ export interface AdaptiveOptions {
 
 interface Sample { ts: number; durationMs: number; ok: boolean }
 
+// Upper bound on retained samples. Eviction is by time window *and* by this cap:
+// once the ring is full the oldest slot is overwritten, so memory stays O(cap)
+// regardless of throughput. 2048 recent samples is ample for a stable p99.
+const MAX_SAMPLES = 2048
+
+/**
+ * Hoare-style quickselect: returns the k-th smallest element (0-indexed),
+ * mutating `arr` into a partial ordering around k. O(n) on average — avoids the
+ * O(n log n) full sort the old percentile() paid on every observe(). Safe to
+ * call repeatedly on the same array (correct for any input ordering).
+ */
+function selectKth(arr: number[], k: number): number {
+  let lo = 0
+  let hi = arr.length - 1
+  while (lo < hi) {
+    const pivot = arr[(lo + hi) >> 1]
+    let i = lo
+    let j = hi
+    while (i <= j) {
+      while (arr[i] < pivot) i++
+      while (arr[j] > pivot) j--
+      if (i <= j) {
+        const tmp = arr[i]
+        arr[i] = arr[j]
+        arr[j] = tmp
+        i++
+        j--
+      }
+    }
+    if (k <= j) hi = j
+    else if (k >= i) lo = i
+    else break
+  }
+  return arr[k]
+}
+
 export class AdaptiveTuner {
   private readonly enabled: boolean
   private readonly windowMs: number
@@ -18,7 +54,12 @@ export class AdaptiveTuner {
   private readonly maxRetries: number
   private readonly minTimeoutMs: number
   private readonly maxTimeoutMs: number
-  private readonly samples: Sample[] = []
+  // Fixed-capacity ring buffer. `start` indexes the oldest live slot, `size` is
+  // the number of live slots (≤ MAX_SAMPLES). Writes are O(1) — out-of-window
+  // entries are skipped lazily during aggregation instead of being shifted out.
+  private readonly ring: Sample[] = new Array(MAX_SAMPLES)
+  private start = 0
+  private size = 0
   private currentRetries: number
   private currentTimeoutMs: number
 
@@ -39,30 +80,43 @@ export class AdaptiveTuner {
   observe(durationMs: number, ok: boolean): void {
     if (!this.enabled) return
     const now = Date.now()
-    this.samples.push({ ts: now, durationMs, ok })
+    const slot = (this.start + this.size) % MAX_SAMPLES
+    this.ring[slot] = { ts: now, durationMs, ok }
+    if (this.size < MAX_SAMPLES) {
+      this.size++
+    } else {
+      // Buffer full — advancing `start` overwrites the oldest sample.
+      this.start = (this.start + 1) % MAX_SAMPLES
+    }
+    this.recompute(now)
+  }
+
+  /** Collect in-window durations into a fresh array and count errors in one pass. */
+  private window(now: number): { durations: number[]; errors: number } {
     const cutoff = now - this.windowMs
-    while (this.samples.length > 0 && this.samples[0].ts < cutoff) this.samples.shift()
-    this.recompute()
+    const durations: number[] = []
+    let errors = 0
+    for (let i = 0; i < this.size; i++) {
+      const s = this.ring[(this.start + i) % MAX_SAMPLES]
+      if (s.ts < cutoff) continue
+      durations.push(s.durationMs)
+      if (!s.ok) errors++
+    }
+    return { durations, errors }
   }
 
-  private percentile(p: number): number {
-    if (this.samples.length === 0) return this.target
-    const sorted = this.samples.map((s) => s.durationMs).sort((a, b) => a - b)
-    const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))
-    return sorted[idx]
+  private percentile(durations: number[], p: number): number {
+    if (durations.length === 0) return this.target
+    const idx = Math.min(durations.length - 1, Math.floor((p / 100) * durations.length))
+    return selectKth(durations, idx)
   }
 
-  private errorRate(): number {
-    if (this.samples.length === 0) return 0
-    let errs = 0
-    for (const s of this.samples) if (!s.ok) errs++
-    return errs / this.samples.length
-  }
-
-  private recompute(): void {
-    if (this.samples.length < 10) return
-    const p99 = this.percentile(99)
-    const err = this.errorRate()
+  private recompute(now: number): void {
+    if (this.size < 10) return
+    const { durations, errors } = this.window(now)
+    if (durations.length < 10) return
+    const p99 = this.percentile(durations, 99)
+    const err = errors / durations.length
 
     if (p99 > this.target * 1.5 && this.currentTimeoutMs < this.maxTimeoutMs) {
       this.currentTimeoutMs = Math.min(this.maxTimeoutMs, Math.floor(this.currentTimeoutMs * 1.5))
@@ -81,12 +135,17 @@ export class AdaptiveTuner {
   getTimeoutMs(): number { return this.currentTimeoutMs }
 
   snapshot(): { p50: number; p95: number; p99: number; errorRate: number; sampleSize: number; retries: number; timeoutMs: number } {
+    const { durations, errors } = this.window(Date.now())
+    const sampleSize = durations.length
+    const errorRate = sampleSize === 0 ? 0 : errors / sampleSize
+    // `percentile` mutates `durations` (partial sort); reusing the same array
+    // across calls is fine — selectKth is correct on any ordering.
     return {
-      p50: this.percentile(50),
-      p95: this.percentile(95),
-      p99: this.percentile(99),
-      errorRate: this.errorRate(),
-      sampleSize: this.samples.length,
+      p50: this.percentile(durations, 50),
+      p95: this.percentile(durations, 95),
+      p99: this.percentile(durations, 99),
+      errorRate,
+      sampleSize,
       retries: this.currentRetries,
       timeoutMs: this.currentTimeoutMs
     }

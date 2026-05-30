@@ -19,13 +19,14 @@ import { resolveRetryOptions, withRetry, ResolvedRetryOptions } from "./retry"
 import { resolveCompressionOptions, ResolvedCompressionOptions } from "./compression"
 import { DEFAULT_MAX_PAYLOAD_BYTES } from "./payload-limit"
 import { getDefaultTracer, NevoTracer } from "./tracing"
-import { getDefaultMetrics, NEVO_METRIC_NAMES, MetricsRegistry } from "./metrics"
+import { getDefaultMetrics, NEVO_METRIC_NAMES, MetricsRegistry, methodLabel } from "./metrics"
 import { GracefulShutdown } from "./graceful-shutdown"
 import { LruIdempotencyCache } from "./idempotency"
 import { formatMethod, DEFAULT_METHOD_VERSION } from "./version"
 import { RateLimiter, resolveRateLimiter } from "./rate-limit"
 import { getDevToolsBus, DevToolsBus } from "./devtools"
 import { uuidv7 } from "./uuid"
+import { applyResilience, type CompiledResilience } from "./resilience-runtime"
 
 export interface PreparedRequest {
   uuid: string
@@ -34,6 +35,45 @@ export interface PreparedRequest {
   request: MessageRequest
 }
 
+/**
+ * Shared client resilience pipeline — the single source of truth for the
+ * ordering "circuit breaker wraps the **entire** retried operation (plus any
+ * optional decorator resilience)". Recording exactly one breaker outcome per
+ * logical call (instead of one per retry attempt) is what stops N retries from
+ * tripping the breaker N× too early.
+ *
+ * Transport clients that do not (yet) extend {@link BaseMessagingClient} — e.g.
+ * `NevoNatsClient` — call this directly, so there is exactly one implementation
+ * of the ordering across the codebase rather than divergent per-transport
+ * copies. See the note on {@link BaseMessagingClient}.
+ */
+export async function runClientPipeline<T>(
+  circuitBreaker: CircuitBreakerRegistry,
+  retryOptions: ResolvedRetryOptions,
+  key: string,
+  attempt: (attempt: number) => Promise<T>,
+  resilience?: CompiledResilience
+): Promise<T> {
+  circuitBreaker.before(key)
+  try {
+    const inner = (): Promise<T> => withRetry(attempt, retryOptions)
+    const result = resilience
+      ? await applyResilience<T>({ config: resilience, ctx: { key }, invoke: () => inner() })
+      : await inner()
+    circuitBreaker.onSuccess(key)
+    return result
+  } catch (err) {
+    circuitBreaker.onFailure(key, err)
+    throw err
+  }
+}
+
+/**
+ * Reference base for transport clients. Its constructor wires the shared
+ * primitives (codec, circuit breaker, retry, metrics, idempotency, …) and
+ * {@link withClientPipeline} is the canonical request path.
+ *
+ */
 export abstract class BaseMessagingClient {
   protected readonly options: TransportClientOptions
   protected readonly microservices: Map<string, string> = new Map()
@@ -133,22 +173,29 @@ export abstract class BaseMessagingClient {
     return this.codec.decode<T>(data)
   }
 
-  protected async withClientPipeline<T>(serviceName: string, method: string, fn: () => Promise<T>): Promise<T> {
+  protected async withClientPipeline<T>(
+    serviceName: string,
+    method: string,
+    fn: () => Promise<T>,
+    resilience?: CompiledResilience
+  ): Promise<T> {
     const key = `${serviceName}:${method}`
-    this.metrics.setGauge(NEVO_METRIC_NAMES.inflight, { service: serviceName, method }, 1)
+    // Version-stripped label so `foo@v1`/`foo@v2` don't split into separate series.
+    const methodName = methodLabel(method)
+    this.metrics.setGauge(NEVO_METRIC_NAMES.inflight, { service: serviceName, method: methodName }, 1)
     try {
-      this.circuitBreaker.before(key)
-      const result = await withRetry(async (attempt) => {
-        if (attempt > 1) this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { service: serviceName, method })
-        return fn()
-      }, this.retryOptions)
-      this.circuitBreaker.onSuccess(key)
-      return result
-    } catch (err) {
-      this.circuitBreaker.onFailure(key, err)
-      throw err
+      return await runClientPipeline<T>(
+        this.circuitBreaker,
+        this.retryOptions,
+        key,
+        async (attempt) => {
+          if (attempt > 1) this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { service: serviceName, method: methodName })
+          return fn()
+        },
+        resilience
+      )
     } finally {
-      this.metrics.setGauge(NEVO_METRIC_NAMES.inflight, { service: serviceName, method }, 0)
+      this.metrics.setGauge(NEVO_METRIC_NAMES.inflight, { service: serviceName, method: methodName }, 0)
     }
   }
 
@@ -180,7 +227,7 @@ export abstract class BaseMessagingClient {
     } catch {}
   }
 
-  protected async query<T = any>(serviceName: string, method: string, params: any, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<T> {
+  protected async query<T = unknown>(serviceName: string, method: string, params: unknown, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<T> {
     const clientName = this.microservices.get(serviceName)
     if (!clientName) {
       throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, { message: `Microservice ${serviceName} is not registered`, serviceName })
@@ -188,7 +235,7 @@ export abstract class BaseMessagingClient {
     return this.shutdown.trackInflight(this._queryMicroservice<T>(clientName, method, params, opts))
   }
 
-  protected async emit(serviceName: string, method: string, params: any, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<void> {
+  protected async emit(serviceName: string, method: string, params: unknown, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<void> {
     const clientName = this.microservices.get(serviceName)
     if (!clientName) {
       throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, { message: `Microservice ${serviceName} is not registered`, serviceName })
@@ -196,10 +243,10 @@ export abstract class BaseMessagingClient {
     return this.shutdown.trackInflight(this._emitToMicroservice(clientName, method, params, opts))
   }
 
-  protected abstract _queryMicroservice<T>(clientName: string, method: string, params: any, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<T>
-  protected abstract _emitToMicroservice(clientName: string, method: string, params: any, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<void>
-  protected abstract _publishToMicroservice(clientName: string, method: string, params: any, opts?: { version?: string; headers?: Record<string, string> }): Promise<void>
-  protected abstract _broadcast(method: string, params: any, opts?: { version?: string; headers?: Record<string, string> }): Promise<void>
+  protected abstract _queryMicroservice<T>(clientName: string, method: string, params: unknown, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<T>
+  protected abstract _emitToMicroservice(clientName: string, method: string, params: unknown, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<void>
+  protected abstract _publishToMicroservice(clientName: string, method: string, params: unknown, opts?: { version?: string; headers?: Record<string, string> }): Promise<void>
+  protected abstract _broadcast(method: string, params: unknown, opts?: { version?: string; headers?: Record<string, string> }): Promise<void>
   protected abstract _subscribeToMicroservice<T>(
     clientName: string,
     method: string,

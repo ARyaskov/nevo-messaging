@@ -20,7 +20,7 @@ import { AuthService } from "./auth/auth.service"
     UserService,
     AuthService,
 
-    // Health probes — Kafka readiness can be added with kafkaProducerPing once a producer handle is available.
+    // Health probes — Kafka readiness can be added with kafkaAdminPing once an admin handle is available.
     {
       provide: HealthRegistry,
       useFactory: () => {

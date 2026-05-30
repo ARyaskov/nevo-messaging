@@ -81,11 +81,52 @@ Use `sub.isPaused()` for diagnostics.
 - Request-reply paths — there's no subscription to pause, just queue rejection
 - Short-running handlers where in-flight count never gets above the watermark
 
-## What is not provided
+## Automatic wiring — `@Backpressure` + `wrapSubscriptionHandler`
+
+You no longer have to thread `begin()/end()` through every handler. Two equivalent paths exist now:
+
+### 1. Declarative `@Backpressure` decorator
+
+```ts
+import { Backpressure } from "@riaskov/nevo-messaging"
+
+@Injectable()
+export class AuditService extends NatsClientBase {
+  @Backpressure({ maxInflight: 200, highWatermark: 160, lowWatermark: 80, onOverflow: "nack" })
+  async onUserUpdated(msg: { id: bigint }) {
+    await project(msg)
+  }
+}
+```
+
+Combined with the resilience runtime, the call site fans through `applyResilience` which calls `begin()` before, `end()` after, and either rejects or nacks/drops when the cap is hit.
+
+### 2. Explicit `wrapSubscriptionHandler`
+
+```ts
+import { wrapSubscriptionHandler } from "@riaskov/nevo-messaging"
+
+const wrapped = wrapSubscriptionHandler(
+  async (msg, ctx) => { await project(msg); await ctx.ack() },
+  () => subscription,                                   // late-bound so it picks up the real Subscription
+  { maxInflight: 200, highWatermark: 160, lowWatermark: 80, onOverflow: "reject" }
+)
+
+const sub = await client.subscribe("user", "user.updated", { ack: true }, wrapped)
+```
+
+`onOverflow` accepts:
+
+- `"reject"` (default) — throw `RATE_LIMITED`; upstream retry/circuit reacts
+- `"nack"` — call `ctx.nack("backpressure overflow")` so the broker redelivers
+- `"drop"` — silently skip; useful for telemetry fan-out where loss is acceptable
+
+The wrapper auto-pauses the subscription on high-watermark and auto-resumes on low-watermark, so transport-side flow control follows the in-process gate.
+
+## What is *still* not provided
 
 - No "executor with maxQueue" — `BackpressureLimiter` only gates new work via `begin()`.
-- No rejection policy enum — your handler decides what to do when `begin()` returns `false` (drop, log, ack-and-skip, retry-later).
-- No automatic wire-up — you place `limiter.begin() / .end()` around your handler explicitly. (Some transport-specific routers wrap this for you.)
+- No per-tenant keying — one limiter per declaration. Use multiple subscriptions/decorators to partition.
 
 ## See also
 
