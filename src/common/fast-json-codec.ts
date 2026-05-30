@@ -1,6 +1,9 @@
+import { createRequire } from "node:module"
 import type { Codec, CodecName } from "./codec"
 import { MessagingError } from "./errors"
 import { ErrorCode } from "./error-code"
+
+const nodeRequire = createRequire(__filename)
 
 type FastJsonStringifyModule = (schema: object) => (input: unknown) => string
 
@@ -14,7 +17,7 @@ let modCache: FastJsonStringifyModule | null = null
 function loadModule(): FastJsonStringifyModule {
   if (modCache) return modCache
   try {
-    const m = require("fast-json-stringify") as FastJsonStringifyModule | { default: FastJsonStringifyModule }
+    const m = nodeRequire("fast-json-stringify") as FastJsonStringifyModule | { default: FastJsonStringifyModule }
     modCache = typeof m === "function" ? m : (m as { default: FastJsonStringifyModule }).default
     return modCache
   } catch {

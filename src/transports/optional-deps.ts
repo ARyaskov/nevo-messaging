@@ -1,3 +1,7 @@
+import { createRequire } from "node:module"
+
+const nodeRequire = createRequire(__filename)
+
 type KafkaModule = typeof import("kafkajs")
 type NatsCoreModule = typeof import("@nats-io/nats-core")
 type NatsTransportModule = typeof import("@nats-io/transport-node")
@@ -30,7 +34,7 @@ function isModuleNotFound(error: unknown, name: string): boolean {
 
 function requireOptional<T>(name: string): T {
   try {
-    return require(name) as T
+    return nodeRequire(name) as T
   } catch (error: unknown) {
     if (isModuleNotFound(error, name)) {
       throw new Error(`Missing optional dependency "${name}". Install it to use this transport.`, { cause: error })
@@ -54,7 +58,7 @@ export function getNatsModule(): NatsModule {
   if (!natsCoreModule) {
     // nats-core is a transitive dep of transport-node and is always installed alongside.
     try {
-      natsCoreModule = require("@nats-io/nats-core") as NatsCoreModule
+      natsCoreModule = nodeRequire("@nats-io/nats-core") as NatsCoreModule
     } catch {
       throw new Error('Missing "@nats-io/nats-core" — it should be installed as a peer of "@nats-io/transport-node".')
     }

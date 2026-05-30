@@ -1,4 +1,7 @@
+import { createRequire } from "node:module"
 import { createTracer, setDefaultTracer, NevoTracer } from "./tracing"
+
+const nodeRequire = createRequire(__filename)
 
 export interface NevoTracingSetupOptions {
   serviceName: string
@@ -26,10 +29,10 @@ export async function setupNevoTracing(opts: NevoTracingSetupOptions): Promise<N
   let processor: any = null
 
   try {
-    const sdkTrace: any = require("@opentelemetry/sdk-trace-node")
-    const resources: any = require("@opentelemetry/resources")
-    const semconv: any = require("@opentelemetry/semantic-conventions")
-    const tracingApi: any = require("@opentelemetry/api")
+    const sdkTrace: any = nodeRequire("@opentelemetry/sdk-trace-node")
+    const resources: any = nodeRequire("@opentelemetry/resources")
+    const semconv: any = nodeRequire("@opentelemetry/semantic-conventions")
+    const tracingApi: any = nodeRequire("@opentelemetry/api")
 
     const attrs: Record<string, string> = {}
     attrs[semconv.SemanticResourceAttributes?.SERVICE_NAME ?? "service.name"] = opts.serviceName
@@ -39,7 +42,7 @@ export async function setupNevoTracing(opts: NevoTracingSetupOptions): Promise<N
     let exporter: any
     if (opts.exporter === "otlp") {
       try {
-        const otlp: any = require("@opentelemetry/exporter-trace-otlp-http")
+        const otlp: any = nodeRequire("@opentelemetry/exporter-trace-otlp-http")
         exporter = new otlp.OTLPTraceExporter({
           url: opts.endpoint ?? "http://localhost:4318/v1/traces",
           headers: opts.headers
@@ -49,14 +52,14 @@ export async function setupNevoTracing(opts: NevoTracingSetupOptions): Promise<N
       }
     } else if (opts.exporter === "jaeger") {
       try {
-        const jaeger = require("@opentelemetry/exporter-jaeger") as any
+        const jaeger = nodeRequire("@opentelemetry/exporter-jaeger") as any
         exporter = new jaeger.JaegerExporter({ endpoint: opts.endpoint ?? "http://localhost:14268/api/traces" })
       } catch (err: any) {
         throw new Error(`Jaeger exporter requires @opentelemetry/exporter-jaeger: ${err?.message}`)
       }
     } else if (opts.exporter === "zipkin") {
       try {
-        const zipkin = require("@opentelemetry/exporter-zipkin") as any
+        const zipkin = nodeRequire("@opentelemetry/exporter-zipkin") as any
         exporter = new zipkin.ZipkinExporter({ url: opts.endpoint ?? "http://localhost:9411/api/v2/spans", serviceName: opts.serviceName })
       } catch (err: any) {
         throw new Error(`Zipkin exporter requires @opentelemetry/exporter-zipkin: ${err?.message}`)

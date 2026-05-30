@@ -1,4 +1,4 @@
-import type { ServiceContract, ContractMethodDescriptor, SchemaDescriptor } from "./contract"
+import type { ServiceContract, SchemaDescriptor } from "./contract"
 import { getDefaultLogger } from "./logger"
 
 function schemaToJsonSchema(schema?: SchemaDescriptor | null): Record<string, unknown> {

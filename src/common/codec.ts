@@ -1,6 +1,9 @@
+import { createRequire } from "node:module"
 import { bigIntReplacer, makeBigIntReviver } from "./bigint.utils"
 import { MessagingError } from "./errors"
 import { ErrorCode } from "./error-code"
+
+const nodeRequire = createRequire(__filename)
 
 const legacyReviver = makeBigIntReviver({ acceptLegacy: true })
 
@@ -109,7 +112,7 @@ let sharedMsgpack: { encoder: { encode(v: unknown): Uint8Array }; decoder: { dec
 function getOrCreateSharedMsgpack(): { encoder: { encode(v: unknown): Uint8Array }; decoder: { decode(b: Uint8Array): unknown } } {
   if (sharedMsgpack) return sharedMsgpack
   try {
-    const mp = require("@msgpack/msgpack") as typeof import("@msgpack/msgpack")
+    const mp = nodeRequire("@msgpack/msgpack") as typeof import("@msgpack/msgpack")
     const EncoderCtor = (mp as unknown as { Encoder?: new (opts: object) => { encode(v: unknown): Uint8Array } }).Encoder
     const DecoderCtor = (mp as unknown as { Decoder?: new (opts: object) => { decode(b: Uint8Array): unknown } }).Decoder
     const opts = { useBigInt64: true }

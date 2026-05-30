@@ -16,7 +16,7 @@ function detachBuffers(value: unknown, depth = 0): unknown {
   }
   if (typeof value === "object") {
     for (const k of Object.keys(value as object)) {
-      ;(value as Record<string, unknown>)[k] = detachBuffers((value as Record<string, unknown>)[k], depth + 1)
+      (value as Record<string, unknown>)[k] = detachBuffers((value as Record<string, unknown>)[k], depth + 1)
     }
   }
   return value

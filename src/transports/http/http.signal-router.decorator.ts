@@ -1,7 +1,7 @@
 import { Type, Post } from "@nestjs/common"
 import { createSignalRouterDecorator, SignalRouterOptions } from "../../signal-router.utils"
 
-export interface HttpSignalRouterOptions extends SignalRouterOptions {}
+export type HttpSignalRouterOptions = SignalRouterOptions
 
 export function HttpSignalRouter(serviceType: Type<any> | Type<any>[], options?: HttpSignalRouterOptions) {
   return createSignalRouterDecorator(

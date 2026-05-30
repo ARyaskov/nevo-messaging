@@ -1,7 +1,7 @@
 import { Type } from "@nestjs/common"
 import { createServer, Server as HttpServer } from "node:http"
 import { createSignalRouterDecorator, SignalRouterOptions } from "../../signal-router.utils"
-import { DEFAULT_DISCOVERY_TOPIC, DEFAULT_SUBSCRIPTION_SUFFIX, stringifyWithBigInt, getDefaultLogger, DlqRouter, matchesFilter } from "../../common"
+import { DEFAULT_DISCOVERY_TOPIC, DEFAULT_SUBSCRIPTION_SUFFIX, stringifyWithBigInt, getDefaultLogger, DlqRouter } from "../../common"
 import { getSocketIoModule } from "../optional-deps"
 
 export interface SocketSignalRouterOptions extends SignalRouterOptions {

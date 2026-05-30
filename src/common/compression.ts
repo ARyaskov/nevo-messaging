@@ -6,7 +6,11 @@ import {
   constants as zlibConstants
 } from "node:zlib"
 import { gzip, gunzip, deflate, inflate } from "node:zlib"
+import * as nodeZlib from "node:zlib"
+import { createRequire } from "node:module"
 import { promisify } from "node:util"
+
+const nodeRequire = createRequire(__filename)
 import type { CompressionOptions } from "./types"
 import { PayloadTooLargeError } from "./errors"
 
@@ -42,22 +46,7 @@ let zstdAsync: { compress: (b: Uint8Array, opts?: object) => Promise<Buffer>; de
 function tryLoadZstd(): boolean {
   if (zstdSync && zstdAsync) return true
   try {
-    const napi: any = require("@napi-rs/zstd")
-    if (napi && typeof napi.compressSync === "function") {
-      zstdSync = {
-        compress: (b) => Buffer.from(napi.compressSync(Buffer.from(b))),
-        decompress: (b) => Buffer.from(napi.decompressSync(Buffer.from(b)))
-      }
-      zstdAsync = {
-        compress: async (b) => Buffer.from(await napi.compress(Buffer.from(b))),
-        decompress: async (b) => Buffer.from(await napi.decompress(Buffer.from(b)))
-      }
-      return true
-    }
-  } catch {}
-  try {
-    const zlib = require("node:zlib") as typeof import("node:zlib")
-    const z: any = zlib
+    const z: any = nodeZlib
     if (typeof z.zstdCompressSync === "function") {
       zstdSync = {
         compress: (b, opts) => z.zstdCompressSync(b, opts),
@@ -91,7 +80,7 @@ export async function maybeCompressAsync(buf: Uint8Array, opts: ResolvedCompress
     return { data: buf, encoding: "identity" }
   }
   try {
-    const { isCompressionWorkerEnabled, compressionWorkerThreshold, workerCompress } = require("./compression-worker") as typeof import("./compression-worker")
+    const { isCompressionWorkerEnabled, compressionWorkerThreshold, workerCompress } = nodeRequire("./compression-worker") as typeof import("./compression-worker")
     if (isCompressionWorkerEnabled() && buf.byteLength >= compressionWorkerThreshold()) {
       const algo: "gzip" | "deflate" | "zstd" = opts.algorithm === "zstd" && tryLoadZstd() ? "zstd" : opts.algorithm === "deflate" ? "deflate" : "gzip"
       const data = await workerCompress(buf, algo, opts.level)
@@ -219,7 +208,7 @@ export async function maybeDecompressAsync(buf: Uint8Array, encoding?: string, m
 async function tryWorkerDecompress(buf: Uint8Array, encoding: "gzip" | "deflate", maxOutputBytes?: number): Promise<Uint8Array | null> {
   let mod: typeof import("./compression-worker")
   try {
-    mod = require("./compression-worker") as typeof import("./compression-worker")
+    mod = nodeRequire("./compression-worker") as typeof import("./compression-worker")
   } catch {
     return null
   }

@@ -1,6 +1,9 @@
 import "reflect-metadata"
+import { createRequire } from "node:module"
 import { MessagingError } from "./errors"
 import { ErrorCode } from "./error-code"
+
+const nodeRequire = createRequire(__filename)
 
 export const SCHEMA_METADATA_KEY = "nevo:schema"
 
@@ -19,12 +22,12 @@ export function toValidator(schema: unknown): SchemaValidator | null {
   const s = schema as SchemaLike
 
   if (typeof s.parse === "function") {
-    return { parse: (input) => (s.parse as Function).call(s, input) }
+    return { parse: (input) => (s.parse as (...args: unknown[]) => unknown).call(s, input) }
   }
   if (typeof s.safeParse === "function") {
     return {
       parse: (input) => {
-        const result = (s.safeParse as Function).call(s, input)
+        const result = (s.safeParse as (...args: unknown[]) => any).call(s, input)
         if (!result.success) {
           throw new MessagingError(ErrorCode.VALIDATION_FAILED, {
             message: "Schema validation failed",
@@ -36,7 +39,7 @@ export function toValidator(schema: unknown): SchemaValidator | null {
     }
   }
   if (typeof s.validate === "function") {
-    return { parse: (input) => (s.validate as Function).call(s, input) }
+    return { parse: (input) => (s.validate as (...args: unknown[]) => unknown).call(s, input) }
   }
   if (typeof schema === "function") {
     const Ctor = schema as new () => unknown
@@ -47,8 +50,8 @@ export function toValidator(schema: unknown): SchemaValidator | null {
 
 function classValidatorAdapter(Ctor: new () => unknown): SchemaValidator | null {
   try {
-    const { validateSync } = require("class-validator")
-    const { plainToInstance } = require("class-transformer")
+    const { validateSync } = nodeRequire("class-validator")
+    const { plainToInstance } = nodeRequire("class-transformer")
     return {
       parse: (input) => {
         const instance = plainToInstance(Ctor, input)

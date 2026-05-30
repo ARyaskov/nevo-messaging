@@ -78,7 +78,7 @@ export function mapServiceMethods<T>(
       if (typeof mapping === "string") {
         methodPrefix = mapping
       } else {
-        ;[methodPrefix, options] = mapping
+        [methodPrefix, options] = mapping
       }
 
       const matchingMethod = serviceMethods.find((m) => m.toLowerCase().startsWith(methodPrefix.toLowerCase()))

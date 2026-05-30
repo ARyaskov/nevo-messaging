@@ -272,7 +272,7 @@ export class MemoryTransport {
     sub: RegisteredSubscriber,
     params: unknown,
     meta: MessageMeta,
-    uuid: string
+    _uuid: string
   ): Promise<void> {
     const ctx: SubscriptionContext = {
       meta: { ...meta, type: "sub" } as MessageMeta,

@@ -280,7 +280,7 @@ export abstract class BaseMessageController {
     const nowMs = Date.now()
     const startMs = nowMs
     const { method, uuid, params, meta } = this.extractMessageData(data)
-    let success = true
+    const success = true
 
     // Establish a chain context for the duration of this handler so any
     // outbound calls picks up the same chain id via AsyncLocalStorage.

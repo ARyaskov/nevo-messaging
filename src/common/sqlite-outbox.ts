@@ -1,5 +1,8 @@
+import { createRequire } from "node:module"
 import type { OutboxRecord, OutboxStore, OutboxMarkResult } from "./outbox"
 import { stringifyWithBigInt, parseWithBigInt } from "./bigint.utils"
+
+const nodeRequire = createRequire(__filename)
 
 type SqliteModule = typeof import("node:sqlite")
 
@@ -8,7 +11,7 @@ let sqliteCache: SqliteModule | null = null
 function getSqlite(): SqliteModule {
   if (sqliteCache) return sqliteCache
   try {
-    sqliteCache = require("node:sqlite") as SqliteModule
+    sqliteCache = nodeRequire("node:sqlite") as SqliteModule
     return sqliteCache
   } catch (err: any) {
     throw new Error(`node:sqlite is unavailable: ${err?.message ?? err}. Requires Node 23+ with --experimental-sqlite, or Node 24+ where it is stable.`)

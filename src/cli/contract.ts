@@ -2,9 +2,12 @@
 import { promises as fs } from "node:fs"
 import * as path from "node:path"
 import { randomUUID } from "node:crypto"
+import { createRequire } from "node:module"
 import { generateContractModule } from "./generate"
 import { NEVO_CONTRACT_METHOD } from "../common/contract"
 import type { ServiceContract } from "../common/contract"
+
+const nodeRequire = createRequire(__filename)
 
 interface CliOptions {
   transport: "http" | "nats"
@@ -111,7 +114,7 @@ async function fetchContractNats(opts: CliOptions): Promise<ServiceContract> {
   let connect: any
   try {
     // nats.js v3 split the legacy `nats` package: `connect` lives in transport-node.
-    connect = require("@nats-io/transport-node").connect
+    connect = nodeRequire("@nats-io/transport-node").connect
   } catch {
     throw new Error("Missing optional dependency '@nats-io/transport-node'. Install with: npm i @nats-io/transport-node")
   }

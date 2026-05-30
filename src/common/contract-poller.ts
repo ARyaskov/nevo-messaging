@@ -1,4 +1,3 @@
-import { setTimeout as sleep } from "node:timers/promises"
 import { NEVO_CONTRACT_METHOD, ServiceContract, SchemaDescriptor } from "./contract"
 
 export const NEVO_CONTRACT_CHANGED_METHOD = "nevo.contract.changed"
