@@ -1,5 +1,8 @@
 import { randomBytes } from "node:crypto"
+import { createRequire } from "node:module"
 import type { MessageMeta, TracingOptions } from "./types"
+
+const nodeRequire = createRequire(__filename)
 
 export interface SpanLike {
   end(): void
@@ -47,7 +50,7 @@ function makeTraceparent(): string {
 
 function tryOtel(opts: TracingOptions): NevoTracer | null {
   try {
-    const api = require("@opentelemetry/api")
+    const api = nodeRequire("@opentelemetry/api")
     const tracer = api.trace.getTracer(opts.serviceName || "nevo")
     return {
       startSpan(name, attributes) {

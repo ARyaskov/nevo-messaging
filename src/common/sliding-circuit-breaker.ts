@@ -1,9 +1,12 @@
+import { createRequire } from "node:module"
 import { CircuitOpenError, MessagingError } from "./errors"
 import { ErrorCode } from "./error-code"
 import type { CircuitBreakerOptions } from "./types"
 import type { CircuitState } from "./circuit-breaker"
 import { getDevToolsBus, DevToolsBus } from "./devtools"
 import type { DevToolsRegistry } from "./devtools-registry"
+
+const nodeRequire = createRequire(__filename)
 
 export interface SlidingCircuitOptions extends CircuitBreakerOptions {
   windowMs?: number
@@ -49,7 +52,7 @@ export class SlidingCircuitBreakerRegistry {
     if (deps?.registry) {
       this.registry = deps.registry
     } else {
-      const { getDevToolsRegistry } = require("./devtools-registry") as typeof import("./devtools-registry")
+      const { getDevToolsRegistry } = nodeRequire("./devtools-registry") as typeof import("./devtools-registry")
       this.registry = getDevToolsRegistry()
     }
   }

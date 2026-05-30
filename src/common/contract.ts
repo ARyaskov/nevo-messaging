@@ -67,7 +67,7 @@ export function describeSchema(schema: unknown): SchemaDescriptor | null {
     }
   }
   if (typeof schema === "function") {
-    return { kind: "class-validator", className: (schema as Function).name }
+    return { kind: "class-validator", className: (schema as { name: string }).name }
   }
   return { kind: "unknown" }
 }

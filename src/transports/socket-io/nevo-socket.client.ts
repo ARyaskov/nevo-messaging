@@ -4,7 +4,6 @@ import { uuidv7 } from "../../common/uuid"
 import {
   DEFAULT_BROADCAST_TOPIC,
   DEFAULT_DISCOVERY_TOPIC,
-  DEFAULT_SUBSCRIPTION_SUFFIX,
   DiscoveryRegistry,
   DiscoveryAnnouncement,
   MessageMeta,

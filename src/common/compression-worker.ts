@@ -1,7 +1,6 @@
 import { Worker } from "node:worker_threads"
-import * as path from "node:path"
 import * as os from "node:os"
-import { getDefaultLogger, NevoLogger } from "./logger"
+import { NevoLogger } from "./logger"
 
 const WORKER_INLINE_SOURCE = `
 const { parentPort } = require("node:worker_threads")
@@ -84,12 +83,10 @@ export interface CompressionWorkerOptions {
   logger?: NevoLogger
 }
 
-let logger: NevoLogger | null = null
 let cfg: CompressionWorkerOptions = {}
 
 export function configureCompressionWorker(opts: CompressionWorkerOptions): void {
   cfg = opts
-  logger = opts.logger ?? getDefaultLogger().child({ component: "compression-worker" })
   if (opts.enabled) getPool(opts.poolSize ?? Math.max(1, Math.min(4, os.cpus().length - 1)))
 }
 

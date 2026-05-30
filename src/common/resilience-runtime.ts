@@ -190,8 +190,14 @@ async function runCircuitHedge<T>(
     if (tuner) {
       try { tuner.observe(duration, ok) } catch {}
     }
-    if (slidingReg) ok ? slidingReg.onSuccess(circuitKey) : slidingReg.onFailure(circuitKey, err)
-    if (countReg) ok ? countReg.onSuccess(circuitKey) : countReg.onFailure(circuitKey, err)
+    if (slidingReg) {
+      if (ok) slidingReg.onSuccess(circuitKey)
+      else slidingReg.onFailure(circuitKey, err)
+    }
+    if (countReg) {
+      if (ok) countReg.onSuccess(circuitKey)
+      else countReg.onFailure(circuitKey, err)
+    }
   }
 
   // A single logical attempt: hedge (N racing copies, first wins) when

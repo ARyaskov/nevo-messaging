@@ -1,5 +1,8 @@
+import { createRequire } from "node:module"
 import { isProduction } from "./env"
 import { pinoRedactPaths } from "./redact"
+
+const nodeRequire = createRequire(__filename)
 
 export type NevoLogLevel = "trace" | "debug" | "info" | "warn" | "error" | "fatal"
 
@@ -69,7 +72,7 @@ class ConsoleLogger implements NevoLogger {
 
 function tryPino(opts: NevoLoggerOptions): NevoLogger | null {
   try {
-    const pino = require("pino")
+    const pino = nodeRequire("pino")
     const pinoLogger = pino({
       name: opts.name,
       level: opts.level || (isProduction() ? "info" : "debug"),

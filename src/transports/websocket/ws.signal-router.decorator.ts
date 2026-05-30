@@ -70,7 +70,7 @@ export function WsSignalRouter(serviceType: Type<any> | Type<any>[], options?: W
             }
 
             if (envelope?.method === "__subscribe") {
-              ;(socket as any).__subscriptions ??= new Set()
+              (socket as any).__subscriptions ??= new Set()
               const key = `${envelope.params?.serviceName?.toLowerCase?.()}:${envelope.params?.method}`
               ;(socket as any).__subscriptions.add(key)
               return

@@ -147,10 +147,9 @@ export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?:
         this.natsConnection = nc
         this.__natsRouterOwnsConnection = ownsConnection
 
-        const ctx = this
         const subscribeAndPump = async () => {
           const sub: Subscription = nc!.subscribe(eventPattern)
-          ctx.natsSubscription = sub
+          this.natsSubscription = sub
           for await (const msg of sub) {
             try {
               const encoding = msg.headers?.get?.("content-encoding")
@@ -159,7 +158,7 @@ export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?:
                 : maybeDecompress(msg.data, encoding, maxPayloadBytes)
               enforcePayloadLimit(raw, maxPayloadBytes)
               const payload = codec.decode(raw)
-              const result = await ctx[handlerName](payload)
+              const result = await this[handlerName](payload)
               if (msg.reply && result) {
                 let outData: Uint8Array
                 let outEncoding: string
@@ -182,7 +181,7 @@ export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?:
                   outData = out.data
                   outEncoding = out.encoding
                 }
-                const replyHeaders = ctx.__buildReplyHeaders ? ctx.__buildReplyHeaders(outEncoding) : undefined
+                const replyHeaders = this.__buildReplyHeaders ? this.__buildReplyHeaders(outEncoding) : undefined
                 nc!.publish(msg.reply, outData, replyHeaders ? { headers: replyHeaders } : undefined)
               }
             } catch (err) {

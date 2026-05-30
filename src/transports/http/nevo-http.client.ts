@@ -1,12 +1,12 @@
 import * as http from "node:http"
 import * as https from "node:https"
 import { randomUUID } from "node:crypto"
+import { createRequire } from "node:module"
 import { uuidv7 } from "../../common/uuid"
 import {
   DEFAULT_BROADCAST_TOPIC,
   DEFAULT_DISCOVERY_TOPIC,
   DEFAULT_EVENTS_SUFFIX,
-  DEFAULT_SUBSCRIPTION_SUFFIX,
   DiscoveryRegistry,
   DiscoveryAnnouncement,
   MessageMeta,
@@ -55,6 +55,8 @@ import {
   normalizeServiceName,
   resolveOutboundChainId
 } from "../../common"
+
+const nodeRequire = createRequire(__filename)
 
 export interface NevoHttpClientOptions extends TransportClientOptions {
   timeoutMs?: number
@@ -150,7 +152,7 @@ export class NevoHttpClient {
 
     if (options?.cacheableDns) {
       try {
-        const cl = require("cacheable-lookup")
+        const cl = nodeRequire("cacheable-lookup")
         const Lookup = cl.default ?? cl
         const lookup = new Lookup(typeof options.cacheableDns === "object" ? options.cacheableDns : {})
         lookup.install(this.httpAgent)
@@ -421,7 +423,7 @@ export class NevoHttpClient {
     let buffer = ""
 
     const readLoop = async () => {
-      while (true) {
+      for (;;) {
         const { value, done } = await reader.read()
         if (done) break
         buffer += decoder.decode(value)
@@ -472,7 +474,7 @@ export class NevoHttpClient {
         const decoder = new TextDecoder()
         let buffer = ""
         ;(async () => {
-          while (true) {
+          for (;;) {
             const { value, done } = await reader.read()
             if (done) break
             buffer += decoder.decode(value)
