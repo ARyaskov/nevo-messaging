@@ -92,7 +92,7 @@ export function KafkaSignalRouter(serviceType: Type<any> | Type<any>[], options?
           const encoding = data?.headers?.["content-encoding"]?.toString?.()
           if (shouldDecompressAsync(buf.byteLength, encoding)) {
             try {
-              ;(data as any)[PREDECOMPRESSED] = await maybeDecompressAsync(buf, encoding, maxPayloadBytes)
+              (data as any)[PREDECOMPRESSED] = await maybeDecompressAsync(buf, encoding, maxPayloadBytes)
             } catch {
               // Fall back to the extractor's sync decode path.
             }

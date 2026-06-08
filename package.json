@@ -19,7 +19,7 @@
   "engines": {
     "node": ">=24"
   },
-  "packageManager": "pnpm@11.0.0",
+  "packageManager": "pnpm@11.5.2",
   "scripts": {
     "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "pnpm run clean && tsc && node -e \"try { require('fs').chmodSync('dist/cli/contract.js', 0o755); require('fs').chmodSync('dist/cli/gen-service.js', 0o755) } catch {}\"",
