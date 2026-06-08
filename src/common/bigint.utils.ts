@@ -30,12 +30,6 @@ export function makeBigIntReviver(opts?: { acceptLegacy?: boolean }): (key: stri
 const defaultReviver = makeBigIntReviver()
 const legacyReviver = makeBigIntReviver({ acceptLegacy: true })
 
-/**
- * Maximum nesting depth walked by serializeBigInt/deserializeBigInt. Without a
- * cap, a deeply-nested (or maliciously crafted) payload could blow the call
- * stack; with a WeakSet seen-guard, cyclic input is also caught. Real-world
- * messaging payloads are nowhere near this deep.
- */
 const MAX_BIGINT_DEPTH = 512
 
 function serializeBigIntInner(obj: any, depth: number, seen: WeakSet<object>): any {

@@ -182,7 +182,6 @@ export class NevoHttpClient {
       idempotencyKey: opts?.idempotencyKey,
       tenantId: opts?.tenantId,
       headers: opts?.headers,
-      // Stamp chain id from ALS (or mint a new one at the entry of a chain).
       nevoChainId: resolveOutboundChainId()
     }
     return this.tracer.inject(baseMeta)
@@ -281,9 +280,7 @@ export class NevoHttpClient {
         resolve({ status: res.statusCode ?? 0, body: respBuf, headers: respHeaders })
       })
     })
-    // req.setTimeout is a socket-inactivity timeout: it resets on every byte, so a
-    // slowly-trickling response could exceed the requested timeout indefinitely. Pair
-    // it with an explicit wall-clock deadline that destroys the request regardless.
+    // Wall-clock deadline alongside the socket-inactivity timeout below.
     const deadline = setTimeout(() => { req.destroy(new Error("timeout")) }, timeoutMs ?? this.timeoutMs)
     req.setTimeout(timeoutMs ?? this.timeoutMs, () => {
       req.destroy(new Error("timeout"))
@@ -332,8 +329,7 @@ export class NevoHttpClient {
             try {
               payload = decompressed.byteLength === 0 ? undefined : this.codec.decode(decompressed)
             } catch (decodeErr) {
-              // A non-nevo error response (proxy/gateway HTML, plain text) may not decode.
-              // Surface the HTTP status rather than a misleading parse error.
+              // Non-nevo error body may not decode; prefer the HTTP status.
               if (res.status >= 400) throw httpStatusToError(res.status, serviceName)
               throw decodeErr
             }
@@ -341,8 +337,7 @@ export class NevoHttpClient {
               const err = payload.params.error
               throw new MessagingError(err.code, err.details ?? { message: err.message }, err.service || serviceName)
             }
-            // A server error status whose body is not a nevo error envelope must not be
-            // returned as a successful empty result (which would also tell the breaker onSuccess).
+            // Non-envelope error status must not count as success.
             if (res.status >= 400) throw httpStatusToError(res.status, serviceName)
             this.circuitBreaker.onSuccess(cbKey)
             span.setStatus({ code: 1 })
@@ -536,8 +531,7 @@ function tryMsgpackOrJson(): Codec {
   }
 }
 
-// Maps an HTTP error status (>= 400) to a MessagingError. Only gateway/availability
-// statuses (502/503/504) are marked retryable; everything else (incl. 500) is terminal.
+// Maps an HTTP error status (>= 400) to a MessagingError; only 502/503/504 are retryable.
 function httpStatusToError(status: number, serviceName: string): MessagingError {
   switch (status) {
     case 413:

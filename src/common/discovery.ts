@@ -57,11 +57,7 @@ export class DiscoveryRegistry {
     return this.services.values().some((e) => e.serviceName === serviceName && now - e.lastSeen <= ttlMs)
   }
 
-  /**
-   * Remove a single instance by `serviceName + instanceId`. Used by external
-   * discovery providers (Consul, Kubernetes DNS, …) to evict entries the
-   * upstream source no longer reports.
-   */
+  /** Remove a single instance by `serviceName + instanceId`. */
   removeInstance(serviceName: string, instanceId: string): boolean {
     return this.services.delete(`${serviceName}::${instanceId}`)
   }

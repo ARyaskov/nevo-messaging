@@ -1,8 +1,17 @@
 import { Type } from "@nestjs/common"
 import { MessagePattern } from "@nestjs/microservices"
 import { createSignalRouterDecorator, SignalRouterOptions } from "../../signal-router.utils"
-import { Codec, getCodec, getDefaultCodec, maybeCompress, maybeDecompress, enforcePayloadLimit, DEFAULT_MAX_PAYLOAD_BYTES, resolveCompressionOptions, getDefaultLogger, DlqRouter } from "../../common"
+import { Codec, getCodec, getDefaultCodec, maybeCompress, maybeDecompress, maybeDecompressAsync, shouldDecompressAsync, enforcePayloadLimit, DEFAULT_MAX_PAYLOAD_BYTES, resolveCompressionOptions, getDefaultLogger, DlqRouter } from "../../common"
 import { getKafkaModule } from "../optional-deps"
+
+// Buffer the async wrapper pre-inflated, for the sync extractor to reuse.
+const PREDECOMPRESSED = Symbol("nevo.kafka.predecompressed")
+
+// Normalises a Kafka message value to a Buffer; null when there is no decodable value.
+function kafkaValueBuffer(data: any): Buffer | null {
+  if (!(data && data.value && (typeof data.value === "string" || data.value instanceof Buffer || data.value instanceof Uint8Array))) return null
+  return data.value instanceof Buffer ? data.value : typeof data.value === "string" ? Buffer.from(data.value, "utf8") : Buffer.from(data.value)
+}
 
 const DEFAULT_KAFKA_HOST = process.env["KAFKA_HOST"] || "localhost"
 const DEFAULT_KAFKA_PORT = process.env["KAFKA_PORT"] || "9092"
@@ -27,11 +36,13 @@ export function KafkaSignalRouter(serviceType: Type<any> | Type<any>[], options?
     { ...options, dlq, logger },
     (data) => {
       let messageData = data
-      if (data && data.value && (typeof data.value === "string" || data.value instanceof Buffer || data.value instanceof Uint8Array)) {
+      const buf = kafkaValueBuffer(data)
+      if (buf) {
         try {
-          const buf = data.value instanceof Buffer ? data.value : typeof data.value === "string" ? Buffer.from(data.value, "utf8") : Buffer.from(data.value)
           const encoding = data?.headers?.["content-encoding"]?.toString?.()
-          const decompressed = maybeDecompress(buf, encoding, maxPayloadBytes)
+          // Reuse the pre-inflated buffer when present; otherwise inflate synchronously.
+          const predecompressed = (data as any)[PREDECOMPRESSED] as Uint8Array | undefined
+          const decompressed = predecompressed ?? maybeDecompress(buf, encoding, maxPayloadBytes)
           enforcePayloadLimit(decompressed, maxPayloadBytes)
           messageData = codec.decode(decompressed)
         } catch (e) {
@@ -75,6 +86,19 @@ export function KafkaSignalRouter(serviceType: Type<any> | Type<any>[], options?
       }
 
       target.prototype[handlerName] = async function (data: any) {
+        // Inflate large compressed payloads off the event loop before the sync extractor runs.
+        const buf = kafkaValueBuffer(data)
+        if (buf) {
+          const encoding = data?.headers?.["content-encoding"]?.toString?.()
+          if (shouldDecompressAsync(buf.byteLength, encoding)) {
+            try {
+              ;(data as any)[PREDECOMPRESSED] = await maybeDecompressAsync(buf, encoding, maxPayloadBytes)
+            } catch {
+              // Fall back to the extractor's sync decode path.
+            }
+          }
+        }
+
         const result = await originalMethod.call(this, data)
 
         if (result && this.producer) {

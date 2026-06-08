@@ -10,23 +10,13 @@ export interface OutboxRecord {
   attempts: number
   status: "pending" | "published" | "failed"
   lastError?: string
-  /**
-   * Optional ordering key. Records that share a partitionKey are relayed
-   * strictly in `createdAt` order, and a partition halts at its first failure,
-   * so a later event can never overtake an earlier one of the same aggregate on
-   * retry. Records without a partitionKey are independent and relayed together.
-   */
+  /** Optional ordering key; records sharing one are relayed in `createdAt` order and halt at the first failure. */
   partitionKey?: string
 }
 
 /** Outcome of finalizing a claimed record via `markPublished` / `markFailed`. */
 export interface OutboxMarkResult {
-  /**
-   * True if this worker still owned the record and the update applied. False
-   * means the claim was stolen (the claim TTL expired and another worker
-   * re-claimed) or the row was already finalized — the caller MUST NOT treat
-   * the record as handled.
-   */
+  /** True if this worker still owned the record and the update applied; false if the claim was stolen or already finalized. */
   owned: boolean
   /** The record's status after the update. Only meaningful when `owned`. */
   status: OutboxRecord["status"]
@@ -35,36 +25,16 @@ export interface OutboxMarkResult {
 }
 
 export interface OutboxStore {
-  /**
-   * Persist a pending record.
-   *
-   * Pass `tx` — a caller-owned transaction/connection handle — to write the
-   * outbox row in the SAME transaction as the business state change. That is
-   * the entire point of the pattern; see {@link withOutboxTransaction}.
-   *
-   * Calling `save` (or {@link Outbox.enqueue}) WITHOUT `tx`, on the store's own
-   * connection, is UNSAFE: a crash between the business COMMIT and this write
-   * loses the event, and writing in the reverse order publishes a phantom event
-   * for a business change that never committed.
-   */
+  /** Persist a pending record. Pass `tx` to write it in the same transaction as the business change; see {@link withOutboxTransaction}. */
   save(record: OutboxRecord, tx?: unknown): Promise<void>
   /** Mark a claimed record published. Returns `owned: false` if the claim was stolen. */
   markPublished(id: string): Promise<OutboxMarkResult>
-  /**
-   * Record a failed attempt. Increments `attempts` and parks the record as
-   * `failed` once `attempts >= maxAttempts`, otherwise leaves it `pending` for
-   * another try. The resulting status is read back from the store rather than
-   * recomputed by the caller. Returns `owned: false` if the claim was stolen.
-   */
+  /** Record a failed attempt; parks as `failed` once `attempts >= maxAttempts`, else leaves `pending`. Returns `owned: false` if the claim was stolen. */
   markFailed(id: string, error: string, maxAttempts: number): Promise<OutboxMarkResult>
   listPending(limit: number): Promise<OutboxRecord[]>
 }
 
-/**
- * Staging buffer used by {@link withOutboxTransaction} for the in-memory store.
- * Records are held until `commit()`; `rollback()` discards them, so an outbox
- * row never survives a rolled-back business transaction.
- */
+/** Staging buffer used by {@link withOutboxTransaction} for the in-memory store; records are held until `commit()`. */
 export class InMemoryOutboxTx {
   readonly staged: OutboxRecord[] = []
   constructor(private readonly onCommit: (records: OutboxRecord[]) => void) {}
@@ -127,32 +97,20 @@ export interface OutboxBatchResult {
 
 export interface OutboxPublisher {
   emit(serviceName: string, method: string, params: unknown): Promise<void>
-  /**
-   * Optional batch fast path. Return a per-item {@link OutboxBatchResult} array
-   * (aligned to `items`) to report PARTIAL success — items the broker accepted
-   * are marked published and never re-sent. Returning `void` keeps the legacy
-   * all-or-nothing contract: resolving means every item was accepted, throwing
-   * means none were.
-   */
+  /** Optional batch fast path. Return a per-item result array for partial success, or `void` for all-or-nothing. */
   emitBatch?(items: OutboxEmitItem[]): Promise<OutboxBatchResult[] | void>
 }
 
 export class Outbox {
   private timer?: NodeJS.Timeout
+  private stopped = false
   constructor(
     private readonly store: OutboxStore,
     private readonly publisher: OutboxPublisher,
     private readonly opts: { batch?: number; intervalMs?: number; maxAttempts?: number } = {}
   ) {}
 
-  /**
-   * Append an event to the outbox.
-   *
-   * Pass `opts.tx` to enlist the write in your business transaction — the only
-   * safe way to use the outbox. Without it the write lands on the store's own
-   * connection, decoupled from the business commit, and a crash on either side
-   * of the gap loses or fabricates an event. See {@link withOutboxTransaction}.
-   */
+  /** Append an event to the outbox. Pass `opts.tx` to enlist the write in your business transaction; see {@link withOutboxTransaction}. */
   async enqueue(
     serviceName: string,
     method: string,
@@ -183,16 +141,12 @@ export class Outbox {
     let published = 0
     let failed = 0
 
-    // Independent records carry no ordering constraint: relay them as one batch
-    // and let each succeed or fail on its own.
     if (independent.length > 0) {
       const r = await this.relayIndependent(independent, maxAttempts)
       published += r.published
       failed += r.failed
     }
 
-    // Each ordered partition is relayed in createdAt order and HALTS at its
-    // first failure, so a later event never overtakes an earlier one on retry.
     for (const part of ordered) {
       const r = await this.relayOrdered(part, maxAttempts)
       published += r.published
@@ -242,19 +196,13 @@ export class Outbox {
       } catch (err: any) {
         const mark = await this.store.markFailed(rec.id, err?.message ?? String(err), maxAttempts)
         if (mark.owned && mark.status === "failed") failed++
-        // Halt the partition: relaying later records now would let them overtake
-        // this one, which must be retried (and delivered) first.
+        // Halt the partition so later records can't overtake this one on retry.
         break
       }
     }
     return { published, failed }
   }
 
-  /**
-   * Invoke the publisher's batch path and normalise the result into a per-item
-   * array, or `null` when the publisher uses the legacy all-or-nothing contract
-   * (resolved void = every item accepted; threw = none accepted).
-   */
   private async callEmitBatch(records: OutboxRecord[]): Promise<OutboxBatchResult[] | null> {
     const items: OutboxEmitItem[] = records.map((r) => ({
       serviceName: r.serviceName,
@@ -272,12 +220,32 @@ export class Outbox {
   }
 
   start(): void {
+    this.stopped = false
     const intervalMs = this.opts.intervalMs ?? 1000
-    this.timer = setInterval(() => { void this.flushOnce() }, intervalMs)
+    // Self-scheduling loop so a flush that outlasts the interval can't overlap the next.
+    const loop = async () => {
+      if (this.stopped) return
+      const startedAt = performance.now()
+      try {
+        await this.flushOnce()
+      } catch {
+        // swallow: a failed flush must not stop the loop
+      }
+      if (this.stopped) return
+      const elapsed = performance.now() - startedAt
+      const delay = Math.max(0, intervalMs - elapsed)
+      this.timer = setTimeout(loop, delay)
+      if (typeof this.timer.unref === "function") this.timer.unref()
+    }
+    this.timer = setTimeout(loop, intervalMs)
     if (typeof this.timer.unref === "function") this.timer.unref()
   }
 
-  stop(): void { if (this.timer) clearInterval(this.timer) }
+  stop(): void {
+    this.stopped = true
+    if (this.timer) clearTimeout(this.timer)
+    this.timer = undefined
+  }
 }
 
 /** Split a pending batch into ordered partitions (keyed) and independent records. */
@@ -296,26 +264,7 @@ function partitionRecords(records: OutboxRecord[]): { ordered: OutboxRecord[][];
   return { ordered: [...byKey.values()], independent }
 }
 
-/**
- * Run `fn` inside a single transaction so the outbox row and the business state
- * commit or roll back together — the core guarantee of the pattern:
- *
- * ```ts
- * await withOutboxTransaction(client, async (tx) => {
- *   await tx.query("INSERT INTO orders (...) VALUES (...)")  // business state
- *   await store.save(outboxRecord, tx)                       // outbox row, same tx
- * })
- * // both committed — or, if anything throws, both rolled back
- * ```
- *
- * `client` may be:
- *  - a SQL connection exposing `query(sql)` (e.g. a pooled Postgres client),
- *  - a `node:sqlite` `DatabaseSync` exposing `exec(sql)`, or
- *  - an {@link InMemoryOutboxStore} (via its `beginTx()`), for tests.
- *
- * The same handle is passed to `fn` as `tx`; forward it to
- * {@link OutboxStore.save}. NEVER enqueue outside such a transaction.
- */
+/** Run `fn` inside a single transaction so the outbox row and business state commit or roll back together. `client` may expose `query(sql)`, `exec(sql)`, or `beginTx()`. */
 export async function withOutboxTransaction<T>(
   client: unknown,
   fn: (tx: unknown) => Promise<T> | T

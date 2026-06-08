@@ -46,17 +46,9 @@ export interface SignalRouterOptions {
   serviceName?: string
   accessControl?: AccessControlConfig
   idempotency?: IdempotencyOptions
-  /**
-   * Optional distributed idempotency backend (Redis, …). On a miss the live
-   * handler claims the key (claim-before-execute) and writes the result through
-   * on success; concurrent duplicates across replicas await the winner's result
-   * instead of re-running. See `idempotency-store.ts`.
-   */
+  /** Optional distributed idempotency backend (Redis, …). */
   idempotencyStore?: IdempotencyStore<MessageResponse>
-  /**
-   * Optional append-only audit log. When set, one redacted entry is recorded per
-   * request (success or failure). See `audit-log.ts`.
-   */
+  /** Optional append-only audit log. */
   auditLog?: AuditLog
   security?: SecurityOptions
   metrics?: MetricsOptions
@@ -112,6 +104,29 @@ export function createErrorResponse(message: string, uuid?: string, method?: str
     },
     meta
   }
+}
+
+const DEFAULT_CACHE_KEY_MAX_CHARS = 1024
+
+// Non-cryptographic 64-bit FNV-1a digest (two 32-bit lanes); not for security.
+function fnv1a64Hex(s: string): string {
+  let h1 = 0x811c9dc5
+  let h2 = 0xcbf29ce4
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    h1 ^= c
+    h1 = (h1 + ((h1 << 1) + (h1 << 4) + (h1 << 7) + (h1 << 8) + (h1 << 24))) >>> 0
+    h2 ^= (c >>> 8) ^ (c & 0xff)
+    h2 = (h2 + ((h2 << 1) + (h2 << 4) + (h2 << 7) + (h2 << 8) + (h2 << 24))) >>> 0
+  }
+  return h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0")
+}
+
+// Builds the default cache key; large params collapse to a length+digest form.
+function buildDefaultCacheKey(name: string, processedParams: unknown): string {
+  const serialized = JSON.stringify(processedParams ?? {})
+  if (serialized.length <= DEFAULT_CACHE_KEY_MAX_CHARS) return `${name}::${serialized}`
+  return `${name}::#${serialized.length}:${fnv1a64Hex(serialized)}`
 }
 
 function deriveServiceName(target: any, options: SignalRouterOptions | undefined): string {
@@ -174,9 +189,7 @@ export function createSignalRouterDecorator(
     }
     contractDescriptors.sort((a, b) => a.signalName.localeCompare(b.signalName))
 
-    // Methods this service actually serves — used to bucket forged / unregistered
-    // method names (e.g. on METHOD_NOT_FOUND) to a single `<unknown>` metric label
-    // so attacker-chosen strings cannot mint unbounded time series.
+    // Known method names; unregistered/forged names bucket to `<unknown>` in metric labels.
     const knownMethodNames = new Set<string>(signalsByName.keys())
     knownMethodNames.add(NEVO_CONTRACT_METHOD)
     if (options.health) {
@@ -198,10 +211,7 @@ export function createSignalRouterDecorator(
     } catch {}
 
     target.prototype[handlerName] = async function (data: any) {
-      // Peek at the envelope just enough to seed the chain context — every
-      // outbound call made inside the handler will inherit this chain id via
-      // AsyncLocalStorage, which is what makes the DevTools /traces view
-      // possible.
+      // Peek at the envelope to seed the chain context for outbound calls.
       let peekedMeta: MessageMeta | undefined
       let peekedUuid: string | undefined
       try {
@@ -279,11 +289,7 @@ export function createSignalRouterDecorator(
           return createErrorResponse(err.message, uuid, method, ErrorCode.REPLAY_DETECTED, meta)
         }
 
-        // Idempotency (claim-before-execute): dedup on the wire-level idempotency
-        // key when the client stamped one, falling back to the envelope uuid (so
-        // timeout-retries — which carry a fresh uuid but the same idempotencyKey —
-        // collapse to one execution). A hit returns the stored response; otherwise
-        // we hold the claim until `finally` commits it (success) or releases it.
+        // Idempotency (claim-before-execute): dedup on idempotencyKey, else uuid.
         idemKey = meta?.idempotencyKey || uuid
         if (idemKey && idem.isEnabled()) {
           const began = await idem.begin(idemKey)
@@ -316,10 +322,7 @@ export function createSignalRouterDecorator(
           }
         }
 
-        // Tenant kill-switch — checked after rate-limit (a disabled tenant is
-        // still charged a token) and before dispatch. Throws UNAUTHORIZED, which
-        // the outer catch turns into a clean error response. Mirrors the order in
-        // BaseMessageController.
+        // Tenant kill-switch — checked after rate-limit, before dispatch.
         assertTenantAllowed(serviceNameFromMeta, meta?.tenantId)
 
         if (!isAccessAllowed(options.accessControl, topic, parsed.name, callerService)) {
@@ -416,7 +419,7 @@ export function createSignalRouterDecorator(
             methodCache = new LruCache<unknown>({ enabled: true, ttlMs: cacheable.ttlMs ?? 60_000, maxEntries: cacheable.maxEntries ?? 1024 })
             methodCaches.set(serviceMethod, methodCache)
           }
-          cacheKey = cacheable.keyBy ? cacheable.keyBy(processedParams) : `${parsed.name}::${JSON.stringify(processedParams ?? {})}`
+          cacheKey = cacheable.keyBy ? cacheable.keyBy(processedParams) : buildDefaultCacheKey(parsed.name, processedParams)
           if (methodCache.has(cacheKey)) {
             const cached = methodCache.get(cacheKey)
             return { uuid, method, params: { result: cached as any }, meta }
@@ -451,10 +454,7 @@ export function createSignalRouterDecorator(
           "nevo.caller": callerService ?? ""
         })
 
-        // Materialise any @Hedge/@CircuitBreaker/@Adaptive/@Backpressure on the
-        // target method. When present, the real handler invocation runs through
-        // the resilience runtime (keyed by `service:method`); otherwise it is a
-        // plain call — zero overhead on undecorated handlers.
+        // Resilience decorators (@Hedge/@CircuitBreaker/@Adaptive/@Backpressure), if any.
         const resilience = readMethodResilience(serviceInstance, serviceMethod)
 
         let result: unknown
@@ -467,9 +467,7 @@ export function createSignalRouterDecorator(
         } catch (err) {
           span?.recordException(err)
           span?.setStatus({ code: 2, message: (err as Error)?.message })
-          // A @Backpressure admission failure surfaces as RATE_LIMITED — that's
-          // intentional load-shedding, not a handler crash, so reply with a
-          // clean error response instead of throwing into the DLQ / error path.
+          // @Backpressure admission failure (RATE_LIMITED) is load-shedding, not a crash.
           if (err instanceof MessagingError && err.code === ErrorCode.RATE_LIMITED) {
             response = { uuid, method, params: { result: "error", error: err.toJSON() }, meta }
             return response
@@ -506,9 +504,7 @@ export function createSignalRouterDecorator(
           if (hookResponse !== undefined) response = hookResponse
         }
 
-        // Commit the idempotency result (L1 + AWAITED distributed write-through)
-        // so a peer replica observes it before we ack. Errors are not cached —
-        // the `finally` block releases the claim so a retry can re-execute.
+        // Commit the idempotency result (errors are not cached).
         if (idemKey && idemBegan && response.params.result !== "error") {
           await idem.commit(idemKey, response)
           idemCommitted = true
@@ -536,8 +532,6 @@ export function createSignalRouterDecorator(
         return finalResponse
       } finally {
         const durationMs = Date.now() - startMs
-        // Use the final response (the catch path sets `finalResponse`, not
-        // `response`) so handler errors are recorded as errors, not "ok".
         const success = (finalResponse ?? response)?.params?.result !== "error"
         const labels = {
           service: serviceNameFromMeta,
@@ -565,14 +559,12 @@ export function createSignalRouterDecorator(
           } catch {}
         }
 
-        // Release a still-held idempotency claim when no result was committed
-        // (handler error, policy denial, early return) so a retry can re-execute
-        // instead of polling a stranded sentinel until its TTL expires.
+        // Release a still-held claim when no result was committed.
         if (idemKey && idemBegan && !idemCommitted) {
           try { await idem.release(idemKey) } catch {}
         }
 
-        // Append-only audit — fire-and-forget, never block request completion.
+        // Append-only audit — fire-and-forget.
         if (auditLog?.isEnabled()) {
           const auditResponse = finalResponse ?? response
           if (auditResponse) {

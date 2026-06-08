@@ -34,18 +34,7 @@ export interface PreparedRequest {
   request: MessageRequest
 }
 
-/**
- * Shared client resilience pipeline — the single source of truth for the
- * ordering "circuit breaker wraps the **entire** retried operation (plus any
- * optional decorator resilience)". Recording exactly one breaker outcome per
- * logical call (instead of one per retry attempt) is what stops N retries from
- * tripping the breaker N× too early.
- *
- * Transport clients that do not (yet) extend {@link BaseMessagingClient} — e.g.
- * `NevoNatsClient` — call this directly, so there is exactly one implementation
- * of the ordering across the codebase rather than divergent per-transport
- * copies. See the note on {@link BaseMessagingClient}.
- */
+/** Shared client resilience pipeline: circuit breaker wraps the entire retried operation. */
 export async function runClientPipeline<T>(
   circuitBreaker: CircuitBreakerRegistry,
   retryOptions: ResolvedRetryOptions,
@@ -67,12 +56,7 @@ export async function runClientPipeline<T>(
   }
 }
 
-/**
- * Reference base for transport clients. Its constructor wires the shared
- * primitives (codec, circuit breaker, retry, metrics, idempotency, …) and
- * {@link withClientPipeline} is the canonical request path.
- *
- */
+/** Reference base for transport clients; wires shared primitives and the canonical request path. */
 export abstract class BaseMessagingClient {
   protected readonly options: TransportClientOptions
   protected readonly microservices: Map<string, string> = new Map()

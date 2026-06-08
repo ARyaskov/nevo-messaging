@@ -23,20 +23,15 @@ export interface JwksVerifierOptions {
   cacheTtlMs?: number
   clockSkewSec?: number
   fetchImpl?: typeof fetch
-  // Signature algorithms this verifier will accept. The token header's `alg` is
-  // attacker-controlled, so it is matched against this allow-list (and never
-  // against a symmetric/`none` algorithm) before any key is selected.
+  // Accepted signature algorithms (allow-list). Never includes `none`/HS*.
   allowedAlgorithms?: string[]
   // Reject tokens that carry no `exp` claim (default true).
   requireExp?: boolean
-  // Reject tokens with no `iss` claim. When `issuer` is set the value must also
-  // match it (that match is always enforced regardless of this flag).
+  // Reject tokens with no `iss` claim (when `issuer` is set its value is always enforced too).
   requireIss?: boolean
-  // Reject tokens with no usable `aud` claim. When `audience` is set the value
-  // must also match it (that match is always enforced regardless of this flag).
+  // Reject tokens with no usable `aud` claim (when `audience` is set its value is always enforced too).
   requireAud?: boolean
-  // On a `kid` miss, at most one JWKS refetch is triggered per this interval to
-  // pick up rotated keys without letting bogus `kid`s hammer the endpoint.
+  // On a `kid` miss, throttle JWKS refetches to at most one per this interval.
   refetchMinIntervalMs?: number
 }
 
@@ -67,6 +62,13 @@ interface AlgSpec {
 
 const DEFAULT_ALLOWED_ALGORITHMS = ["RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "PS256"]
 
+// Hard cap on encoded token size, enforced before any base64-decode/JSON.parse.
+const MAX_TOKEN_BYTES = 8192
+
+function isTokenOverCap(token: string): boolean {
+  return typeof token !== "string" || token.length > MAX_TOKEN_BYTES
+}
+
 function base64UrlToBuffer(s: string): Buffer {
   const padded = s.replaceAll("-", "+").replaceAll("_", "/")
   const pad = padded.padEnd(padded.length + ((4 - (padded.length % 4)) % 4), "=")
@@ -74,6 +76,7 @@ function base64UrlToBuffer(s: string): Buffer {
 }
 
 function decodeJwtHeader(token: string): JwtHeader | null {
+  if (isTokenOverCap(token)) return null
   const dot = token.indexOf(".")
   if (dot < 0) return null
   try {
@@ -83,6 +86,7 @@ function decodeJwtHeader(token: string): JwtHeader | null {
 }
 
 function decodeJwtPayloadRaw(token: string): { payload: VerifiedClaims | null; signedBytes: Buffer; signature: Buffer } | null {
+  if (isTokenOverCap(token)) return null
   const parts = token.split(".")
   if (parts.length !== 3) return null
   try {
@@ -97,9 +101,7 @@ function jwkToPublicKey(jwk: JwksKey): import("node:crypto").KeyObject {
   return createPublicKey({ key: jwk as any, format: "jwk" })
 }
 
-// Maps a JWS `alg` to the primitives needed to verify it. Returns null for any
-// algorithm this verifier does not implement (including `none` and the HS*
-// symmetric family), so an unknown/forged `alg` can never select a verifier.
+// Maps a JWS `alg` to verify primitives; returns null for unsupported algs (incl. `none`/HS*).
 function algToSpec(alg: string): AlgSpec | null {
   switch (alg) {
     case "RS256": return { hash: "sha256", family: "RSA", pss: false }
@@ -131,9 +133,7 @@ export function createJwksVerifier(opts: JwksVerifierOptions): (token: string) =
   let cached: { fetchedAt: number; keys: JwksKey[] } | null = null
   let lastRotationRefetchAt = 0
 
-  // A forged header can ask for `none` or an HS* (shared-secret) algorithm to
-  // sidestep public-key verification; reject those outright and require the
-  // remainder to be on the configured allow-list.
+  // Reject `none`/HS* outright; require the rest to be on the allow-list.
   function isAlgAllowed(alg: string): boolean {
     if (alg === "none") return false
     if (alg.startsWith("HS")) return false
@@ -153,18 +153,13 @@ export function createJwksVerifier(opts: JwksVerifierOptions): (token: string) =
     try {
       return await fetchJwks()
     } catch (err) {
-      // The fetch failed. Serve a stale-but-previously-valid key set if we have
-      // one rather than downgrading to an empty set (which the caller would read
-      // as "anonymous"). With nothing cached we cannot verify anything, so fail
-      // closed by propagating the error instead of returning null.
+      // On fetch failure, serve the stale cache if present; otherwise fail closed by rethrowing.
       if (cached) return cached.keys
       throw err
     }
   }
 
-  // Best-effort refetch to pick up a rotated key after a `kid` miss. Rate-limited
-  // so a stream of bogus `kid`s cannot turn into a stream of JWKS fetches, and
-  // never throws — the caller still fails the lookup if the key does not appear.
+  // Rate-limited, never-throwing refetch to pick up a rotated key after a `kid` miss.
   async function maybeRefetchForRotation(): Promise<JwksKey[]> {
     const now = Date.now()
     if (now - lastRotationRefetchAt < refetchMinIntervalMs) return cached?.keys ?? []
@@ -177,20 +172,18 @@ export function createJwksVerifier(opts: JwksVerifierOptions): (token: string) =
   }
 
   function findKey(keys: JwksKey[], kid?: string): JwksKey | undefined {
-    // A present `kid` must match exactly — never fall back to an arbitrary key,
-    // which would let an attacker pin verification to a key of their choosing.
+    // A present `kid` must match exactly (no fallback). Absent `kid`: only safe when the set is a singleton.
     if (kid) return keys.find((k) => k.kid === kid)
-    // No `kid` in the header: only safe when the set is unambiguous.
     return keys.length === 1 ? keys[0] : undefined
   }
 
   return async function verify(token: string): Promise<VerifiedClaims | null> {
+    if (isTokenOverCap(token)) return null
     const header = decodeJwtHeader(token)
     if (!header?.alg) return null
     // Reject critical extensions we do not understand (RFC 7515 §4.1.11).
     if (header.crit !== undefined) return null
-    // Pin the algorithm before touching the network or selecting a key, so a
-    // forged `alg` can neither drive JWKS fetches nor reach key selection.
+    // Pin the algorithm before any network/key selection so a forged `alg` cannot drive them.
     if (!isAlgAllowed(header.alg)) return null
     const spec = algToSpec(header.alg)
     if (!spec) return null
@@ -201,17 +194,13 @@ export function createJwksVerifier(opts: JwksVerifierOptions): (token: string) =
     const keys = await loadJwks()
     let jwk = findKey(keys, header.kid)
     if (!jwk && header.kid) {
-      // `kid` present but unknown — the key may have just rotated in. Try a
-      // single rate-limited refetch before deciding the token is unverifiable.
+      // `kid` unknown — may have just rotated in; try one rate-limited refetch.
       const refreshed = await maybeRefetchForRotation()
       jwk = findKey(refreshed, header.kid)
     }
     if (!jwk) return null
 
-    // Bind the selected JWK to the header `alg`: the key type must match the
-    // algorithm family, and a JWK that pins its own `alg` must agree. This blocks
-    // algorithm-confusion attacks that pair an RSA key with an EC alg (or vice
-    // versa) to coax a forged signature through verification.
+    // Bind JWK to header `alg` (key family + any pinned `alg`) to block algorithm-confusion attacks.
     if (!ktyMatchesFamily(jwk.kty, spec.family)) return null
     if (jwk.alg !== undefined && jwk.alg !== header.alg) return null
 
@@ -256,8 +245,7 @@ export function createJwksVerifier(opts: JwksVerifierOptions): (token: string) =
   }
 }
 
-// `aud` may be a string, an array, or — from a hostile token — contain non-string
-// junk; keep only string entries so comparisons never match on coerced values.
+// Normalise `aud` (string | array | junk) to a list of string entries only.
 function audToStringList(aud: unknown): string[] {
   const list = Array.isArray(aud) ? aud : aud !== undefined ? [aud] : []
   return list.filter((a): a is string => typeof a === "string")

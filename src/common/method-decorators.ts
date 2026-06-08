@@ -16,23 +16,38 @@ export interface CacheableConfig {
   keyBy?: (params: unknown) => string
 }
 
-function defineOnMethod(metaKey: string, target: any, propertyKey: string | symbol, value: unknown): void {
-  const ctor = target?.constructor ?? target
+function defineOnCtor(metaKey: string, ctor: any, propertyKey: string | symbol, value: unknown): void {
   const map = (Reflect.getMetadata(metaKey, ctor) as Map<string, unknown> | undefined) ?? new Map<string, unknown>()
   map.set(propertyKey as string, value)
   Reflect.defineMetadata(metaKey, map, ctor)
 }
 
-export function RateLimit(config: RateLimitConfig): MethodDecorator {
-  return (target, propertyKey) => {
-    defineOnMethod(NEVO_METHOD_RATE_LIMIT, target, propertyKey, config)
+// Detects the TC39 (stage-3) decorator context vs the legacy form.
+function isStandardDecoratorContext(maybeContext: any): maybeContext is { kind: string; name: string | symbol; addInitializer: (fn: () => void) => void } {
+  return !!maybeContext && typeof maybeContext === "object" && typeof maybeContext.addInitializer === "function" && "kind" in maybeContext
+}
+
+function applyMethodMetadata(metaKey: string, value: unknown, targetOrValue: any, ctxOrKey: any, descriptor: any): any {
+  if (isStandardDecoratorContext(ctxOrKey)) {
+    const propertyKey = ctxOrKey.name
+    ctxOrKey.addInitializer(function (this: any) {
+      defineOnCtor(metaKey, this.constructor, propertyKey, value)
+    })
+    return targetOrValue
   }
+  // Legacy: targetOrValue is the prototype, ctxOrKey is the property key.
+  defineOnCtor(metaKey, targetOrValue?.constructor ?? targetOrValue, ctxOrKey, value)
+  return descriptor
+}
+
+export function RateLimit(config: RateLimitConfig): MethodDecorator {
+  return ((targetOrValue: any, ctxOrKey: any, descriptor?: any) =>
+    applyMethodMetadata(NEVO_METHOD_RATE_LIMIT, config, targetOrValue, ctxOrKey, descriptor)) as MethodDecorator
 }
 
 export function Cacheable(config: CacheableConfig = {}): MethodDecorator {
-  return (target, propertyKey) => {
-    defineOnMethod(NEVO_METHOD_CACHEABLE, target, propertyKey, config)
-  }
+  return ((targetOrValue: any, ctxOrKey: any, descriptor?: any) =>
+    applyMethodMetadata(NEVO_METHOD_CACHEABLE, config, targetOrValue, ctxOrKey, descriptor)) as MethodDecorator
 }
 
 export function getMethodRateLimit(target: any, propertyKey: string): RateLimitConfig | undefined {

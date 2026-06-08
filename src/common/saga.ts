@@ -15,23 +15,9 @@ export interface SagaStepBackoff {
 
 export interface SagaStep<C = any> {
   name: string
-  /**
-   * Forward action. Receives an {@link AbortSignal} that fires when the step
-   * exceeds `timeoutMs`. IMPORTANT: a timeout only rejects the orchestrator's
-   * wait — it cannot stop work already in flight — so the step is retried while
-   * the original attempt may still be running. Steps MUST therefore be
-   * idempotent, and SHOULD honour `signal` (abort the underlying I/O, or at
-   * least track and ignore the late result) so a non-idempotent side effect
-   * (e.g. chargeUser) cannot execute twice.
-   */
+  /** Forward action; `signal` fires on `timeoutMs`. A timeout doesn't stop in-flight work, so steps MUST be idempotent and SHOULD honour `signal`. */
   execute: (ctx: C, signal: AbortSignal) => Promise<unknown> | unknown
-  /**
-   * Undo action, run in reverse order on failure. `error` is the failure that
-   * triggered compensation (may be undefined on a resumed saga). `signal` fires
-   * on `compensateTimeoutMs`; the same idempotency rules as {@link execute}
-   * apply. If a compensation exhausts its retries the saga is marked
-   * `compensation_failed` (never `compensated`) and routed to the DLQ.
-   */
+  /** Undo action, run in reverse order on failure; `signal` fires on `compensateTimeoutMs`. Exhausting retries marks the saga `compensation_failed` and routes it to the DLQ. */
   compensate?: (ctx: C, error: unknown, signal: AbortSignal) => Promise<void> | void
   retries?: number
   timeoutMs?: number
@@ -84,17 +70,11 @@ export class InMemorySagaStore implements SagaStore {
   async delete(id: string): Promise<void> { this.data.delete(id) }
 }
 
-// A never-aborting signal handed to steps with no timeout configured, so
-// `execute`/`compensate` always receive an AbortSignal and can be written
-// against a single, uniform contract.
+// Never-aborting signal handed to steps with no timeout, so they always receive an AbortSignal.
 const NEVER_ABORTED: AbortSignal = new AbortController().signal
 
 async function withTimeout<T>(fn: (signal: AbortSignal) => Promise<T>, timeoutMs?: number): Promise<T> {
   if (!timeoutMs || timeoutMs <= 0) return await fn(NEVER_ABORTED)
-  // AbortSignal.timeout fires after `timeoutMs`. We reject the outer promise so
-  // the orchestrator stops waiting AND hand the signal to `fn`, so a cooperative
-  // step can cancel its in-flight work instead of running to completion behind a
-  // retry (which would otherwise double a non-idempotent side effect).
   const signal = AbortSignal.timeout(timeoutMs)
   const { promise, resolve, reject } = Promise.withResolvers<T>()
   const onAbort = () => reject(new Error(`Saga step timeout after ${timeoutMs}ms`))
@@ -199,8 +179,7 @@ export class Saga<C = any> {
     return await this.forward(ctx, [])
   }
 
-  // Execute steps not yet in `alreadyExecuted`, in order. Shared by run() and
-  // resume() so the crash-recovery path gets the same compensation semantics.
+  // Execute steps not yet in `alreadyExecuted`, in order. Shared by run() and resume().
   private async forward(ctx: C, alreadyExecuted: string[]): Promise<SagaResult> {
     const sagaId = this.sagaId as string
     const executed = [...alreadyExecuted]
@@ -228,10 +207,7 @@ export class Saga<C = any> {
     await this.persist(ctx, executed, "compensating", err)
     const { compensated, failed } = await this.compensate(ctx, executed, err)
     if (failed.length > 0) {
-      // A compensation threw after exhausting retries — the saga is NOT clean.
-      // Persist a DISTINCT terminal status so it is excluded from listPending()
-      // (no blind auto-retry) and stays visible for manual intervention. The
-      // failure has already been routed to the DLQ / metric inside compensate().
+      // Distinct terminal status excludes it from listPending() and keeps it visible for manual intervention.
       await this.persist(ctx, executed, "compensation_failed", err)
       return { status: "failed", error: err, executed, compensated, compensationFailed: failed, sagaId }
     }
@@ -259,9 +235,6 @@ export class Saga<C = any> {
         )
         compensated.push(name)
       } catch (compErr) {
-        // Do NOT swallow: a compensation that exhausted its retries means a side
-        // effect (e.g. a reserved wallet) may not have been released. Record it,
-        // alert via DLQ + metric, and let fail() mark the saga compensation_failed.
         failed.push(name)
         await this.reportCompensationFailure(name, snapshot, lastErr, compErr, cAttempts)
       }
@@ -337,13 +310,7 @@ export class Saga<C = any> {
   }
 }
 
-/**
- * Registry of step definitions keyed by `(saga type, step name)`. Step
- * functions can't be serialized into a snapshot, so a process that recovers a
- * crashed saga needs them re-registered by name to rebuild the ordered step
- * list. Register every saga type your service runs at startup, then hand the
- * registry to {@link SagaRecovery}.
- */
+/** Registry of step definitions keyed by `(saga type, step name)`, used by {@link SagaRecovery} to rebuild a crashed saga's step list. */
 export class SagaStepRegistry<C = any> {
   private readonly steps = new Map<string, SagaStep<C>>()
 
@@ -369,11 +336,7 @@ export class SagaStepRegistry<C = any> {
     return this.steps.has(this.key(type, name))
   }
 
-  /**
-   * Resolve a snapshot's ordered step names into their registered definitions.
-   * Returns null if ANY name is unknown — a saga can't be safely resumed without
-   * every step's compensate handler, so the recovery worker skips it.
-   */
+  /** Resolve ordered step names into registered definitions; returns null if any name is unknown. */
   resolve(type: string, names: string[]): SagaStep<C>[] | null {
     const out: SagaStep<C>[] = []
     for (const name of names) {
@@ -401,18 +364,7 @@ export interface SagaRecoveryResult {
   failed: number
 }
 
-/**
- * Background worker that drives crash recovery: it periodically calls
- * `store.listPending()` and resumes every `pending` / `compensating` saga via
- * {@link Saga.resume}, looking step definitions up in a {@link SagaStepRegistry}.
- *
- * Without this, a process that dies mid-saga leaves its snapshot stuck forever.
- *
- * NOTE: `listPending()` does not lock rows, so running this in more than one
- * process can resume the same saga concurrently. That is safe ONLY because saga
- * steps are required to be idempotent (see {@link SagaStep.execute}); the late /
- * duplicate attempt must be a no-op.
- */
+/** Background worker that polls `store.listPending()` and resumes stuck sagas via {@link Saga.resume}. Running it in multiple processes is safe only because steps are idempotent. */
 export class SagaRecovery<C = any> {
   private readonly store: SagaStore
   private readonly registry: SagaStepRegistry<C>
@@ -437,19 +389,32 @@ export class SagaRecovery<C = any> {
 
   start(): void {
     this.stopped = false
-    this.timer = setInterval(() => { void this.recoverOnce() }, this.intervalMs)
-    // Don't keep the process alive just for the recovery poll.
+    // Self-scheduling loop so a pass that outlasts the interval can't overlap the next.
+    const loop = async () => {
+      if (this.stopped) return
+      const startedAt = performance.now()
+      try {
+        await this.recoverOnce()
+      } catch {
+        // swallow: a failed pass must not stop the loop
+      }
+      if (this.stopped) return
+      const elapsed = performance.now() - startedAt
+      const delay = Math.max(0, this.intervalMs - elapsed)
+      this.timer = setTimeout(loop, delay)
+      if (typeof this.timer.unref === "function") this.timer.unref()
+    }
+    this.timer = setTimeout(loop, this.intervalMs)
     if (typeof this.timer.unref === "function") this.timer.unref()
   }
 
   stop(): void {
     this.stopped = true
-    if (this.timer) clearInterval(this.timer)
+    if (this.timer) clearTimeout(this.timer)
     this.timer = undefined
   }
 
   async recoverOnce(): Promise<SagaRecoveryResult> {
-    // Skip if stopped or a previous tick is still draining (ticks don't overlap).
     if (this.stopped || this.running) return { recovered: 0, skipped: 0, failed: 0 }
     this.running = true
     const result: SagaRecoveryResult = { recovered: 0, skipped: 0, failed: 0 }

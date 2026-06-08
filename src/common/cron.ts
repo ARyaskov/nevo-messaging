@@ -1,20 +1,7 @@
-// 5-field cron parser: "minute hour day month weekday".
-// Supports `*`, `,`, `-`, `/`. No `L`, `#`, `?` (Quartz extensions).
-//
-// Returns the next firing timestamp at or after `from`.
-//
-// Timezone: by default schedules are evaluated in the server's LOCAL time
-// (matching `Date` getters). Pass `{ utc: true }` to evaluate in UTC, or
-// `{ timezone: "Area/City" }` for any IANA zone (resolved via
-// `Intl.DateTimeFormat`). DST is handled by mapping wall-clock times back to
-// real epoch instants; wall-clock times that don't exist on a spring-forward
-// day are skipped.
-
+// 5-field cron parser ("minute hour day month weekday"); supports `*`, `,`, `-`, `/`.
 interface CronField {
   values: Set<number>
-  // True only when the field was literally "*". Needed for the POSIX
-  // day-of-month vs day-of-week OR rule (see `dayMatches`). "*/2" is NOT a
-  // wildcard — it restricts the field.
+  // True only when the field was literally "*" (not "*/N"); drives the POSIX dom/dow OR rule.
   wildcard: boolean
 }
 
@@ -109,7 +96,6 @@ function wallClock(epochMs: number, tz?: string): WallClock {
   const p = zonedParts(epochMs, tz)
   return {
     ...p,
-    // A calendar date maps to a fixed weekday independent of timezone.
     weekday: new Date(Date.UTC(p.year, p.month - 1, p.day)).getUTCDay()
   }
 }
@@ -164,10 +150,7 @@ function dayMatches(parsed: ParsedCron, wc: WallClock): boolean {
   const dowRestricted = !parsed.weekday.wildcard
   const domHit = parsed.day.values.has(wc.day)
   const dowHit = parsed.weekday.values.has(wc.weekday)
-  // POSIX: when BOTH day-of-month and day-of-week are restricted, the day
-  // matches if EITHER field matches (logical OR) — e.g. "0 0 13 * 5" fires on
-  // the 13th OR any Friday. When only one is restricted, it applies and the
-  // wildcard field matches everything.
+  // POSIX: when both dom and dow are restricted the day matches if EITHER matches.
   if (domRestricted && dowRestricted) return domHit || dowHit
   if (domRestricted) return domHit
   if (dowRestricted) return dowHit
@@ -198,9 +181,7 @@ export function nextCronTick(expr: string, from: number, opts: CronOptions = {})
   let lowerHour = wc.hour
   let lowerMinute = wc.minute
 
-  // Step day-by-day (≈1.5k iterations for a 4-year horizon) and only resolve
-  // the hour/minute on days that match — far cheaper than the old
-  // minute-by-minute scan (worst case ≈2.1M iterations for rare schedules).
+  // Step day-by-day, resolving hour/minute only on matching days.
   const MAX_DAYS = 366 * 4 + 2
   for (let d = 0; d < MAX_DAYS; d++) {
     if (dayMatches(parsed, wc)) {
@@ -210,8 +191,7 @@ export function nextCronTick(expr: string, from: number, opts: CronOptions = {})
           if (h === lowerHour && m < lowerMinute) continue
           const candidate = toEpoch(wc.year, wc.month, wc.day, h, m, tz)
           if (candidate < fromMinute) continue
-          // Skip wall-clock times that don't exist (spring-forward gap):
-          // `toEpoch` normalizes them forward, so the round-trip won't match.
+          // Skip wall-clock times that don't exist (spring-forward gap).
           const back = wallClock(candidate, tz)
           if (back.hour !== h || back.minute !== m) continue
           return candidate

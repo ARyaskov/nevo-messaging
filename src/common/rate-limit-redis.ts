@@ -162,12 +162,7 @@ export class RedisRateLimiter {
     })
   }
 
-  /**
-   * Best-effort snapshot of bucket states via SCAN. Use for dashboards only.
-   *
-   * Buckets are stored as Redis HASHes (see TOKEN_BUCKET_LUA), so the `tokens`
-   * field is read with HGET — a plain GET would raise WRONGTYPE / yield NaN.
-   */
+  /** Best-effort snapshot of bucket states via SCAN (dashboards only). */
   async snapshot(): Promise<Record<string, { tokens: number; capacity: number }>> {
     const out: Record<string, { tokens: number; capacity: number }> = {}
     if (!this.client.scanKeys || !this.client.hget) return out
@@ -191,18 +186,8 @@ export class RedisRateLimiter {
   }
 
   /**
-   * Compose local (per-pod) + remote (cluster-wide) limiters.
-   *
-   * The local limiter is a consuming token bucket — calling `local.check` spends
-   * a token. If we consumed locally first and the remote then rejected, that
-   * local token would be wasted, draining the local bucket under sustained
-   * remote-limiting (eventually the local shield would reject requests the
-   * cluster would have allowed). To avoid that, when both limiters are enabled
-   * we check the remote (cluster-wide) limiter first and only spend a local
-   * token once the remote has allowed the request.
-   *
-   * NOTE: the local capacity should be configured >= the remote capacity so the
-   * per-pod shield never rejects traffic the cluster-wide limiter would permit.
+   * Compose local (per-pod) + remote (cluster-wide) limiters; remote is checked first so a
+   * rejected request never spends a local token. Configure local capacity >= remote capacity.
    */
   static withLocalShield(local: RateLimiter, remote: RedisRateLimiter): { check(ctx: RateLimiterKeyContext): Promise<void>; isEnabled(): boolean } {
     return {

@@ -1,6 +1,6 @@
 {
   "name": "@riaskov/nevo-messaging",
-  "version": "2.3.2",
+  "version": "2.3.3",
   "description": "Microservices messaging framework for NestJS with NATS/Kafka/SocketIO/HTTP transport, MessagePack, retry/circuit-breaker, OTel, schema validation, DLQ, idempotency, saga, outbox, metrics, health, DevTools",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

@@ -39,12 +39,8 @@ export class InMemoryEventStore implements EventStore {
       sequence: this.nextSeq++,
       ts: Date.now()
     }
-    // Persist synchronously: the workflow engine reads history immediately after
-    // append() resolves, so the event must be durable before we return.
     this.events.push(event)
-    // Deliver to a SNAPSHOT of subscribers asynchronously and unawaited: a slow
-    // subscriber must not block the producer, and snapshotting decouples us from
-    // any subscribe()/unsubscribe() that a handler triggers via reentrant append.
+    // Deliver to a snapshot of subscribers asynchronously so a slow handler can't block the producer.
     const targets = [...this.subscribers].filter((s) => event.sequence >= s.from)
     if (targets.length > 0) {
       queueMicrotask(() => {
@@ -71,10 +67,7 @@ export class InMemoryEventStore implements EventStore {
   async subscribe(from: number, handler: (e: DomainEvent) => Promise<void> | void): Promise<{ unsubscribe(): Promise<void> }> {
     const entry = { from, handler }
     this.subscribers.add(entry)
-    // Catch up on history against a SNAPSHOT so a handler that reentrantly
-    // appends does not extend the array we are iterating (which would replay
-    // events it just produced). New events past the snapshot arrive via append's
-    // live delivery, since `entry` is already registered.
+    // Catch up on history against a snapshot so reentrant appends don't extend what we iterate.
     const backlog = this.events.slice()
     for (const e of backlog) {
       if (e.sequence >= from) {

@@ -24,29 +24,18 @@ interface GaugeStore {
   values: Map<string, number>
 }
 
-// Sentinel for any method that is not registered (or is attacker-supplied on a
-// METHOD_NOT_FOUND). Bucketing here keeps random method names from minting new
-// time series. See `methodLabel`.
+// Label for any unregistered/unknown method; caps method-name cardinality.
 export const UNKNOWN_METHOD_LABEL = "<unknown>"
 
-// Sentinel label-set every metric collapses into once it exceeds the series
-// cap, so a cardinality attack cannot grow the backing Maps without bound.
+// Catch-all label-set a metric collapses into once it exceeds the series cap.
 const OVERFLOW_LABEL_VALUE = "<other>"
 
-// Default request-latency buckets (seconds). Extended past the old 10s ceiling
-// to 30s/60s so slow requests stay visible instead of collapsing into +Inf.
+// Default request-latency buckets (seconds).
 const DEFAULT_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60]
 
 const DEFAULT_MAX_SERIES_PER_METRIC = 2000
 
-/**
- * Normalise a raw (possibly version-suffixed, possibly attacker-supplied) method
- * string into a safe, low-cardinality metric label. The `@version` suffix is
- * stripped, and — when an `isKnown` predicate is supplied — any method the
- * server did not register collapses to {@link UNKNOWN_METHOD_LABEL}. Callers
- * without a registry (clients) pass no predicate and just get the version
- * stripped.
- */
+/** Normalise a method string into a low-cardinality metric label (strips `@version`; unknown methods collapse to {@link UNKNOWN_METHOD_LABEL}). */
 export function methodLabel(method: string | undefined | null, isKnown?: (name: string) => boolean): string {
   if (!method) return UNKNOWN_METHOD_LABEL
   const { name } = parseMethod(method)
@@ -55,10 +44,7 @@ export function methodLabel(method: string | undefined | null, isKnown?: (name: 
   return name
 }
 
-// Prometheus text-format label value: wrapped in double quotes with `\`, `"`
-// and newline escaped. Other control characters are dropped so a crafted label
-// (e.g. a forged method name on METHOD_NOT_FOUND) cannot inject exposition
-// lines or otherwise corrupt the output.
+// Escape a Prometheus label value (\, ", newline escaped; other control chars dropped to prevent injection).
 function escapeLabelValue(value: string): string {
   let out = ""
   for (const ch of value) {
@@ -74,11 +60,7 @@ function escapeLabelValue(value: string): string {
   return out
 }
 
-// Produces the fully-rendered, escaped, quoted label portion (e.g.
-// `method="ping",service="user"`). This doubles as the dedup key for a series
-// and as the exact text written by `expose()` — escaping happens exactly once,
-// here, so the two can never drift out of sync. Label *names* are framework
-// constants (always valid identifiers) so only values need escaping.
+// Rendered escaped-and-quoted label portion; doubles as the series dedup key and the exact `expose()` text.
 function labelsKey(labels: Record<string, string>): string {
   const keys = Object.keys(labels).sort()
   return keys.map((k) => `${k}="${escapeLabelValue(labels[k])}"`).join(",")
@@ -86,8 +68,7 @@ function labelsKey(labels: Record<string, string>): string {
 
 const OVERFLOW_KEY = labelsKey({ label: OVERFLOW_LABEL_VALUE })
 
-// Bucket boundaries must be ascending and unique for the bucket search to be
-// correct; normalise defensively in case a caller passes an unsorted set.
+// Bucket boundaries must be ascending and unique for the bucket search; normalise defensively.
 function normalizeBuckets(buckets: number[]): number[] {
   return Array.from(new Set(buckets.filter((b) => Number.isFinite(b)))).sort((a, b) => a - b)
 }
@@ -122,10 +103,7 @@ export class InMemoryMetrics implements MetricsRegistry {
 
   isEnabled(): boolean { return this.enabled }
 
-  // Resolve the label-set key, funnelling any *new* series past the cap into the
-  // single overflow bucket. Existing keys (including the overflow key itself)
-  // always pass through, so a metric retains at most `maxSeries` real series
-  // plus the one `{label="<other>"}` catch-all.
+  // Resolve the label-set key; new series past `maxSeries` funnel into the overflow bucket.
   private resolveKey(map: ReadonlyMap<string, unknown>, key: string): string {
     if (map.has(key)) return key
     if (map.size < this.maxSeries) return key
@@ -147,14 +125,12 @@ export class InMemoryMetrics implements MetricsRegistry {
     if (!this.enabled) return
     let store = this.histograms.get(name)
     if (!store) {
-      // Bucket precedence: explicit per-metric config > buckets passed on the
-      // first observation > the extended latency defaults.
+      // Bucket precedence: per-metric config > first-observation buckets > defaults.
       const initial = this.bucketConfig[name] ?? (buckets ? normalizeBuckets(buckets) : DEFAULT_BUCKETS)
       store = { buckets: initial, counts: new Map(), sums: new Map(), totals: new Map() }
       this.histograms.set(name, store)
     } else if (buckets && !sameBuckets(normalizeBuckets(buckets), store.buckets) && !this.bucketWarned.has(name)) {
-      // Buckets are fixed at first observation; a later mismatch is surfaced
-      // (once per metric) rather than silently ignored.
+      // Buckets are fixed at first observation; warn once on a later mismatch.
       this.bucketWarned.add(name)
       getDefaultLogger().warn(
         { event: "metrics.bucket_mismatch", metric: name, requested: buckets, active: store.buckets },
@@ -162,8 +138,7 @@ export class InMemoryMetrics implements MetricsRegistry {
       )
     }
     const key = this.resolveKey(store.totals, labelsKey(labels))
-    // The overflow bucket aggregates many distinct label-sets, so a per-`le`
-    // distribution would be meaningless — track only its sum/count.
+    // The overflow bucket tracks only sum/count (a per-`le` distribution would be meaningless).
     if (key !== OVERFLOW_KEY) {
       let arr = store.counts.get(key)
       if (!arr) {
@@ -211,8 +186,7 @@ export class InMemoryMetrics implements MetricsRegistry {
     }
     for (const [name, store] of this.histograms.entries()) {
       lines.push(`# TYPE ${name} histogram`)
-      // `totals` holds every observed key (incl. the overflow key, which has no
-      // per-bucket counts) so iterate it as the canonical series set.
+      // `totals` is the canonical series set (incl. the overflow key, which has no per-bucket counts).
       for (const [labels, total] of store.totals.entries()) {
         const sum = store.sums.get(labels) ?? 0
         if (labels === OVERFLOW_KEY) {
@@ -252,13 +226,8 @@ export const NEVO_METRIC_NAMES = {
   retries: "nevo_messaging_retries_total",
   circuitState: "nevo_messaging_circuit_state",
   payloadBytes: "nevo_messaging_payload_bytes",
-  // High-severity: a distributed idempotency / inbox store read failed. Labelled
-  // by `{ store, op, policy }`. Spikes here mean dedup may have degraded (and,
-  // under fail-open, that handlers may have re-executed).
+  // Distributed idempotency/inbox store read failed; labelled by `{ store, op, policy }`.
   storeErrors: "nevo_messaging_store_errors_total",
-  // High-severity: a saga compensation step exhausted its retries and threw.
-  // Labelled by `{ type, step }`. The saga is left `compensation_failed` (never
-  // `compensated`) and routed to the DLQ — a non-zero rate means side effects
-  // may not have been rolled back and need manual intervention.
+  // Saga compensation step exhausted retries and threw; labelled by `{ type, step }`.
   sagaCompensationFailures: "nevo_messaging_saga_compensation_failures_total"
 }

@@ -131,7 +131,6 @@ export class NevoWsClient {
       idempotencyKey: opts?.idempotencyKey,
       tenantId: opts?.tenantId,
       headers: opts?.headers,
-      // Stamp chain id from ALS (or mint a new one at the entry of a chain).
       nevoChainId: resolveOutboundChainId()
     }
     return this.tracer.inject(baseMeta)

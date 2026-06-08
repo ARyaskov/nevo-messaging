@@ -24,13 +24,6 @@ export interface ScheduledTask {
 export interface ScheduledTaskStore {
   enqueue(task: ScheduledTask): Promise<void>
   claimDue(workerId: string, now: number, limit: number, claimTtlMs: number): Promise<ScheduledTask[]>
-  // The finalizers take the claiming `workerId` and only mutate a row that is
-  // still `running` and still owned by that worker. The lease reaper in
-  // `claimDue` lets a second worker re-claim a task whose holder stalled past
-  // its lease without crashing; fencing here stops the stalled original from
-  // double-bumping `attempts` (premature maxAttempts exhaustion) or
-  // double-rescheduling a row the reaper now owns. Mirrors the outbox fence in
-  // `PgOutboxStore.markPublished`/`markFailed`.
   markCompleted(id: string, workerId: string): Promise<void>
   markFailed(id: string, error: string, workerId: string): Promise<void>
   reschedule(id: string, nextRunAt: number, workerId: string): Promise<void>
@@ -42,9 +35,7 @@ export class InMemoryScheduledTaskStore implements ScheduledTaskStore {
   private readonly map = new Map<string, ScheduledTask>()
 
   async enqueue(task: ScheduledTask): Promise<void> {
-    // Dedup by id, mirroring the PG store's `ON CONFLICT (id) DO NOTHING`: a
-    // deterministic cron id means N replicas enqueue the same row but only the
-    // first wins, so the job fires once per cluster, not once per replica.
+    // Dedup by id (cron ids are deterministic) so the job fires once per cluster.
     if (this.map.has(task.id)) return
     this.map.set(task.id, { ...task })
   }
@@ -54,10 +45,7 @@ export class InMemoryScheduledTaskStore implements ScheduledTaskStore {
     for (const task of this.map.values()) {
       if (claimed.length >= limit) break
       if (task.runAt > now) continue
-      // Claimable when pending, or when a prior claim's lease has expired — the
-      // worker that held it likely crashed between claim and completion. Without
-      // this reaper a task stuck in "running" is stranded forever (and a stuck
-      // cron silently stops recurring).
+      // Claimable when pending, or when a prior claim's lease has expired.
       const leaseExpired =
         task.status === "running" &&
         task.claimedAt !== undefined &&
@@ -99,8 +87,6 @@ export class InMemoryScheduledTaskStore implements ScheduledTaskStore {
   }
 
   // Fence: only the worker that still holds the (running) claim may finalize.
-  // A worker reaped after its lease expired (claim stolen, status flipped, or
-  // already finalized) sees this return false and its finalizer is a no-op.
   private owns(t: ScheduledTask | undefined, workerId: string): t is ScheduledTask {
     return t !== undefined && t.status === "running" && t.claimedBy === workerId
   }
@@ -173,18 +159,7 @@ export class Scheduler {
     return this.enqueue(name, payload, Date.now() + Math.max(0, ms))
   }
 
-  /**
-   * Schedule `name` to recur on a cron expression.
-   *
-   * The task id is DERIVED from the logical name (`cron:<name>`), so every
-   * replica enqueues the same row and the store dedups it — the job fires once
-   * per cluster per tick, not once per replica. Re-enqueuing an existing cron
-   * is a no-op (first writer wins); use distinct names for distinct schedules.
-   *
-   * Cron is evaluated in server local time by default; pass `{ utc: true }` or
-   * `{ timezone: "Area/City" }` to override. The zone is persisted so each
-   * reschedule uses the same rule.
-   */
+  /** Schedule `name` to recur on a cron expression (deduped per cluster by a name-derived id). */
   async enqueueCron(name: string, payload: unknown, cron: string, opts: CronOptions = {}): Promise<string> {
     if (!isValidCron(cron)) throw new Error(`Scheduler: invalid cron "${cron}"`)
     const timezone = opts.utc ? "UTC" : opts.timezone
@@ -243,12 +218,9 @@ export class Scheduler {
         await handler(task.payload)
         if (task.cron) {
           const cronOpts = task.timezone ? { timezone: task.timezone } : undefined
-          // Compute the next tick from the task's SCHEDULED runAt (not the wall
-          // clock at completion) so a slow handler doesn't drift the cadence.
+          // Next tick from the SCHEDULED runAt so a slow handler doesn't drift the cadence.
           let next = nextCronTick(task.cron, task.runAt, cronOpts)
-          // Missed-run policy: SKIP. If we've fallen behind (worker was down, or
-          // the handler ran past one or more ticks), jump to the next tick after
-          // now instead of replaying every missed occurrence.
+          // Missed-run policy: SKIP — jump to the next tick after now.
           const now = Date.now()
           if (next > 0 && next <= now) next = nextCronTick(task.cron, now, cronOpts)
           if (next > 0) {
@@ -336,15 +308,7 @@ export function getScheduledMethods(target: any): ScheduledMeta[] {
   return (Reflect.getMetadata(NEVO_METHOD_SCHEDULED, ctor) as ScheduledMeta[] | undefined) ?? []
 }
 
-/**
- * Walk through `instances`, find any `@Scheduled` methods, register them with
- * `scheduler` and enqueue an initial run.
- *
- * Cron tasks use a DETERMINISTIC id derived from the logical name, so re-running
- * discovery — or running it across N replicas — enqueues each cron exactly once
- * (the store dedups via `ON CONFLICT (id) DO NOTHING`). One-shot `at`/`in` tasks
- * are NOT deduped and enqueue a fresh run on every call.
- */
+/** Find `@Scheduled` methods on `instances`, register them, and enqueue an initial run. */
 export async function discoverAndRegisterScheduled(
   scheduler: Scheduler,
   instances: object[]

@@ -40,39 +40,7 @@ export interface PgOutboxStoreOptions extends PgStoreOptions {
   claimTtlMs?: number
 }
 
-/**
- * Postgres outbox.
- *
- * Schema:
- *   CREATE TABLE nevo_outbox (
- *     id            TEXT PRIMARY KEY,
- *     service_name  TEXT NOT NULL,
- *     method        TEXT NOT NULL,
- *     params        JSONB NOT NULL,
- *     partition_key TEXT,
- *     status        TEXT NOT NULL DEFAULT 'pending',
- *     attempts      INT  NOT NULL DEFAULT 0,
- *     last_error    TEXT,
- *     created_at    TIMESTAMPTZ NOT NULL,
- *     claimed_at    TIMESTAMPTZ,
- *     claimed_by    TEXT,
- *     published_at  TIMESTAMPTZ
- *   );
- *   CREATE INDEX nevo_outbox_pending ON nevo_outbox (status, created_at)
- *     WHERE status = 'pending';
- *
- * Ownership: `listPending` claims rows with FOR UPDATE SKIP LOCKED, stamping
- * `claimed_by`/`claimed_at`. `markPublished`/`markFailed` only mutate a row that
- * is still `claimed_by` THIS worker and still `pending`, so a worker whose claim
- * was stolen after its TTL expired cannot re-finalize the row (no double publish
- * of the outbox state). Re-delivery to the broker can still happen — that is the
- * at-least-once contract; pair with the consumer-side inbox/idempotency cache.
- *
- * `claimed_by` (a per-instance unique worker id) is the fencing identity here.
- * A monotonic claim epoch would be strictly stronger (it survives worker-id
- * reuse), but each `PgOutboxStore` mints a fresh uuid-derived `workerId`, so the
- * id already serves as a unique fence without an extra column.
- */
+/** Postgres outbox store with claim-fenced publish (FOR UPDATE SKIP LOCKED). */
 export class PgOutboxStore implements OutboxStore {
   private readonly client: PgClient
   private readonly table: string
@@ -106,7 +74,6 @@ export class PgOutboxStore implements OutboxStore {
         published_at  TIMESTAMPTZ
       );
     `)
-    // Forward-migrate tables created before partition_key existed.
     await this.client.query(`ALTER TABLE ${this.table} ADD COLUMN IF NOT EXISTS partition_key TEXT;`)
     await this.client.query(`
       CREATE INDEX IF NOT EXISTS nevo_outbox_pending_idx ON ${this.table} (status, created_at)
@@ -114,12 +81,7 @@ export class PgOutboxStore implements OutboxStore {
     `)
   }
 
-  /**
-   * Persist a pending record. Pass `tx` (a live connection running your
-   * business transaction) to write the outbox row in the SAME BEGIN/COMMIT as
-   * the state change. Without it the write uses the store's own connection,
-   * which is unsafe — see {@link OutboxStore.save} and `withOutboxTransaction`.
-   */
+  /** Persist a pending record; pass `tx` to write in the caller's transaction. */
   async save(record: OutboxRecord, tx?: PgClient): Promise<void> {
     const client = tx ?? this.client
     await client.query(
@@ -214,17 +176,7 @@ export interface PgInboxStoreOptions extends PgStoreOptions {
   ttlMs?: number
 }
 
-/**
- * Postgres inbox.
- *
- * Schema:
- *   CREATE TABLE nevo_inbox (
- *     uuid        TEXT PRIMARY KEY,
- *     result      JSONB,
- *     seen_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
- *   );
- *   CREATE INDEX nevo_inbox_seen_at ON nevo_inbox (seen_at);
- */
+/** Postgres inbox (dedup) store. */
 export class PgInboxStore implements InboxStore {
   private readonly client: PgClient
   private readonly table: string
@@ -293,23 +245,7 @@ export interface PgSagaStoreOptions extends PgStoreOptions {
   table?: string
 }
 
-/**
- * Postgres saga snapshot store.
- *
- * Schema:
- *   CREATE TABLE nevo_saga (
- *     saga_id     TEXT PRIMARY KEY,
- *     type        TEXT NOT NULL DEFAULT 'default',
- *     status      TEXT NOT NULL,
- *     steps       JSONB NOT NULL,
- *     executed    JSONB NOT NULL,
- *     ctx         JSONB NOT NULL,
- *     error       TEXT,
- *     updated_at  TIMESTAMPTZ NOT NULL
- *   );
- *   CREATE INDEX nevo_saga_pending ON nevo_saga (status)
- *     WHERE status IN ('pending', 'compensating');
- */
+/** Postgres saga snapshot store. */
 export class PgSagaStore implements SagaStore {
   private readonly client: PgClient
   private readonly table: string
@@ -333,7 +269,6 @@ export class PgSagaStore implements SagaStore {
         updated_at TIMESTAMPTZ NOT NULL
       );
     `)
-    // Idempotently add `type` to tables created before crash recovery existed.
     await this.client.query(`
       ALTER TABLE ${this.table} ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'default';
     `)
@@ -417,22 +352,7 @@ export interface PgEventStoreOptions extends PgStoreOptions {
   table?: string
 }
 
-/**
- * Postgres event store.
- *
- * Schema:
- *   CREATE TABLE nevo_events (
- *     sequence     BIGSERIAL PRIMARY KEY,
- *     id           TEXT NOT NULL UNIQUE,
- *     type         TEXT NOT NULL,
- *     aggregate_id TEXT,
- *     payload      JSONB NOT NULL,
- *     meta         JSONB,
- *     ts           TIMESTAMPTZ NOT NULL DEFAULT NOW()
- *   );
- *   CREATE INDEX nevo_events_aggregate ON nevo_events (aggregate_id, sequence);
- *   CREATE INDEX nevo_events_type      ON nevo_events (type);
- */
+/** Postgres event store. */
 export class PgEventStore implements EventStore {
   private readonly client: PgClient
   private readonly table: string
@@ -531,9 +451,7 @@ export class PgEventStore implements EventStore {
           try {
             await handler(e)
           } catch (err) {
-            // Do NOT advance the cursor past an event whose handler threw —
-            // that would silently drop it. Stop this tick and retry the SAME
-            // event on the next one, preserving at-least-once delivery.
+            // Handler threw: stop without advancing the cursor so the event retries next tick.
             this.logger?.warn(
               { sequence: e.sequence, id: e.id, type: e.type, err: (err as Error)?.message ?? String(err) },
               "event-store.subscribe: handler failed; retrying event next tick (cursor not advanced)"
@@ -565,22 +483,7 @@ export interface PgDlqStoreOptions extends PgStoreOptions {
   table?: string
 }
 
-/**
- * Postgres DLQ.
- *
- * Schema:
- *   CREATE TABLE nevo_dlq (
- *     id          TEXT PRIMARY KEY,
- *     topic       TEXT NOT NULL,
- *     reason      TEXT NOT NULL,
- *     method      TEXT,
- *     error_code  INT,
- *     ts          TIMESTAMPTZ NOT NULL,
- *     entry       JSONB NOT NULL
- *   );
- *   CREATE INDEX nevo_dlq_topic_ts ON nevo_dlq (topic, ts);
- *   CREATE INDEX nevo_dlq_method   ON nevo_dlq (method);
- */
+/** Postgres DLQ store. */
 export class PgDlqStore implements DlqStore {
   private readonly client: PgClient
   private readonly table: string
@@ -649,13 +552,7 @@ export class PgDlqStore implements DlqStore {
     return res.rows.map((r) => deserializeBigInt(r.entry) as DlqEntry)
   }
 
-  /**
-   * Aggregate DLQ stats in a SINGLE round-trip. A base CTE applies the optional
-   * `sinceMs` time window once; the grand total / oldest / newest and each
-   * GROUP BY breakdown are computed with FILTER and stitched together with
-   * UNION ALL, tagged by a `kind` discriminator. Pass `sinceMs` to restrict the
-   * whole computation to rows with `ts >= sinceMs`.
-   */
+  /** Aggregate DLQ stats in a single round-trip; `sinceMs` restricts the time window. */
   async stats(sinceMs?: number): Promise<DlqStats> {
     const params: unknown[] = []
     let windowClause = ""
@@ -748,12 +645,9 @@ export class PgScheduledTaskStore implements ScheduledTaskStore {
         created_at   TIMESTAMPTZ NOT NULL
       );
     `)
-    // Backfill the timezone column on tables created before it existed.
     await this.client.query(`
       ALTER TABLE ${this.table} ADD COLUMN IF NOT EXISTS timezone TEXT;
     `)
-    // Covers the claimDue scan for both pending tasks and running tasks whose
-    // lease has expired (reclaimed by the reaper after a worker crash).
     await this.client.query(`
       CREATE INDEX IF NOT EXISTS nevo_scheduled_due_idx ON ${this.table} (status, run_at)
         WHERE status IN ('pending', 'running');
@@ -764,9 +658,6 @@ export class PgScheduledTaskStore implements ScheduledTaskStore {
   }
 
   async enqueue(task: ScheduledTask): Promise<void> {
-    // ON CONFLICT (id) DO NOTHING dedups across replicas: cron tasks share a
-    // deterministic id, so the first replica to enqueue wins and the job has a
-    // single row (one firing per tick cluster-wide).
     await this.client.query(
       `INSERT INTO ${this.table} (id, name, payload, run_at, cron, timezone, attempts, max_attempts, status, created_at)
        VALUES ($1, $2, $3::jsonb, to_timestamp($4 / 1000.0), $5, $6, $7, $8, $9, to_timestamp($10 / 1000.0))
@@ -782,11 +673,7 @@ export class PgScheduledTaskStore implements ScheduledTaskStore {
       timezone: string | null; attempts: number; max_attempts: number; status: string;
       last_error: string | null; created_at: Date
     }>(
-      // Claims pending tasks AND reclaims tasks stuck in 'running' past their
-      // lease — the worker that held them likely crashed before
-      // markCompleted/markFailed. Without this a stuck task (and any cron behind
-      // it) is stranded forever. Lease age uses the DB clock (NOW()), the
-      // authoritative reference across replicas.
+      // Claims pending tasks and reclaims 'running' tasks past their lease (DB clock).
       `WITH cte AS (
          SELECT id FROM ${this.table}
           WHERE run_at <= to_timestamp($1 / 1000.0)
@@ -823,11 +710,7 @@ export class PgScheduledTaskStore implements ScheduledTaskStore {
     }))
   }
 
-  // markCompleted/markFailed/reschedule are fenced by `claimed_by` and
-  // `status = 'running'`, exactly like PgOutboxStore.markPublished/markFailed.
-  // claimDue's lease reaper can hand a stalled-but-alive worker's task to a
-  // second worker; without the fence the original worker, on finally finishing,
-  // would double-bump `attempts` or re-reschedule the row the reaper now owns.
+  // markCompleted/markFailed/reschedule are fenced by `claimed_by` and `status = 'running'`.
   async markCompleted(id: string, workerId: string): Promise<void> {
     await this.client.query(
       `UPDATE ${this.table} SET status = 'completed', completed_at = NOW()

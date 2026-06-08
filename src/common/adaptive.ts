@@ -10,17 +10,9 @@ export interface AdaptiveOptions {
 
 interface Sample { ts: number; durationMs: number; ok: boolean }
 
-// Upper bound on retained samples. Eviction is by time window *and* by this cap:
-// once the ring is full the oldest slot is overwritten, so memory stays O(cap)
-// regardless of throughput. 2048 recent samples is ample for a stable p99.
 const MAX_SAMPLES = 2048
 
-/**
- * Hoare-style quickselect: returns the k-th smallest element (0-indexed),
- * mutating `arr` into a partial ordering around k. O(n) on average — avoids the
- * O(n log n) full sort the old percentile() paid on every observe(). Safe to
- * call repeatedly on the same array (correct for any input ordering).
- */
+/** Quickselect: returns the k-th smallest element (0-indexed), mutating `arr`. */
 function selectKth(arr: number[], k: number): number {
   let lo = 0
   let hi = arr.length - 1
@@ -54,9 +46,7 @@ export class AdaptiveTuner {
   private readonly maxRetries: number
   private readonly minTimeoutMs: number
   private readonly maxTimeoutMs: number
-  // Fixed-capacity ring buffer. `start` indexes the oldest live slot, `size` is
-  // the number of live slots (≤ MAX_SAMPLES). Writes are O(1) — out-of-window
-  // entries are skipped lazily during aggregation instead of being shifted out.
+  // Fixed-capacity ring buffer; `start` is the oldest live slot, `size` the live count.
   private readonly ring: Sample[] = new Array(MAX_SAMPLES)
   private start = 0
   private size = 0
@@ -85,7 +75,6 @@ export class AdaptiveTuner {
     if (this.size < MAX_SAMPLES) {
       this.size++
     } else {
-      // Buffer full — advancing `start` overwrites the oldest sample.
       this.start = (this.start + 1) % MAX_SAMPLES
     }
     this.recompute(now)
@@ -138,8 +127,6 @@ export class AdaptiveTuner {
     const { durations, errors } = this.window(Date.now())
     const sampleSize = durations.length
     const errorRate = sampleSize === 0 ? 0 : errors / sampleSize
-    // `percentile` mutates `durations` (partial sort); reusing the same array
-    // across calls is fine — selectKth is correct on any ordering.
     return {
       p50: this.percentile(durations, 50),
       p95: this.percentile(durations, 95),

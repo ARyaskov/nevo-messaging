@@ -4,8 +4,7 @@ import { redactObject, jsonByteSize } from "./redact"
 import type { MessageMeta, MessageResponse } from "./types"
 import { getDefaultLogger, type NevoLogger } from "./logger"
 
-// Append-only audit log. Pluggable sinks (in-memory, file, pg, tee).
-// Integrated into BaseMessageController: one entry per request, redacted.
+// Append-only audit log with pluggable sinks (in-memory, file, pg, tee).
 
 export type AuditOutcome = "ok" | "error"
 
@@ -119,10 +118,7 @@ export class AuditLog {
   }
 
   private normalise(entry: AuditEntry): AuditEntry {
-    // Size-guard FIRST: a single non-allocating pass that estimates the redacted
-    // serialized size and bails as soon as the budget is exceeded. Oversized
-    // payloads short-circuit before we pay for deep redaction, and we never build
-    // a throwaway JSON string to measure.
+    // Size-guard first via a non-allocating estimate; oversized payloads short-circuit before deep redaction.
     if (jsonByteSize(entry, this.maxEntryBytes, this.redactPaths) > this.maxEntryBytes) {
       const dropped = { __dropped: "oversize" as const, maxBytes: this.maxEntryBytes }
       return {
@@ -131,7 +127,6 @@ export class AuditLog {
         result: entry.result === undefined ? undefined : dropped
       }
     }
-    // Within budget: deep-redact once. No second serialization pass.
     return {
       ...entry,
       params: redactObject(entry.params, this.redactPaths),
@@ -221,24 +216,8 @@ export class FileAuditSink implements AuditSink {
   }
 }
 
-// Postgres sink. Caller supplies a `query(text, values)`-shaped client —
-// 4-line wrapper around `pg`, `postgres`, or `pg-promise`.
-//
-// Schema:
-//   CREATE TABLE nevo_audit (
-//     uuid        TEXT PRIMARY KEY,
-//     ts          TIMESTAMPTZ NOT NULL,
-//     service     TEXT NOT NULL,
-//     method      TEXT NOT NULL,
-//     caller      TEXT,
-//     tenant_id   TEXT,
-//     outcome     TEXT NOT NULL,
-//     duration_ms INT  NOT NULL,
-//     entry       JSONB NOT NULL
-//   );
-//   CREATE INDEX nevo_audit_ts     ON nevo_audit (ts);
-//   CREATE INDEX nevo_audit_method ON nevo_audit (method);
-//   CREATE INDEX nevo_audit_tenant ON nevo_audit (tenant_id);
+// Postgres sink. Caller supplies a `query(text, values)`-shaped client.
+// Expected schema: nevo_audit(uuid PK, ts, service, method, caller, tenant_id, outcome, duration_ms, entry JSONB); index ts/method/tenant_id.
 export interface AuditPgClient {
   query(text: string, values?: unknown[]): Promise<unknown>
 }

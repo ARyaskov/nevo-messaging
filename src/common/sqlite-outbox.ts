@@ -22,12 +22,7 @@ export interface SqliteOutboxStoreOptions {
   path?: string
   tableName?: string
   pragma?: string[]
-  /**
-   * Share an existing `node:sqlite` `DatabaseSync` instead of opening one. Put
-   * your business tables on the same connection and the outbox write commits in
-   * the SAME transaction as the state change — see `withOutboxTransaction`.
-   * When set, `path` and `pragma` are ignored (the owner manages the connection).
-   */
+  /** Share an existing `node:sqlite` `DatabaseSync` so the outbox write can commit in the same transaction as the state change. When set, `path` and `pragma` are ignored. */
   db?: any
 }
 
@@ -72,8 +67,7 @@ export class SqliteOutboxStore implements OutboxStore {
       );
       CREATE INDEX IF NOT EXISTS ${this.table}_status_idx ON ${this.table}(status, created_at);
     `)
-    // Forward-migrate tables created before partition_key existed (SQLite has no
-    // ADD COLUMN IF NOT EXISTS, so a duplicate-column error is expected and ignored).
+    // Forward-migrate pre-partition_key tables; duplicate-column error is expected and ignored.
     try { this.db.exec(`ALTER TABLE ${this.table} ADD COLUMN partition_key TEXT`) } catch {}
 
     this.stmts = {
@@ -84,12 +78,7 @@ export class SqliteOutboxStore implements OutboxStore {
     }
   }
 
-  /**
-   * Persist a pending record. Pass `tx` (a `node:sqlite` `DatabaseSync` running
-   * a transaction) to enlist the outbox write in your business transaction. When
-   * `tx` is this store's own connection the prepared insert already runs inside
-   * the open BEGIN; a distinct connection gets a one-off prepared insert.
-   */
+  /** Persist a pending record. Pass `tx` (a `node:sqlite` `DatabaseSync` in a transaction) to enlist the write in your business transaction. */
   async save(record: OutboxRecord, tx?: any): Promise<void> {
     if (tx && tx !== this.db && typeof tx.prepare === "function") {
       tx.prepare(
@@ -129,7 +118,7 @@ export class SqliteOutboxStore implements OutboxStore {
   }
 
   close(): void {
-    // Never close a borrowed connection — the owner manages its lifecycle.
+    // Never close a borrowed connection.
     if (!this.ownsDb) return
     try { this.db.close() } catch {}
   }

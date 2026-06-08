@@ -48,10 +48,14 @@ import {
   DevToolsBus,
   getDevToolsBus,
   publishClientEvent,
-  normalizeServiceName
+  normalizeServiceName,
+  mapLimit
 } from "../../common"
 import { getNatsModule } from "../optional-deps"
 import { resolveOutboundChainId } from "../../common/chain-context"
+
+// Cap on concurrent async encode+compress operations during a batch publish.
+const BATCH_ENCODE_CONCURRENCY = 16
 
 export interface NevoNatsClientOptions extends TransportClientOptions {
   servers?: string[]
@@ -223,8 +227,6 @@ export class NevoNatsClient {
       tenantId: opts?.tenantId,
       headers: opts?.headers,
       contentEncoding: this.defaultContentEncoding,
-      // Stamp the chain id (inherited from the active ALS context if we're
-      // inside a handler, otherwise a fresh one). DevTools groups by this.
       nevoChainId: resolveOutboundChainId()
     }
     return this.tracer.inject(baseMeta)
@@ -269,8 +271,7 @@ export class NevoNatsClient {
 
   private decodePayload<T = any>(data: Uint8Array, encoding?: string): T | Promise<T> {
     this.metrics.observeHistogram(NEVO_METRIC_NAMES.payloadBytes, { direction: "in", service: this.serviceName ?? "unknown" }, data.byteLength)
-    // Tiny / identity payloads inflate synchronously (no event-loop hop on the
-    // common path); larger compressed buffers offload to the worker pool.
+    // Small/identity payloads inflate synchronously; larger ones offload to the worker pool.
     if (!shouldDecompressAsync(data.byteLength, encoding)) {
       const decompressed = maybeDecompress(data, encoding, this.maxPayloadBytes)
       enforcePayloadLimit(decompressed, this.maxPayloadBytes)
@@ -297,7 +298,7 @@ export class NevoNatsClient {
     const normalized = this.ensureServiceRegistered(serviceName)
     const subject = `${normalized}-events`
     const cbKey = `${normalized}:${method}`
-    // Version-stripped label so `foo@v1`/`foo@v2` don't split into separate series.
+    // Version-stripped label so `foo@v1`/`foo@v2` share one metric series.
     const metricMethod = methodLabel(method)
 
     return this.shutdown.trackInflight((async () => {
@@ -306,10 +307,6 @@ export class NevoNatsClient {
         return this.idempotencyCache.get(idempotencyKey) as T
       }
 
-      // Breaker wraps the *entire* retried operation through the shared client
-      // pipeline, so one logical call records exactly one breaker outcome — not
-      // one per `withRetry` attempt (which previously tripped it ~maxAttempts×
-      // too early). Per-attempt spans / DevTools events / metrics stay inside.
       const result = await runClientPipeline<T>(this.circuitBreaker, this.retryOptions, cbKey, async (attempt) => {
         const startMs = Date.now()
         let lastUuid: string | undefined
@@ -517,12 +514,12 @@ export class NevoNatsClient {
     if (items.length === 0) return
     const nc = await this.ensureConnection()
     if (this.compression.async && this.compression.enabled) {
-      const encoded = await Promise.all(items.map(async (item) => {
+      const encoded = await mapLimit(items, BATCH_ENCODE_CONCURRENCY, async (item) => {
         const normalized = this.ensureServiceRegistered(item.serviceName)
         const subject = `${normalized}-events`
         const { payload, meta } = await this.encodeRequestAsync(item.method, item.params, "emit", item.opts)
         return { subject, payload, headers: this.toNatsHeaders(meta.headers) }
-      }))
+      })
       for (const e of encoded) nc.publish(e.subject, e.payload, e.headers ? { headers: e.headers } : undefined)
     } else {
       for (const item of items) {
@@ -550,12 +547,12 @@ export class NevoNatsClient {
       await nc.flush()
       return
     }
-    const encoded = await Promise.all(items.map(async (item) => {
+    const encoded = await mapLimit(items, BATCH_ENCODE_CONCURRENCY, async (item) => {
       const normalized = this.ensureServiceRegistered(item.serviceName)
       const subject = `${normalized}${DEFAULT_SUBSCRIPTION_SUFFIX}`
       const { payload, meta } = await this.encodeRequest(item.method, item.params, "sub", item.opts)
       return { subject, payload, headers: this.toNatsHeaders(meta.headers) }
-    }))
+    })
     for (const e of encoded) {
       nc.publish(e.subject, e.payload, e.headers ? { headers: e.headers } : undefined)
     }

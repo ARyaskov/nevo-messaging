@@ -10,17 +10,9 @@ export interface DevToolsEvent {
   service?: string
   method?: string
   uuid?: string
-  /**
-   * Correlation id shared across every envelope in one logical fan-out (the
-   * initiating call plus everything it calls, transitively). Surfaced in the
-   * DevTools /traces view to reconstruct chains. Populated by the framework
-   * via `chain-context.ts`; see `MessageMeta.nevoChainId`.
-   */
+  /** Correlation id shared across every envelope in one logical fan-out. */
   chainId?: string
-  /**
-   * Envelope uuid of the immediately-causing message. Lets the dashboard render
-   * a tree instead of a flat list. Mirrors `MessageMeta.nevoParentUuid`.
-   */
+  /** Envelope uuid of the immediately-causing message. */
   parentUuid?: string
   durationMs?: number
   status?: "ok" | "error"
@@ -36,6 +28,8 @@ export interface DevToolsRingOptions {
   originId?: string
   batchFlushMs?: number
   dropStrategy?: DevToolsDropStrategy
+  /** High-water cap for the batched listener-emission queue (defaults to `maxEvents`). */
+  maxPending?: number
   onBackpressure?: (depth: number) => void
 }
 
@@ -49,6 +43,7 @@ export class DevToolsBus {
 
   private readonly batched: boolean
   private readonly pendingEmissions: DevToolsEvent[] = []
+  private readonly maxPending: number
   private flushScheduled = false
   private flushTimer?: NodeJS.Immediate
   private readonly dropStrategy: DevToolsDropStrategy
@@ -60,6 +55,7 @@ export class DevToolsBus {
     this.originId = opts?.originId ?? randomUUID()
     this.batched = (opts?.batchFlushMs ?? 0) > 0
     this.dropStrategy = opts?.dropStrategy ?? "drop-oldest"
+    this.maxPending = opts?.maxPending ?? this.capacity
     this.onBackpressure = opts?.onBackpressure
   }
 
@@ -84,6 +80,19 @@ export class DevToolsBus {
     return true
   }
 
+  private enqueuePending(event: DevToolsEvent): void {
+    if (this.pendingEmissions.length >= this.maxPending) {
+      if (this.dropStrategy === "drop-newest") return
+      if (this.dropStrategy === "back-pressure") {
+        this.onBackpressure?.(this.pendingEmissions.length)
+        return
+      }
+      this.pendingEmissions.shift()
+    }
+    this.pendingEmissions.push(event)
+    this.scheduleFlush()
+  }
+
   private scheduleFlush(): void {
     if (this.flushScheduled) return
     this.flushScheduled = true
@@ -103,8 +112,7 @@ export class DevToolsBus {
     this.storeInRing(stamped)
     if (this.listeners.size === 0) return
     if (this.batched) {
-      this.pendingEmissions.push(stamped)
-      this.scheduleFlush()
+      this.enqueuePending(stamped)
     } else {
       this.emitToListeners(stamped)
     }
@@ -115,8 +123,7 @@ export class DevToolsBus {
     this.storeInRing(event)
     if (this.listeners.size === 0) return
     if (this.batched) {
-      this.pendingEmissions.push(event)
-      this.scheduleFlush()
+      this.enqueuePending(event)
     } else {
       this.emitToListeners(event)
     }

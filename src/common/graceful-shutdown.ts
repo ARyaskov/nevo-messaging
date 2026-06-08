@@ -13,18 +13,11 @@ export class GracefulShutdown {
   }
 
   trackInflight<T>(task: Promise<T>): Promise<T> {
-    // Track even tasks started during the drain window: returning early here
-    // would leave them untracked, so drain/timeout could tear them down
-    // mid-flight. Once tracked, completing the last one still resolves drain.
     const id = Symbol()
     this.inflight.add(id)
     return task.finally(() => {
       this.inflight.delete(id)
-      // Gate on an active drain (resolveDrain set), not on shuttingDown: drain()
-      // is public and may be awaited on its own without shutdown() having flipped
-      // shuttingDown. A present resolver means some drain() is waiting, so the
-      // last inflight task completing should resolve it via completion rather
-      // than forcing it to wait out the timeout.
+      // Gate on an active drain (resolveDrain set), not on shuttingDown.
       if (this.inflight.size === 0 && this.resolveDrain) {
         this.resolveDrain()
       }

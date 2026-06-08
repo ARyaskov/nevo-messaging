@@ -102,7 +102,6 @@ export class NevoHttp2Client {
       idempotencyKey: opts?.idempotencyKey,
       tenantId: opts?.tenantId,
       headers: opts?.headers,
-      // Stamp chain id from ALS (or mint a new one at the entry of a chain).
       nevoChainId: resolveOutboundChainId()
     }
     return this.tracer.inject(baseMeta)
@@ -189,8 +188,7 @@ export class NevoHttp2Client {
                 reject(new MessagingError(err.code, err.details ?? { message: err.message }, err.service || serviceName))
                 return
               }
-              // A server error status whose body is not a nevo error envelope must not be
-              // resolved as a successful empty result (which would also tell the breaker onSuccess).
+              // Non-envelope error status must not count as success.
               if (status >= 400) {
                 reject(httpStatusToError(status, serviceName))
                 return
@@ -199,8 +197,7 @@ export class NevoHttp2Client {
               publishClientEvent(this.devtoolsBus, { service: serviceName, method, uuid, chainId: lastChainId, durationMs: Date.now() - startMs, status: "ok", transport: "http2", origin: this.serviceName })
               resolve(payload?.params?.result as T)
             } catch (err: any) {
-              // A non-nevo error response (proxy/gateway body) may not decode; prefer the
-              // mapped HTTP status over a misleading parse error.
+              // Non-nevo error body may not decode; prefer the HTTP status.
               if (status >= 400) { reject(httpStatusToError(status, serviceName)); return }
               reject(err instanceof MessagingError ? err : new MessagingError(ErrorCode.PARSE_ERROR, { message: err?.message ?? "decode failed" }))
             }
@@ -251,8 +248,7 @@ function tryMsgpackOrJson(): Codec {
   }
 }
 
-// Maps an HTTP error status (>= 400) to a MessagingError. Only gateway/availability
-// statuses (502/503/504) are marked retryable; everything else (incl. 500) is terminal.
+// Maps an HTTP error status (>= 400) to a MessagingError; only 502/503/504 are retryable.
 function httpStatusToError(status: number, serviceName: string): MessagingError {
   switch (status) {
     case 413:

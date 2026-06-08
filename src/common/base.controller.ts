@@ -53,16 +53,9 @@ export abstract class BaseMessageController {
     return this._logger
   }
   protected readonly idempotency: LruIdempotencyCache<MessageResponse>
-  /**
-   * Optional distributed idempotency backend (Redis, Memcached, …).
-   * When set, takes precedence over the local LRU on miss and is written
-   * through on success. See `idempotency-store.ts`.
-   */
+  /** Optional distributed idempotency backend (Redis, Memcached, …). */
   protected readonly distributedIdempotency?: IdempotencyStore<MessageResponse>
-  /**
-   * Shared two-tier idempotency runtime (L1 + claim-before-execute over the
-   * distributed store). Single source of truth with the live signal-router path.
-   */
+  /** Shared two-tier idempotency runtime (L1 + claim-before-execute). */
   private readonly idem: TwoTierIdempotency<MessageResponse>
   protected readonly replayGuard: ReplayGuard
   protected readonly dlq: DlqRouter
@@ -74,10 +67,7 @@ export abstract class BaseMessageController {
   protected readonly capabilities?: string[]
   protected readonly serviceVersion?: string
   protected readonly devtoolsBus: DevToolsBus | null
-  /**
-   * Optional append-only audit log. Records every successful or failed
-   * request when enabled. Sinks are pluggable — see `audit-log.ts`.
-   */
+  /** Optional append-only audit log. */
   protected readonly auditLog?: AuditLog
 
   protected constructor(
@@ -104,10 +94,7 @@ export abstract class BaseMessageController {
       capabilities?: string[]
       disableBuiltinHandlers?: boolean
       devtools?: DevToolsBus | boolean
-      /**
-       * Append-only audit log of every request/response. When set, the
-       * controller writes one redacted entry per call via `auditLog.recordFromResponse`.
-       */
+      /** Append-only audit log of every request/response. */
       auditLog?: AuditLog
     }
   ) {
@@ -168,10 +155,7 @@ export abstract class BaseMessageController {
     })
   }
 
-  // Version-stripped method name for metric labels, bucketing any unregistered
-  // / forged method (e.g. on METHOD_NOT_FOUND) to a single `<unknown>` series.
-  // `hasOwnProperty` (not `in`) so inherited Object members like "toString" are
-  // not mistaken for registered handlers.
+  // Version-stripped metric label; unregistered/forged methods bucket to `<unknown>`.
   private metricMethodLabel(method: string): string {
     return methodLabel(method, (name) => Object.prototype.hasOwnProperty.call(this.methodRegistry, name))
   }
@@ -282,9 +266,7 @@ export abstract class BaseMessageController {
     const { method, uuid, params, meta } = this.extractMessageData(data)
     const success = true
 
-    // Establish a chain context for the duration of this handler so any
-    // outbound calls picks up the same chain id via AsyncLocalStorage.
-    // See `chain-context.ts` and the DevTools /traces view.
+    // Establish a chain context so outbound calls inherit the same chain id.
     const chainId = resolveInboundChainId(meta?.nevoChainId)
     return runInChain({ chainId, parentUuid: uuid }, () => this.runProcessMessage(data, method, uuid, params, meta, nowMs, startMs, success, chainId, metrics))
   }
@@ -335,10 +317,7 @@ export abstract class BaseMessageController {
         return this.createErrorResponse(uuid, method, err, meta)
       }
 
-      // Idempotency (claim-before-execute) via the shared two-tier runtime: dedup
-      // on the wire-level idempotency key when the client stamped one, else the
-      // envelope uuid. A hit returns the stored response; otherwise we hold the
-      // claim until `finally` commits it (success) or releases it.
+      // Idempotency (claim-before-execute): dedup on idempotencyKey, else uuid.
       idemKey = meta?.idempotencyKey || uuid
       if (idemKey && this.idem.isEnabled()) {
         const began = await this.idem.begin(idemKey)
@@ -361,8 +340,7 @@ export abstract class BaseMessageController {
         this.rateLimiter.check({ topic, method: parsed.name, callerService, tenantId: meta?.tenantId, meta })
       }
 
-      // Tenant kill-switch — checked after rate-limit so disabled tenants
-      // are charged a token but get a clean `UNAUTHORIZED` response.
+      // Tenant kill-switch — checked after rate-limit.
       assertTenantAllowed(this.serviceName, meta?.tenantId)
 
       if (!isAccessAllowed(this.accessControl, topic, parsed.name, callerService)) {
@@ -421,10 +399,7 @@ export abstract class BaseMessageController {
 
       await this.systemAfterHook({ ...responseContext, response })
 
-      // Commit through the shared runtime: L1 write + an AWAITED distributed
-      // write-through (closing the window where a peer re-executes before the
-      // result is stored — previously this distributed set was fire-and-forget).
-      // Errors are not cached; the `finally` block releases the claim instead.
+      // Commit the idempotency result (errors are not cached).
       if (idemKey && idemBegan && response.params.result !== "error") {
         await this.idem.commit(idemKey, response)
         idemCommitted = true
@@ -471,7 +446,7 @@ export abstract class BaseMessageController {
         } catch {}
       }
       if (this.auditLog?.isEnabled() && finalResponse) {
-        // Fire-and-forget — never block request completion on audit writes.
+        // Fire-and-forget.
         Promise.resolve(
           this.auditLog.recordFromResponse({
             service: this.serviceName,
@@ -485,9 +460,7 @@ export abstract class BaseMessageController {
           })
         ).catch(() => {})
       }
-      // Release a still-held idempotency claim when no result was committed
-      // (handler error, policy denial, early return) so a retry can re-execute
-      // instead of polling a stranded sentinel until its TTL expires.
+      // Release a still-held claim when no result was committed.
       if (idemKey && idemBegan && !idemCommitted) {
         try { await this.idem.release(idemKey) } catch {}
       }

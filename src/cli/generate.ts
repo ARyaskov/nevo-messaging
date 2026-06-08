@@ -92,8 +92,7 @@ function isOptionalField(node: any): boolean {
 export function generateContractModule(contract: ServiceContract, opts?: GenerateOptions): string {
   const service = opts?.serviceName ?? contract.serviceName
   const baseName = opts?.serviceMapName ?? `${pascalCase(service)}ServiceContract`
-  // Client alias name: drop a trailing "ServiceContract"/"Contract" suffix so
-  // `FooServiceContract` -> `FooClient`; otherwise just append "Client".
+  // Drop a trailing "ServiceContract"/"Contract" suffix, else append "Client".
   const clientName = `${baseName.replace(/(Service)?Contract$/, "")}Client`
 
   const lines: string[] = []
@@ -114,9 +113,7 @@ export function generateContractModule(contract: ServiceContract, opts?: Generat
   }
   lines.push(`}`)
   lines.push("")
-  // Typed facade over a transport client, scoped to this service's contract.
-  // `typed<${baseName}>(client)` returns an instance whose `query`/`emit` infer
-  // params & result from the interface above.
+  // Emit the typed-client alias for this service's contract.
   lines.push(`export type ${clientName} = TypedClient<${baseName}>`)
   lines.push("")
   lines.push(`export const ${pascalCase(service)}ContractMethods = [`)

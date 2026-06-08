@@ -52,9 +52,13 @@ import {
   getDevToolsBus,
   publishClientEvent,
   normalizeServiceName,
-  resolveOutboundChainId
+  resolveOutboundChainId,
+  mapLimit
 } from "../../common"
 import { getKafkaModule } from "../optional-deps"
+
+// Cap on concurrent async encode+compress operations during a batch emit.
+const BATCH_ENCODE_CONCURRENCY = 16
 
 export interface NevoKafkaClientOptions extends TransportClientOptions {
   timeoutMs?: number
@@ -76,9 +80,7 @@ interface StickyGroup {
   deliveryCounts: Map<string, number>
 }
 
-// Defensive upper bound on a consumer's deliveryCounts map. Entries are normally
-// dropped on success / DLQ / max-delivery / no-match, so this only ever bites a
-// pathological stream that accumulates in-flight retries faster than they resolve.
+// Defensive upper bound on a consumer's deliveryCounts map.
 const MAX_DELIVERY_COUNTS = 10_000
 
 export class NevoKafkaClient {
@@ -185,7 +187,6 @@ export class NevoKafkaClient {
       idempotencyKey: opts?.idempotencyKey,
       tenantId: opts?.tenantId,
       headers: opts?.headers,
-      // Stamp chain id from ALS (or mint a new one at the entry of a chain).
       nevoChainId: resolveOutboundChainId()
     }
     return this.tracer.inject(baseMeta)
@@ -229,8 +230,7 @@ export class NevoKafkaClient {
   private decodePayload<T = any>(data: Uint8Array | Buffer | string, encoding?: string): T | Promise<T> {
     const buf = typeof data === "string" ? Buffer.from(data, "utf8") : Buffer.from(data as any)
     this.metrics.observeHistogram(NEVO_METRIC_NAMES.payloadBytes, { direction: "in", service: this.serviceName ?? "unknown" }, buf.byteLength)
-    // Tiny / identity payloads inflate synchronously; larger compressed buffers
-    // offload to the worker pool via maybeDecompressAsync.
+    // Small/identity payloads inflate synchronously; larger ones offload to the worker pool.
     if (!shouldDecompressAsync(buf.byteLength, encoding)) {
       const decompressed = maybeDecompress(buf, encoding, this.maxPayloadBytes)
       enforcePayloadLimit(decompressed, this.maxPayloadBytes)
@@ -321,23 +321,24 @@ export class NevoKafkaClient {
   async emitBatch(items: Array<{ serviceName: string; method: string; params: unknown; opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> } }>): Promise<void> {
     if (items.length === 0) return
     if (!this.batchProducer) {
-      // Match the server-side producer's durability posture (see kafka.config.ts):
-      // idempotent + single in-flight request guarantees ordered, exactly-once
-      // appends; without these a transient broker hiccup can silently drop or
-      // reorder a batch.
+      // Idempotent + single in-flight request for ordered, exactly-once appends.
       this.batchProducer = this.sharedKafkaForSubs.producer({ idempotent: true, maxInFlightRequests: 1, allowAutoTopicCreation: true })
       await this.batchProducer.connect()
     }
     const byTopic = new Map<string, Array<{ key: string; value: Buffer }>>()
     if (this.compression.async && this.compression.enabled) {
-      await Promise.all(items.map(async (item) => {
+      // Encode under a concurrency cap, then group in input order to keep per-topic order deterministic.
+      const encoded = await mapLimit(items, BATCH_ENCODE_CONCURRENCY, async (item) => {
         const normalized = this.ensureServiceRegistered(item.serviceName)
         const topic = `${normalized}-events`
         const { key, value } = await this.encodeRequest(item.method, item.params, "emit", item.opts) as { key: string; value: Uint8Array }
-        let arr = byTopic.get(topic)
-        if (!arr) { arr = []; byTopic.set(topic, arr) }
-        arr.push({ key, value: Buffer.from(value) })
-      }))
+        return { topic, key, value: Buffer.from(value) }
+      })
+      for (const e of encoded) {
+        let arr = byTopic.get(e.topic)
+        if (!arr) { arr = []; byTopic.set(e.topic, arr) }
+        arr.push({ key: e.key, value: e.value })
+      }
     } else {
       for (const item of items) {
         const normalized = this.ensureServiceRegistered(item.serviceName)
@@ -367,8 +368,7 @@ export class NevoKafkaClient {
     this.kafkaClient.emit(DEFAULT_BROADCAST_TOPIC, { key, value: Buffer.from(value) })
   }
 
-  // Evict the oldest entries once the per-consumer counter map exceeds its cap.
-  // Map preserves insertion order, so iterating keys() yields oldest-first.
+  // Evict oldest-first (insertion order) once the counter map exceeds its cap.
   private boundDeliveryCounts(counts: Map<string, number>): void {
     if (counts.size <= MAX_DELIVERY_COUNTS) return
     for (const key of counts.keys()) {
@@ -382,9 +382,7 @@ export class NevoKafkaClient {
     return Math.min(this.retryOptions.maxMs, exp)
   }
 
-  // kafkajs pause() is sticky: the partition stays paused until resume() runs.
-  // Capture the resume thunk it returns and re-enable consumption after a backoff
-  // so the failed message is redelivered instead of stalling the partition forever.
+  // Pause the partition and resume after a backoff so the failed message is redelivered.
   private scheduleResume(pause: () => () => void, attempts: number): void {
     let resume: () => void
     try {
@@ -480,8 +478,6 @@ export class NevoKafkaClient {
             }
             return
           }
-          // Keep the counter (attempts must accumulate toward maxAttempts) and
-          // resume the partition after a backoff so the message is redelivered.
           if (manualAck) {
             this.scheduleResume(pause, attempts)
           }
@@ -601,16 +597,13 @@ export class NevoKafkaClient {
                 ts: Date.now()
               })
             } else if (manualAck && !retryScheduled) {
-              // Pause once for the whole batch of matching handlers and resume
-              // after a backoff; the counter is retained below so attempts grow.
+              // Pause once for the whole batch of matching handlers.
               this.scheduleResume(pause, attempts)
               retryScheduled = true
             }
           }
         }
-        // Drop the per-offset counter unless a redelivery is pending. This covers
-        // both successful delivery and messages that matched no handler (which
-        // previously leaked one entry per message on busy topics).
+        // Drop the per-offset counter unless a redelivery is pending.
         if (!retryScheduled) deliveryCounts.delete(msgKey)
       }
     })
