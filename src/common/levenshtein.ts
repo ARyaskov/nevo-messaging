@@ -4,7 +4,7 @@ export function levenshteinDistance(a: string, b: string): number {
   if (!b.length) return a.length
 
   if (a.length > b.length) {
-    [a, b] = [b, a]
+    ;[a, b] = [b, a]
   }
 
   let prev = new Array<number>(a.length + 1)

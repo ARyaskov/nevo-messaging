@@ -1,6 +1,15 @@
 import "reflect-metadata"
 import { Controller, Type } from "@nestjs/common"
-import { BeforeHook, AfterHook, ServiceMethodMapping, AccessControlConfig, IdempotencyOptions, SecurityOptions, MetricsOptions, TracingOptions } from "./types"
+import {
+  BeforeHook,
+  AfterHook,
+  ServiceMethodMapping,
+  AccessControlConfig,
+  IdempotencyOptions,
+  SecurityOptions,
+  MetricsOptions,
+  TracingOptions
+} from "./types"
 import { getClassSignals, getNevoServiceName, SignalMetadata } from "../signal.decorator"
 import { DEFAULT_METHOD_VERSION } from "./version"
 import type { RateLimiter, RateLimiterOptions } from "./rate-limit"
@@ -21,6 +30,7 @@ export function createSignalRouterDecorator<T>(
     tracing?: TracingOptions
     defaultVersion?: string
     rateLimit?: RateLimiterOptions | RateLimiter
+    disableBuiltinHandlers?: boolean
   }
 ) {
   return function (target: any): any {
@@ -59,7 +69,8 @@ export function createSignalRouterDecorator<T>(
             metrics: options?.metrics,
             tracing: options?.tracing,
             defaultVersion: options?.defaultVersion ?? DEFAULT_METHOD_VERSION,
-            rateLimit: options?.rateLimit
+            rateLimit: options?.rateLimit,
+            disableBuiltinHandlers: options?.disableBuiltinHandlers
           })
 
           Object.getOwnPropertyNames(controller).forEach((key) => {

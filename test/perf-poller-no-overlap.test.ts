@@ -36,14 +36,20 @@ test("Outbox.start does not overlap flushes when the body outlasts the interval"
   // 40ms — well over the 5ms interval — so naive setInterval would overlap.
   const store: OutboxStore = {
     async save() {},
-    async markPublished(): Promise<OutboxMarkResult> { return { owned: true, status: "published", attempts: 0 } },
-    async markFailed(): Promise<OutboxMarkResult> { return { owned: true, status: "failed", attempts: 1 } },
+    async markPublished(): Promise<OutboxMarkResult> {
+      return { owned: true, status: "published", attempts: 0 }
+    },
+    async markFailed(): Promise<OutboxMarkResult> {
+      return { owned: true, status: "failed", attempts: 1 }
+    },
     async listPending(): Promise<OutboxRecord[]> {
       return [{ id: "x", serviceName: "s", method: "m", params: {}, createdAt: Date.now(), attempts: 0, status: "pending" }]
     }
   }
   const publisher: OutboxPublisher = {
-    async emit() { await tracker.run(40) }
+    async emit() {
+      await tracker.run(40)
+    }
   }
   const outbox = new Outbox(store, publisher, { intervalMs: 5, batch: 1 })
   outbox.start()

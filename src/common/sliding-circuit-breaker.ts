@@ -26,6 +26,7 @@ interface CircuitData {
   buckets: Bucket[]
   openedAt: number
   halfOpenSuccesses: number
+  halfOpenInFlight: boolean
 }
 
 export class SlidingCircuitBreakerRegistry {
@@ -37,6 +38,7 @@ export class SlidingCircuitBreakerRegistry {
   private readonly minSampleSize: number
   private readonly resetTimeoutMs: number
   private readonly halfOpenSuccessThreshold: number
+  private readonly maxKeys: number
   private readonly bus: DevToolsBus
   private readonly registry: DevToolsRegistry
 
@@ -48,6 +50,7 @@ export class SlidingCircuitBreakerRegistry {
     this.minSampleSize = opts?.minSampleSize ?? 20
     this.resetTimeoutMs = opts?.resetTimeoutMs ?? 10_000
     this.halfOpenSuccessThreshold = opts?.halfOpenSuccessThreshold ?? 1
+    this.maxKeys = opts?.maxKeys ?? 10_000
     this.bus = deps?.bus ?? getDevToolsBus()
     if (deps?.registry) {
       this.registry = deps.registry
@@ -57,15 +60,31 @@ export class SlidingCircuitBreakerRegistry {
     }
   }
 
-  isEnabled(): boolean { return this.enabled }
+  isEnabled(): boolean {
+    return this.enabled
+  }
 
   private getOrCreate(key: string): CircuitData {
     let c = this.circuits.get(key)
     if (!c) {
-      c = { state: "closed", buckets: [], openedAt: 0, halfOpenSuccesses: 0 }
+      this.evictIfFull()
+      c = { state: "closed", buckets: [], openedAt: 0, halfOpenSuccesses: 0, halfOpenInFlight: false }
       this.circuits.set(key, c)
     }
     return c
+  }
+
+  private evictIfFull(): void {
+    if (this.circuits.size < this.maxKeys) return
+    let fallback: string | undefined
+    for (const [k, v] of this.circuits) {
+      if (fallback === undefined) fallback = k
+      if (v.state === "closed") {
+        this.circuits.delete(k)
+        return
+      }
+    }
+    if (fallback !== undefined) this.circuits.delete(fallback)
   }
 
   private currentBucket(c: CircuitData): Bucket {
@@ -113,11 +132,19 @@ export class SlidingCircuitBreakerRegistry {
         const prev = c.state
         c.state = "half-open"
         c.halfOpenSuccesses = 0
+        c.halfOpenInFlight = false
         this.emitTransition(key, prev, c.state, this.aggregate(c))
       } else {
         const [service, method] = key.split(":")
         throw new CircuitOpenError(service ?? "unknown", method ?? "unknown")
       }
+    }
+    if (c.state === "half-open") {
+      if (c.halfOpenInFlight) {
+        const [service, method] = key.split(":")
+        throw new CircuitOpenError(service ?? "unknown", method ?? "unknown")
+      }
+      c.halfOpenInFlight = true
     }
   }
 
@@ -126,12 +153,14 @@ export class SlidingCircuitBreakerRegistry {
     const c = this.getOrCreate(key)
     this.currentBucket(c).success++
     if (c.state === "half-open") {
+      c.halfOpenInFlight = false
       c.halfOpenSuccesses++
       if (c.halfOpenSuccesses >= this.halfOpenSuccessThreshold) {
         const prev = c.state
         c.state = "closed"
         c.buckets = []
         c.halfOpenSuccesses = 0
+        c.halfOpenInFlight = false
         this.emitTransition(key, prev, c.state, { failure: 0, success: 0 })
       }
     }
@@ -139,11 +168,15 @@ export class SlidingCircuitBreakerRegistry {
 
   onFailure(key: string, err: unknown): void {
     if (!this.enabled) return
-    if (err instanceof MessagingError && err.code === ErrorCode.VALIDATION_FAILED) return
-    if (err instanceof MessagingError && err.code === ErrorCode.UNAUTHORIZED) return
+    if (err instanceof MessagingError && (err.code === ErrorCode.VALIDATION_FAILED || err.code === ErrorCode.UNAUTHORIZED)) {
+      const current = this.circuits.get(key)
+      if (current?.state === "half-open") current.halfOpenInFlight = false
+      return
+    }
     const c = this.getOrCreate(key)
     this.currentBucket(c).failure++
     if (c.state === "half-open") {
+      c.halfOpenInFlight = false
       const prev = c.state
       c.state = "open"
       c.openedAt = Date.now()

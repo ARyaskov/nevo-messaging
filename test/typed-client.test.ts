@@ -35,7 +35,7 @@ void _contractIsValidShape
 // then errors at build time.
 // ---------------------------------------------------------------------------
 
-type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false
+type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false
 type Expect<T extends true> = T
 
 // Inferred params for a method come from `TContract[method]["params"]`.
@@ -66,9 +66,7 @@ type _AssertMethodKeys = Expect<Equal<_MethodKeys, "user.getById" | "user.create
 
 // `params` is inferred per-method (third positional arg of `query`).
 // We assert it via a dedicated extractor so a regression to `any` is caught.
-type ParamsOf<K extends keyof SampleContract & string> = Parameters<
-  <KK extends K>(...args: [string, KK, SampleContract[KK]["params"]]) => void
->[2]
+type ParamsOf<K extends keyof SampleContract & string> = Parameters<<KK extends K>(...args: [string, KK, SampleContract[KK]["params"]]) => void>[2]
 type _AssertGetByIdParams = Expect<Equal<ParamsOf<"user.getById">, { id: string }>>
 type _AssertCreateParams = Expect<Equal<ParamsOf<"user.create">, { name: string }>>
 
@@ -91,7 +89,17 @@ function _negativeTypeChecks() {
 }
 
 // Reference the type aliases / fns so unused-local lint/compile checks don't drop them.
-type _Touch = [_ParamsGetById, _ResultGetById, _AssertGetByIdResult, _AssertCreateResult, _AssertVoidResult, _AssertMethodKeys, _AssertGetByIdParams, _AssertCreateParams, _AssertEmitResult]
+type _Touch = [
+  _ParamsGetById,
+  _ResultGetById,
+  _AssertGetByIdResult,
+  _AssertCreateResult,
+  _AssertVoidResult,
+  _AssertMethodKeys,
+  _AssertGetByIdParams,
+  _AssertCreateParams,
+  _AssertEmitResult
+]
 void _negativeTypeChecks
 
 // ---------------------------------------------------------------------------

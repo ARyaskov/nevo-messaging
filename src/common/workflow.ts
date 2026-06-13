@@ -56,11 +56,13 @@ interface ConsumedSignal {
 
 interface WorkflowReplayState {
   steps: Map<string, unknown>
+  sleepStarted: Set<string>
   sleepDone: Set<string>
   signals: Map<string, unknown[]>
   consumedByOrdinal: Map<number, ConsumedSignal>
   claimed: Set<string>
   signalTimeouts: Set<number>
+  signalTimeoutScheduled: Set<number>
   nows: Map<number, number>
   input: unknown
   status: WorkflowStatus
@@ -90,6 +92,7 @@ export class WorkflowEngine {
   private readonly scheduler?: Scheduler
   private readonly logger: NevoLogger
   private readonly workflows = new Map<string, WorkflowFn<any, any>>()
+  private readonly executionQueues = new Map<string, Promise<void>>()
 
   constructor(opts: WorkflowEngineOptions = {}) {
     this.store = opts.store ?? new InMemoryEventStore()
@@ -99,9 +102,7 @@ export class WorkflowEngine {
     if (this.scheduler) {
       this.scheduler.registerHandler(WAKEUP_TASK_NAME, async (payload: WakeupPayload) => {
         await this.onWakeup(payload).catch((err) => {
-          this.logger.warn(
-            { event: "workflow.wake.failed", workflowId: payload.workflowId, err: (err as Error)?.message }
-          )
+          this.logger.warn({ event: "workflow.wake.failed", workflowId: payload.workflowId, err: (err as Error)?.message })
         })
       })
     }
@@ -183,9 +184,7 @@ export class WorkflowEngine {
     if (kind === "sleep") {
       const p = payload as { workflowId: string; ordinal: number }
       const events = await this.store.read({ aggregateId: p.workflowId })
-      const already = events.some(
-        (e) => e.type === "workflow.sleep.completed" && (e.payload as { ordinal: number }).ordinal === p.ordinal
-      )
+      const already = events.some((e) => e.type === "workflow.sleep.completed" && (e.payload as { ordinal: number }).ordinal === p.ordinal)
       if (!already && !this.isTerminal(events)) {
         await this.store.append({
           type: "workflow.sleep.completed",
@@ -198,10 +197,8 @@ export class WorkflowEngine {
       const events = await this.store.read({ aggregateId: p.workflowId })
       const settled = events.some(
         (e) =>
-          (e.type === "workflow.signal.consumed" &&
-            (e.payload as { ordinal: number }).ordinal === p.ordinal) ||
-          (e.type === "workflow.signal.timeout" &&
-            (e.payload as { ordinal: number }).ordinal === p.ordinal)
+          (e.type === "workflow.signal.consumed" && (e.payload as { ordinal: number }).ordinal === p.ordinal) ||
+          (e.type === "workflow.signal.timeout" && (e.payload as { ordinal: number }).ordinal === p.ordinal)
       )
       if (!settled && !this.isTerminal(events)) {
         await this.store.append({
@@ -215,24 +212,33 @@ export class WorkflowEngine {
   }
 
   private isTerminal(events: DomainEvent[]): boolean {
-    return events.some(
-      (e) =>
-        e.type === "workflow.completed" ||
-        e.type === "workflow.failed" ||
-        e.type === "workflow.cancelled"
-    )
+    return events.some((e) => e.type === "workflow.completed" || e.type === "workflow.failed" || e.type === "workflow.cancelled")
   }
 
-  private async execute(workflowId: string): Promise<WorkflowRunResult> {
+  private execute(workflowId: string): Promise<WorkflowRunResult> {
+    const tail = this.executionQueues.get(workflowId) ?? Promise.resolve()
+    const run = tail.then(() => this.executeExclusive(workflowId))
+    const next = run.then(
+      () => undefined,
+      () => undefined
+    )
+    this.executionQueues.set(workflowId, next)
+    void next.then(() => {
+      if (this.executionQueues.get(workflowId) === next) this.executionQueues.delete(workflowId)
+    })
+    return run
+  }
+
+  private async executeExclusive(workflowId: string): Promise<WorkflowRunResult> {
     const events = await this.store.read({ aggregateId: workflowId })
     const replay = this.buildReplayState(events)
     if (!replay) {
       throw new Error(`WorkflowEngine: no workflow.started event for ${workflowId}`)
     }
     if (replay.status === "completed" || replay.status === "failed" || replay.status === "cancelled") {
-      const completion = events.find((e) => e.type.startsWith("workflow.") && (
-        e.type === "workflow.completed" || e.type === "workflow.failed" || e.type === "workflow.cancelled"
-      ))
+      const completion = events.find(
+        (e) => e.type.startsWith("workflow.") && (e.type === "workflow.completed" || e.type === "workflow.failed" || e.type === "workflow.cancelled")
+      )
       const payload = completion?.payload as { result?: unknown; error?: string } | undefined
       return { status: replay.status, result: payload?.result, error: payload?.error }
     }
@@ -250,6 +256,12 @@ export class WorkflowEngine {
     let waitOrdinal = 0
     let nowOrdinal = 0
     const claimed = new Set<string>(replay.claimed)
+    const pendingNowAppends: Array<Promise<void>> = []
+    const drainNowAppends = async (): Promise<void> => {
+      while (pendingNowAppends.length > 0) {
+        await Promise.all(pendingNowAppends.splice(0))
+      }
+    }
     const ctx: WorkflowContext = {
       workflowId,
       input: startPayload.input,
@@ -260,11 +272,15 @@ export class WorkflowEngine {
         if (recorded !== undefined) return recorded
         const value = Date.now()
         replay.nows.set(key, value)
-        void this.store.append({
-          type: "workflow.now.recorded",
-          aggregateId: workflowId,
-          payload: { ordinal: key, value }
-        })
+        const append = this.store
+          .append({
+            type: "workflow.now.recorded",
+            aggregateId: workflowId,
+            payload: { ordinal: key, value }
+          })
+          .then(() => undefined)
+        append.catch(() => {})
+        pendingNowAppends.push(append)
         return value
       },
       step: async <T>(name: string, body: () => Promise<T> | T): Promise<T> => {
@@ -272,6 +288,7 @@ export class WorkflowEngine {
           return replay.steps.get(name) as T
         }
         const result = await body()
+        await drainNowAppends()
         await this.store.append({
           type: "workflow.step.completed",
           aggregateId: workflowId,
@@ -287,13 +304,19 @@ export class WorkflowEngine {
         if (!this.scheduler) {
           throw new Error("WorkflowEngine: ctx.sleep requires a Scheduler — pass one to the engine constructor")
         }
-        await this.store.append({
-          type: "workflow.sleep.started",
-          aggregateId: workflowId,
-          payload: { ordinal: sleepOrdinal, ms, wakeAt: Date.now() + ms }
-        })
-        const wake: WakeupPayload = { workflowId, kind: "sleep", ordinal: sleepOrdinal }
-        await this.scheduler.enqueueIn(WAKEUP_TASK_NAME, wake, ms)
+        if (!replay.sleepStarted.has(key)) {
+          await drainNowAppends()
+          const wake: WakeupPayload = { workflowId, kind: "sleep", ordinal: sleepOrdinal }
+          await this.scheduler.enqueueIn(WAKEUP_TASK_NAME, wake, ms, {
+            id: `workflow:${workflowId}:sleep:${sleepOrdinal}`
+          })
+          await this.store.append({
+            type: "workflow.sleep.started",
+            aggregateId: workflowId,
+            payload: { ordinal: sleepOrdinal, ms, wakeAt: Date.now() + ms }
+          })
+          replay.sleepStarted.add(key)
+        }
         throw new WorkflowSuspended(`sleep#${sleepOrdinal}`)
       },
       waitForSignal: async <T>(name: string, opts?: { timeoutMs?: number }): Promise<T> => {
@@ -310,10 +333,14 @@ export class WorkflowEngine {
         const queue = replay.signals.get(name) ?? []
         let index = -1
         for (let i = 0; i < queue.length; i++) {
-          if (!claimed.has(`${name}#${i}`)) { index = i; break }
+          if (!claimed.has(`${name}#${i}`)) {
+            index = i
+            break
+          }
         }
         if (index >= 0) {
           claimed.add(`${name}#${index}`)
+          await drainNowAppends()
           await this.store.append({
             type: "workflow.signal.consumed",
             aggregateId: workflowId,
@@ -321,9 +348,18 @@ export class WorkflowEngine {
           })
           return queue[index] as T
         }
-        if (opts?.timeoutMs && this.scheduler) {
+        if (opts?.timeoutMs && this.scheduler && !replay.signalTimeoutScheduled.has(ordinal)) {
+          await drainNowAppends()
           const wake: WakeupPayload = { workflowId, kind: "signal-timeout", ordinal, name }
-          await this.scheduler.enqueueIn(WAKEUP_TASK_NAME, wake, opts.timeoutMs)
+          await this.scheduler.enqueueIn(WAKEUP_TASK_NAME, wake, opts.timeoutMs, {
+            id: `workflow:${workflowId}:signal-timeout:${ordinal}`
+          })
+          await this.store.append({
+            type: "workflow.signal.timeout.scheduled",
+            aggregateId: workflowId,
+            payload: { ordinal, name }
+          })
+          replay.signalTimeoutScheduled.add(ordinal)
         }
         throw new WorkflowSuspended(`signal:${name}`)
       }
@@ -331,6 +367,7 @@ export class WorkflowEngine {
 
     try {
       const result = await fn(ctx)
+      await drainNowAppends()
       await this.store.append({
         type: "workflow.completed",
         aggregateId: workflowId,
@@ -339,6 +376,11 @@ export class WorkflowEngine {
       return { status: "completed", result }
     } catch (err) {
       if (isWorkflowSuspended(err)) {
+        try {
+          await drainNowAppends()
+        } catch (appendErr) {
+          this.logger.warn({ event: "workflow.now.append_failed", workflowId, err: (appendErr as Error)?.message })
+        }
         await this.store.append({
           type: "workflow.suspended",
           aggregateId: workflowId,
@@ -346,6 +388,9 @@ export class WorkflowEngine {
         })
         return { status: "suspended" }
       }
+      try {
+        await drainNowAppends()
+      } catch {}
       const error = (err as Error)?.message ?? String(err)
       await this.store.append({
         type: "workflow.failed",
@@ -361,11 +406,13 @@ export class WorkflowEngine {
     if (!start) return null
     const state: WorkflowReplayState = {
       steps: new Map(),
+      sleepStarted: new Set(),
       sleepDone: new Set(),
       signals: new Map(),
       consumedByOrdinal: new Map(),
       claimed: new Set(),
       signalTimeouts: new Set(),
+      signalTimeoutScheduled: new Set(),
       nows: new Map(),
       input: (start.payload as { input: unknown }).input,
       status: "running"
@@ -375,6 +422,11 @@ export class WorkflowEngine {
         case "workflow.step.completed": {
           const p = e.payload as { name: string; result: unknown }
           state.steps.set(p.name, p.result)
+          break
+        }
+        case "workflow.sleep.started": {
+          const p = e.payload as { ordinal: number }
+          state.sleepStarted.add(`sleep#${p.ordinal}`)
           break
         }
         case "workflow.sleep.completed": {
@@ -400,15 +452,28 @@ export class WorkflowEngine {
           state.signalTimeouts.add(p.ordinal)
           break
         }
+        case "workflow.signal.timeout.scheduled": {
+          const p = e.payload as { ordinal: number }
+          state.signalTimeoutScheduled.add(p.ordinal)
+          break
+        }
         case "workflow.now.recorded": {
           const p = e.payload as { ordinal: number; value: number }
           state.nows.set(p.ordinal, p.value)
           break
         }
-        case "workflow.completed": state.status = "completed"; break
-        case "workflow.failed":    state.status = "failed"; break
-        case "workflow.cancelled": state.status = "cancelled"; break
-        case "workflow.suspended": state.status = "suspended"; break
+        case "workflow.completed":
+          state.status = "completed"
+          break
+        case "workflow.failed":
+          state.status = "failed"
+          break
+        case "workflow.cancelled":
+          state.status = "cancelled"
+          break
+        case "workflow.suspended":
+          state.status = "suspended"
+          break
       }
     }
     return state
@@ -433,8 +498,7 @@ interface WorkflowMeta extends WorkflowDecoratorOptions {
 export function Workflow(options: WorkflowDecoratorOptions = {}): MethodDecorator {
   return (target, propertyKey) => {
     const ctor = (target as any)?.constructor ?? target
-    const list =
-      (Reflect.getMetadata(NEVO_METHOD_WORKFLOW, ctor) as WorkflowMeta[] | undefined) ?? []
+    const list = (Reflect.getMetadata(NEVO_METHOD_WORKFLOW, ctor) as WorkflowMeta[] | undefined) ?? []
     list.push({ ...options, propertyKey: propertyKey as string })
     Reflect.defineMetadata(NEVO_METHOD_WORKFLOW, list, ctor)
   }
@@ -446,10 +510,7 @@ export function getWorkflowMethods(target: any): WorkflowMeta[] {
 }
 
 /** Walk through `instances`, find any `@Workflow` methods, register with the engine. */
-export function discoverAndRegisterWorkflows(
-  engine: WorkflowEngine,
-  instances: object[]
-): Array<{ name: string }> {
+export function discoverAndRegisterWorkflows(engine: WorkflowEngine, instances: object[]): Array<{ name: string }> {
   const out: Array<{ name: string }> = []
   for (const instance of instances) {
     const className = instance.constructor?.name ?? "Unknown"

@@ -72,11 +72,11 @@ configureCompressionWorker({
 })
 ```
 
-Below `threshold`, compression stays on the main thread (worker round-trip would cost more than the work). Above, the framework uses `maybeCompressAsync` to offload via the pool.
+Below `threshold`, compression stays on the main thread (worker round-trip would cost more than the work). Above, the framework uses `maybeCompressAsync` to offload via the pool. The posted buffer is the actual transferable copy, so the worker transfer is zero-copy without detaching the caller's input.
 
 `isCompressionWorkerEnabled()` / `compressionWorkerThreshold()` expose the configured state.
 
-`shutdownCompressionWorker()` tears the pool down — call it from your shutdown hook.
+Worker `error` and unexpected `exit` events reject all pending jobs instead of leaving their promises unresolved. `shutdownCompressionWorker()` also rejects pending work and tears the pool down; call it from your shutdown hook.
 
 ## Decompression
 
@@ -89,7 +89,7 @@ The codec API has two encode paths:
 - `maybeCompress(buf, opts)` — synchronous (no worker)
 - `maybeCompressAsync(buf, opts)` — uses the worker pool when enabled and over threshold
 
-`query()` calls the sync path when possible and falls back to async only when needed, keeping latency low for small messages.
+Transport hot paths use the async helpers whenever compression/decompression is required. With a configured worker pool, payloads over the threshold are offloaded; without one, the async zlib APIs are used so gzip/deflate work does not block the event loop. The synchronous helpers remain available for explicit low-level use.
 
 ## When to skip
 

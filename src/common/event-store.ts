@@ -47,7 +47,9 @@ export class InMemoryEventStore implements EventStore {
         for (const s of targets) {
           // The handler may have unsubscribed by the time the microtask runs.
           if (!this.subscribers.has(s)) continue
-          try { void Promise.resolve(s.handler(event)).catch(() => {}) } catch {}
+          try {
+            void Promise.resolve(s.handler(event)).catch(() => {})
+          } catch {}
         }
       })
     }
@@ -71,11 +73,19 @@ export class InMemoryEventStore implements EventStore {
     const backlog = this.events.slice()
     for (const e of backlog) {
       if (e.sequence >= from) {
-        try { await handler(e) } catch {}
+        try {
+          await handler(e)
+        } catch {}
       }
     }
-    return { unsubscribe: async () => { this.subscribers.delete(entry) } }
+    return {
+      unsubscribe: async () => {
+        this.subscribers.delete(entry)
+      }
+    }
   }
 
-  size(): number { return this.events.length }
+  size(): number {
+    return this.events.length
+  }
 }

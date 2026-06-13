@@ -37,7 +37,10 @@ export function kafkaAdminPing(admin: { describeCluster: () => Promise<{ brokers
   }
 }
 
-export function natsPing(nc: { request: (subj: string, data: Uint8Array, opts?: { timeout?: number }) => Promise<any>; isClosed?: () => boolean }): HealthCheckFn {
+export function natsPing(nc: {
+  request: (subj: string, data: Uint8Array, opts?: { timeout?: number }) => Promise<any>
+  isClosed?: () => boolean
+}): HealthCheckFn {
   return async () => {
     try {
       if (typeof nc.isClosed === "function" && nc.isClosed()) return { status: "down", message: "connection closed" }

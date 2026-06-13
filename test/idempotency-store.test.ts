@@ -8,16 +8,25 @@ function fakeRedis(): IdempotencyRedisLike & { storage: Map<string, string>; get
   let setCalls = 0
   return {
     storage,
-    get getCalls() { return getCalls },
-    get setCalls() { return setCalls },
-    async get(key: string) { getCalls++; return storage.get(key) ?? null },
+    get getCalls() {
+      return getCalls
+    },
+    get setCalls() {
+      return setCalls
+    },
+    async get(key: string) {
+      getCalls++
+      return storage.get(key) ?? null
+    },
     async set(key, value, opts) {
       setCalls++
       if (opts.ifNotExists && storage.has(key)) return null
       storage.set(key, value)
       return "OK"
     },
-    async del(key) { return storage.delete(key) ? 1 : 0 }
+    async del(key) {
+      return storage.delete(key) ? 1 : 0
+    }
   } as any
 }
 
@@ -70,7 +79,7 @@ test("claim acquires once; second claim sees in-progress, then the committed res
 
 test("set overwrites the in-progress sentinel (no NX strand)", async () => {
   const store = new RedisIdempotencyStore<number>({ client: fakeRedis(), enabled: true, ttlMs: 60_000 })
-  await store.claim("k")  // writes the sentinel with SET NX
+  await store.claim("k") // writes the sentinel with SET NX
   await store.set("k", 5) // must replace it even though the key already exists
   assert.equal(await store.get("k"), 5)
 })
@@ -79,7 +88,9 @@ test("awaitResult resolves once a peer commits the real result", async () => {
   const store = new RedisIdempotencyStore<number>({ client: fakeRedis(), enabled: true, ttlMs: 60_000 })
   await store.claim("k") // in-progress sentinel
   const waiter = store.awaitResult("k", { timeoutMs: 1_000, pollMs: 5 })
-  setTimeout(() => { void store.set("k", 99) }, 20)
+  setTimeout(() => {
+    void store.set("k", 99)
+  }, 20)
   assert.equal(await waiter, 99)
 })
 
@@ -95,8 +106,12 @@ test("awaitResult returns undefined when no result appears before the deadline",
 
 test("readErrorPolicy=closed rethrows on read failure; open treats it as a miss", async () => {
   const boom: IdempotencyRedisLike = {
-    async get() { throw new Error("ECONNREFUSED") },
-    async set() { return "OK" }
+    async get() {
+      throw new Error("ECONNREFUSED")
+    },
+    async set() {
+      return "OK"
+    }
   }
   const closed = new RedisIdempotencyStore({ client: boom, enabled: true, readErrorPolicy: "closed" })
   await assert.rejects(() => Promise.resolve(closed.get("k")))
@@ -106,8 +121,12 @@ test("readErrorPolicy=closed rethrows on read failure; open treats it as a miss"
 
 test("readErrorPolicy=open claim falls open to acquired (execute) when the store is down", async () => {
   const boom: IdempotencyRedisLike = {
-    async get() { return null },
-    async set() { throw new Error("ECONNREFUSED") }
+    async get() {
+      return null
+    },
+    async set() {
+      throw new Error("ECONNREFUSED")
+    }
   }
   const open = new RedisIdempotencyStore({ client: boom, enabled: true, readErrorPolicy: "open" })
   const c = await open.claim("k")

@@ -85,7 +85,7 @@ Why prefer this: the consecutive-failure rule misbehaves at high RPS. At 1000 RP
 
 - **Closed** — calls flow, errors are counted.
 - **Open** — calls reject immediately with `ErrorCode.CIRCUIT_OPEN`.
-- **Half-open** — a single probe is allowed; on success, more probes; after `halfOpenSuccessThreshold` consecutive successes, close.
+- **Half-open** — exactly one probe may be in flight. Concurrent traffic still receives `CIRCUIT_OPEN`; each successful probe permits the next one, and `halfOpenSuccessThreshold` consecutive successes close the circuit.
 
 ## Inspecting state
 

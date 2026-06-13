@@ -70,9 +70,10 @@ export async function setupNevoTracing(opts: NevoTracingSetupOptions): Promise<N
 
     provider = new sdkTrace.NodeTracerProvider({
       resource,
-      sampler: opts.sampleRate !== undefined
-        ? new sdkTrace.TraceIdRatioBasedSampler(Math.max(0, Math.min(1, opts.sampleRate)))
-        : new sdkTrace.AlwaysOnSampler()
+      sampler:
+        opts.sampleRate !== undefined
+          ? new sdkTrace.TraceIdRatioBasedSampler(Math.max(0, Math.min(1, opts.sampleRate)))
+          : new sdkTrace.AlwaysOnSampler()
     })
     processor = new sdkTrace.BatchSpanProcessor(exporter)
     provider.addSpanProcessor(processor)
@@ -82,7 +83,7 @@ export async function setupNevoTracing(opts: NevoTracingSetupOptions): Promise<N
   } catch (err: any) {
     throw new Error(
       `Failed to initialize OpenTelemetry tracing: ${err?.message ?? err}. ` +
-      `Install @opentelemetry/api @opentelemetry/sdk-trace-node @opentelemetry/resources @opentelemetry/semantic-conventions plus your exporter.`
+        `Install @opentelemetry/api @opentelemetry/sdk-trace-node @opentelemetry/resources @opentelemetry/semantic-conventions plus your exporter.`
     )
   }
 
@@ -92,8 +93,12 @@ export async function setupNevoTracing(opts: NevoTracingSetupOptions): Promise<N
   return {
     tracer,
     shutdown: async () => {
-      try { await processor?.shutdown() } catch {}
-      try { await provider?.shutdown() } catch {}
+      try {
+        await processor?.shutdown()
+      } catch {}
+      try {
+        await provider?.shutdown()
+      } catch {}
     }
   }
 }

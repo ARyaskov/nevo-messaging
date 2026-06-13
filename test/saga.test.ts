@@ -7,8 +7,18 @@ import type { DlqEntry } from "../src/common/dlq"
 test("saga executes steps in order", async () => {
   const order: string[] = []
   const result = await createSaga<{ x: number }>()
-    .step({ name: "a", execute: () => { order.push("a") } })
-    .step({ name: "b", execute: () => { order.push("b") } })
+    .step({
+      name: "a",
+      execute: () => {
+        order.push("a")
+      }
+    })
+    .step({
+      name: "b",
+      execute: () => {
+        order.push("b")
+      }
+    })
     .run({ x: 1 })
   assert.equal(result.status, "success")
   assert.deepEqual(order, ["a", "b"])
@@ -17,9 +27,30 @@ test("saga executes steps in order", async () => {
 test("saga compensates on failure", async () => {
   const order: string[] = []
   const result = await createSaga<{ x: number }>()
-    .step({ name: "a", execute: () => { order.push("a") }, compensate: () => { order.push("-a") } })
-    .step({ name: "b", execute: () => { order.push("b") }, compensate: () => { order.push("-b") } })
-    .step({ name: "c", execute: () => { throw new Error("boom") } })
+    .step({
+      name: "a",
+      execute: () => {
+        order.push("a")
+      },
+      compensate: () => {
+        order.push("-a")
+      }
+    })
+    .step({
+      name: "b",
+      execute: () => {
+        order.push("b")
+      },
+      compensate: () => {
+        order.push("-b")
+      }
+    })
+    .step({
+      name: "c",
+      execute: () => {
+        throw new Error("boom")
+      }
+    })
     .run({ x: 1 })
   assert.equal(result.status, "failed")
   assert.deepEqual(order, ["a", "b", "-b", "-a"])
@@ -33,17 +64,28 @@ test("failed compensation yields compensation_failed (not compensated) and hits 
 
   const result = await createSaga<{ reserved: boolean }>("wallet-checkout")
     .withStore(store, sagaId)
-    .withDlq((e) => { dlq.push(e) })
+    .withDlq((e) => {
+      dlq.push(e)
+    })
     .withMetrics(metrics)
     .step({
       name: "reserveWallet",
-      execute: (c) => { c.reserved = true },
+      execute: (c) => {
+        c.reserved = true
+      },
       // Compensation can never succeed → it exhausts its retries and throws.
-      compensate: () => { throw new Error("release failed") },
+      compensate: () => {
+        throw new Error("release failed")
+      },
       compensateRetries: 1,
       compensateBackoff: { baseMs: 1, maxMs: 1, jitter: false }
     })
-    .step({ name: "charge", execute: () => { throw new Error("boom") } })
+    .step({
+      name: "charge",
+      execute: () => {
+        throw new Error("boom")
+      }
+    })
     .run({ reserved: false })
 
   // Overall the saga failed AND compensation did NOT cleanly complete.

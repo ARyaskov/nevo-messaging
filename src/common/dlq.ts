@@ -1,7 +1,10 @@
 import type { MessageMeta } from "./types"
 import { redactObject } from "./redact"
+import { uuidv7 } from "./uuid"
 
 export const DEFAULT_DLQ_SUFFIX = ".dlq"
+
+const REPLAY_ATTEMPTS_CAP = 10_000
 
 export interface DlqEntry {
   id?: string
@@ -46,6 +49,7 @@ export interface DlqStats {
 export interface DlqStore {
   push(entry: DlqEntry): Promise<void>
   list(limit?: number): Promise<DlqEntry[]>
+  listOldest?(limit?: number): Promise<DlqEntry[]>
   query?(q: DlqQuery): Promise<DlqEntry[]>
   stats?(): Promise<DlqStats>
   remove(id: string): Promise<void>
@@ -55,12 +59,19 @@ export interface DlqStore {
 export class InMemoryDlqStore implements DlqStore {
   private readonly entries: DlqEntry[] = []
   private readonly max: number
-  constructor(opts?: { max?: number }) { this.max = opts?.max ?? 1000 }
+  constructor(opts?: { max?: number }) {
+    this.max = opts?.max ?? 1000
+  }
   async push(entry: DlqEntry): Promise<void> {
-    this.entries.push(entry)
+    this.entries.push(entry.id ? entry : { ...entry, id: uuidv7() })
     while (this.entries.length > this.max) this.entries.shift()
   }
-  async list(limit = 100): Promise<DlqEntry[]> { return this.entries.slice(-limit) }
+  async list(limit = 100): Promise<DlqEntry[]> {
+    return this.entries.slice(-limit)
+  }
+  async listOldest(limit = 100): Promise<DlqEntry[]> {
+    return this.entries.slice(0, limit)
+  }
   async query(q: DlqQuery): Promise<DlqEntry[]> {
     const out: DlqEntry[] = []
     const limit = q.limit ?? 100
@@ -97,7 +108,9 @@ export class InMemoryDlqStore implements DlqStore {
     const idx = this.entries.findIndex((e) => e.id === id)
     if (idx >= 0) this.entries.splice(idx, 1)
   }
-  async clear(): Promise<void> { this.entries.length = 0 }
+  async clear(): Promise<void> {
+    this.entries.length = 0
+  }
 }
 
 export interface DlqReplayOptions {
@@ -114,6 +127,8 @@ export class DlqRouter {
   private readonly store: DlqStore | null
   private readonly replayOpts?: DlqReplayOptions
   private replayTimer?: NodeJS.Timeout
+  private replayInProgress = false
+  private readonly replayAttempts = new Map<string, number>()
 
   constructor(opts?: DlqRouterOptions) {
     this.enabled = opts?.enabled !== false
@@ -126,7 +141,9 @@ export class DlqRouter {
     }
   }
 
-  isEnabled(): boolean { return this.enabled }
+  isEnabled(): boolean {
+    return this.enabled
+  }
 
   addSink(sink: DlqSink): void {
     this.sinks.push(sink)
@@ -139,9 +156,11 @@ export class DlqRouter {
 
   async route(entry: DlqEntry): Promise<void> {
     if (!this.enabled) return
-    const safe = this.redact(entry)
+    const safe = this.redact(entry.id ? entry : { ...entry, id: uuidv7() })
     for (const sink of this.sinks) {
-      try { await sink(safe) } catch (err) {
+      try {
+        await sink(safe)
+      } catch (err) {
         console.error("[NevoMessaging][DLQ] sink failed", err)
       }
     }
@@ -150,7 +169,9 @@ export class DlqRouter {
   startReplay(): void {
     if (!this.store || !this.replayOpts?.handler) return
     const intervalMs = this.replayOpts.intervalMs ?? 30_000
-    this.replayTimer = setInterval(() => { void this.replayOnce() }, intervalMs)
+    this.replayTimer = setInterval(() => {
+      void this.replayOnce()
+    }, intervalMs)
     if (typeof this.replayTimer.unref === "function") this.replayTimer.unref()
   }
 
@@ -159,7 +180,9 @@ export class DlqRouter {
     this.replayTimer = undefined
   }
 
-  getStore(): DlqStore | null { return this.store }
+  getStore(): DlqStore | null {
+    return this.store
+  }
 
   async query(q: DlqQuery = {}): Promise<DlqEntry[]> {
     if (!this.store) return []
@@ -183,19 +206,61 @@ export class DlqRouter {
 
   async replayOnce(): Promise<{ replayed: number; skipped: number; failed: number }> {
     if (!this.store || !this.replayOpts?.handler) return { replayed: 0, skipped: 0, failed: 0 }
-    const policy = this.replayOpts.policy ?? (() => true)
-    const handler = this.replayOpts.handler
-    const list = await this.store.list(100)
-    let replayed = 0, skipped = 0, failed = 0
-    for (const e of list) {
-      const allow = await policy(e)
-      if (!allow) { skipped++; continue }
-      try {
-        const ok = await handler(e)
-        if (ok && e.id) await this.store.remove(e.id)
-        if (ok) replayed++; else failed++
-      } catch { failed++ }
+    if (this.replayInProgress) return { replayed: 0, skipped: 0, failed: 0 }
+    this.replayInProgress = true
+    try {
+      const policy = this.replayOpts.policy ?? (() => true)
+      const handler = this.replayOpts.handler
+      const maxAttempts = this.replayOpts.maxAttempts
+      const list = this.store.listOldest ? await this.store.listOldest(100) : await this.store.list(100)
+      let replayed = 0,
+        skipped = 0,
+        failed = 0
+      for (const e of list) {
+        if (maxAttempts !== undefined && e.id !== undefined) {
+          const attempts = this.replayAttempts.get(e.id) ?? e.attempts ?? 0
+          if (attempts >= maxAttempts) {
+            skipped++
+            continue
+          }
+        }
+        const allow = await policy(e)
+        if (!allow) {
+          skipped++
+          continue
+        }
+        try {
+          const ok = await handler(e)
+          if (ok) {
+            if (e.id) {
+              await this.store.remove(e.id)
+              this.replayAttempts.delete(e.id)
+            }
+            replayed++
+          } else {
+            failed++
+            this.bumpReplayAttempts(e)
+          }
+        } catch {
+          failed++
+          this.bumpReplayAttempts(e)
+        }
+      }
+      return { replayed, skipped, failed }
+    } finally {
+      this.replayInProgress = false
     }
-    return { replayed, skipped, failed }
+  }
+
+  private bumpReplayAttempts(e: DlqEntry): void {
+    if (e.id === undefined) return
+    const next = (this.replayAttempts.get(e.id) ?? e.attempts ?? 0) + 1
+    e.attempts = next
+    this.replayAttempts.set(e.id, next)
+    while (this.replayAttempts.size > REPLAY_ATTEMPTS_CAP) {
+      const oldest = this.replayAttempts.keys().next().value
+      if (oldest === undefined) break
+      this.replayAttempts.delete(oldest)
+    }
   }
 }

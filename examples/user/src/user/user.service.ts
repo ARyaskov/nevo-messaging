@@ -1,11 +1,5 @@
 import { Injectable, Inject } from "@nestjs/common"
-import {
-  Cacheable,
-  KafkaClientBase,
-  NevoKafkaClient,
-  RateLimit,
-  Schema
-} from "@riaskov/nevo-messaging"
+import { Cacheable, KafkaClientBase, NevoKafkaClient, RateLimit, Schema } from "@riaskov/nevo-messaging"
 import { z } from "zod"
 
 const GetByIdInput = z.object({ id: z.bigint() })

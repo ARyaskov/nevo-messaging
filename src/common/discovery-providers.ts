@@ -224,10 +224,7 @@ export class ConsulDiscoveryProvider implements DiscoveryProvider {
 // Headless service (clusterIP: None) → A record per pod, or SRV per port.
 
 export interface KubernetesDnsDiscoveryProviderOptions {
-  services: Array<
-    | string
-    | { name: string; namespace?: string; port?: number; portName?: string; transport?: string }
-  >
+  services: Array<string | { name: string; namespace?: string; port?: number; portName?: string; transport?: string }>
   /** Default `svc.cluster.local`. */
   clusterDomain?: string
   defaultNamespace?: string
@@ -307,12 +304,7 @@ export class KubernetesDnsDiscoveryProvider implements DiscoveryProvider {
     }
   }
 
-  private async resolveSrvHost(
-    name: string,
-    host: string,
-    portName: string,
-    transport?: string
-  ): Promise<DiscoveryAnnouncement[]> {
+  private async resolveSrvHost(name: string, host: string, portName: string, transport?: string): Promise<DiscoveryAnnouncement[]> {
     const srvName = `_${portName}._tcp.${host}`
     const records = await this.resolveSrv(srvName)
     const now = Date.now()
@@ -327,12 +319,7 @@ export class KubernetesDnsDiscoveryProvider implements DiscoveryProvider {
     }))
   }
 
-  private async resolveAHost(
-    name: string,
-    host: string,
-    port: number | undefined,
-    transport?: string
-  ): Promise<DiscoveryAnnouncement[]> {
+  private async resolveAHost(name: string, host: string, port: number | undefined, transport?: string): Promise<DiscoveryAnnouncement[]> {
     const addrs = await this.lookup(host)
     const now = Date.now()
     return addrs.map((a) => ({
@@ -351,10 +338,7 @@ export class KubernetesDnsDiscoveryProvider implements DiscoveryProvider {
 // Helper that wires a provider into a registry in one call.
 // ---------------------------------------------------------------------------
 
-export async function attachDiscoveryProvider(
-  registry: DiscoveryRegistry,
-  provider: DiscoveryProvider
-): Promise<() => Promise<void>> {
+export async function attachDiscoveryProvider(registry: DiscoveryRegistry, provider: DiscoveryProvider): Promise<() => Promise<void>> {
   const sink = new RegistryDiscoverySink(registry)
   await provider.start(sink)
   return async () => {

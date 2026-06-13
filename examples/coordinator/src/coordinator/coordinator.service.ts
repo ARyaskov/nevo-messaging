@@ -1,10 +1,5 @@
 import { Injectable, Inject } from "@nestjs/common"
-import {
-  KafkaClientBase,
-  NevoKafkaClient,
-  Outbox,
-  createSaga
-} from "@riaskov/nevo-messaging"
+import { KafkaClientBase, NevoKafkaClient, Outbox, createSaga } from "@riaskov/nevo-messaging"
 
 interface PlaceOrderCtx {
   userId: bigint
@@ -43,9 +38,7 @@ export class CoordinatorService extends KafkaClientBase {
       .step({
         name: "reserveWallet",
         execute: async (ctx) => {
-          const r = await this.query<{ reservationId: string }>(
-            "wallet", "wallet.reserve", { userId: ctx.userId, amount: ctx.amount }
-          )
+          const r = await this.query<{ reservationId: string }>("wallet", "wallet.reserve", { userId: ctx.userId, amount: ctx.amount })
           ctx.reservationId = r.reservationId
         },
         compensate: async (ctx) => {
@@ -60,9 +53,7 @@ export class CoordinatorService extends KafkaClientBase {
       .step({
         name: "chargeUser",
         execute: async (ctx) => {
-          const r = await this.query<{ chargeId: string }>(
-            "user", "user.charge", { userId: ctx.userId, amount: ctx.amount }
-          )
+          const r = await this.query<{ chargeId: string }>("user", "user.charge", { userId: ctx.userId, amount: ctx.amount })
           ctx.chargeId = r.chargeId
         },
         compensate: async (ctx) => {

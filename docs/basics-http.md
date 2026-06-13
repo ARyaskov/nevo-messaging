@@ -77,10 +77,10 @@ The `serviceUrls` map is `{ <serviceName>: <baseUrl> }`. The framework appends `
 | `socketKeepAliveMs` | Idle interval for TCP keepalive |
 | `recvBufferSize` | OS receive buffer hint |
 | `cacheableDns` | Memoise DNS lookups (peer-optional dep `cacheable-lookup`) |
-| `useUndici` | Use undici's pooled agent (peer-optional dep `undici`) |
+| `useUndici` | Use undici's pooled `Agent` for query, SSE, and discovery requests (peer-optional dep `undici`) |
 | `useMessagePack` | Force MessagePack codec on outbound (otherwise inferred) |
 
-The peer-optional deps are loaded with try/catch and silently fall back if not installed.
+`cacheable-lookup` is optional and falls back to the standard resolver when unavailable. `useUndici: true` is explicit: startup throws a configuration error when the optional `undici` package is not installed. The undici dispatcher is closed by `client.close()`.
 
 ## Authentication
 

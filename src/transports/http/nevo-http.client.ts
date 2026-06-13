@@ -106,6 +106,9 @@ export class NevoHttpClient {
   private readonly metaStaticPart: Pick<MessageMeta, "service" | "instanceId" | "auth" | "codec">
   private readonly tcpNoDelay: boolean = true
   private readonly recvBufferSize?: number
+  private readonly useUndici: boolean
+  private readonly undiciDispatcher?: { close(): Promise<void> | void }
+  private readonly undiciRequest?: (url: string, opts: Record<string, unknown>) => Promise<any>
 
   constructor(serviceUrls: Record<string, string>, options?: NevoHttpClientOptions) {
     this.serviceUrls = new Map(Object.entries(serviceUrls).map(([k, v]) => [k.toLowerCase(), v]))
@@ -116,7 +119,9 @@ export class NevoHttpClient {
     this.authToken = options?.authToken
     this.logger = (options?.logger as NevoLogger) || getDefaultLogger().child({ component: "http-client", service: this.serviceName })
     this.codec = options?.codec
-      ? (typeof options.codec === "string" ? getCodec(options.codec) : (options.codec as Codec))
+      ? typeof options.codec === "string"
+        ? getCodec(options.codec)
+        : (options.codec as Codec)
       : options?.useMessagePack === false
         ? new JsonCodec()
         : tryMsgpackOrJson()
@@ -135,7 +140,7 @@ export class NevoHttpClient {
     this.host = options?.discovery?.host
     this.port = options?.discovery?.port
     this.version = options?.discovery?.version
-    this.devtoolsBus = options?.devtools === false ? null : (options?.devtools instanceof Object ? (options.devtools as DevToolsBus) : getDevToolsBus())
+    this.devtoolsBus = options?.devtools === false ? null : options?.devtools instanceof Object ? (options.devtools as DevToolsBus) : getDevToolsBus()
     this.metaStaticPart = Object.freeze({
       service: this.serviceName,
       instanceId: this.instanceId,
@@ -149,6 +154,25 @@ export class NevoHttpClient {
     const keepAliveMsecs = options?.socketKeepAliveMs ?? 1000
     this.httpAgent = new http.Agent({ keepAlive, maxSockets, maxFreeSockets, keepAliveMsecs })
     this.httpsAgent = new https.Agent({ keepAlive, maxSockets, maxFreeSockets, keepAliveMsecs })
+    this.useUndici = options?.useUndici === true
+    if (this.useUndici) {
+      try {
+        const undici = nodeRequire("undici") as {
+          Agent: new (opts?: Record<string, unknown>) => { close(): Promise<void> | void }
+          request: (url: string, opts: Record<string, unknown>) => Promise<any>
+        }
+        this.undiciDispatcher = new undici.Agent({
+          connections: Number.isFinite(maxSockets) ? maxSockets : undefined,
+          keepAliveTimeout: keepAliveMsecs,
+          keepAliveMaxTimeout: Math.max(keepAliveMsecs, 10_000)
+        })
+        this.undiciRequest = undici.request
+      } catch (err: any) {
+        throw new MessagingError(ErrorCode.INTERNAL, {
+          message: `useUndici requires the optional "undici" dependency: ${err?.message ?? err}`
+        })
+      }
+    }
 
     if (options?.cacheableDns) {
       try {
@@ -171,9 +195,14 @@ export class NevoHttpClient {
     }
   }
 
-  getInstanceId(): string { return this.instanceId }
+  getInstanceId(): string {
+    return this.instanceId
+  }
 
-  private buildMeta(type: MessageType, opts?: { idempotencyKey?: string; version?: string; headers?: Record<string, string>; tenantId?: string }): MessageMeta {
+  private buildMeta(
+    type: MessageType,
+    opts?: { idempotencyKey?: string; version?: string; headers?: Record<string, string>; tenantId?: string }
+  ): MessageMeta {
     const baseMeta: MessageMeta = {
       ...this.metaStaticPart,
       type,
@@ -187,8 +216,13 @@ export class NevoHttpClient {
     return this.tracer.inject(baseMeta)
   }
 
-  private createBodySync(method: string, params: unknown, type: MessageType, opts?: any): { buf: Uint8Array; meta: MessageMeta; uuid: string; encoding: "gzip" | "deflate" | "zstd" | "identity"; versionedMethod: string } {
-    const uuid = uuidv7()
+  private createBodySync(
+    method: string,
+    params: unknown,
+    type: MessageType,
+    opts?: any
+  ): { buf: Uint8Array; meta: MessageMeta; uuid: string; encoding: "gzip" | "deflate" | "zstd" | "identity"; versionedMethod: string } {
+    const uuid = opts?.uuid ?? uuidv7()
     const meta = this.buildMeta(type, opts)
     const versionedMethod = method.includes("@") ? method : formatMethod(method, opts?.version || DEFAULT_METHOD_VERSION)
     const envelope = { uuid, method: versionedMethod, params, meta }
@@ -198,17 +232,33 @@ export class NevoHttpClient {
     }
     const compressed = maybeCompress(raw, this.compression)
     meta.contentEncoding = compressed.encoding
-    this.metrics.observeHistogram(NEVO_METRIC_NAMES.payloadBytes, { direction: "out", service: this.serviceName ?? "unknown" }, compressed.data.byteLength)
+    this.metrics.observeHistogram(
+      NEVO_METRIC_NAMES.payloadBytes,
+      { direction: "out", service: this.serviceName ?? "unknown" },
+      compressed.data.byteLength
+    )
     return { buf: compressed.data, meta, uuid, encoding: compressed.encoding, versionedMethod }
   }
 
-  private createBody(method: string, params: unknown, type: MessageType, opts?: any): { buf: Uint8Array; meta: MessageMeta; uuid: string; encoding: "gzip" | "deflate" | "zstd" | "identity"; versionedMethod: string } | Promise<{ buf: Uint8Array; meta: MessageMeta; uuid: string; encoding: "gzip" | "deflate" | "zstd" | "identity"; versionedMethod: string }> {
+  private createBody(
+    method: string,
+    params: unknown,
+    type: MessageType,
+    opts?: any
+  ):
+    | { buf: Uint8Array; meta: MessageMeta; uuid: string; encoding: "gzip" | "deflate" | "zstd" | "identity"; versionedMethod: string }
+    | Promise<{ buf: Uint8Array; meta: MessageMeta; uuid: string; encoding: "gzip" | "deflate" | "zstd" | "identity"; versionedMethod: string }> {
     if (this.compression.async && this.compression.enabled) return this.createBodyAsync(method, params, type, opts)
     return this.createBodySync(method, params, type, opts)
   }
 
-  private async createBodyAsync(method: string, params: unknown, type: MessageType, opts?: any): Promise<{ buf: Uint8Array; meta: MessageMeta; uuid: string; encoding: "gzip" | "deflate" | "zstd" | "identity"; versionedMethod: string }> {
-    const uuid = uuidv7()
+  private async createBodyAsync(
+    method: string,
+    params: unknown,
+    type: MessageType,
+    opts?: any
+  ): Promise<{ buf: Uint8Array; meta: MessageMeta; uuid: string; encoding: "gzip" | "deflate" | "zstd" | "identity"; versionedMethod: string }> {
+    const uuid = opts?.uuid ?? uuidv7()
     const meta = this.buildMeta(type, opts)
     const versionedMethod = method.includes("@") ? method : formatMethod(method, opts?.version || DEFAULT_METHOD_VERSION)
     const envelope = { uuid, method: versionedMethod, params, meta }
@@ -218,7 +268,11 @@ export class NevoHttpClient {
     }
     const compressed = await maybeCompressAsync(raw, this.compression)
     meta.contentEncoding = compressed.encoding
-    this.metrics.observeHistogram(NEVO_METRIC_NAMES.payloadBytes, { direction: "out", service: this.serviceName ?? "unknown" }, compressed.data.byteLength)
+    this.metrics.observeHistogram(
+      NEVO_METRIC_NAMES.payloadBytes,
+      { direction: "out", service: this.serviceName ?? "unknown" },
+      compressed.data.byteLength
+    )
     return { buf: compressed.data, meta, uuid, encoding: compressed.encoding, versionedMethod }
   }
 
@@ -226,12 +280,33 @@ export class NevoHttpClient {
     const normalized = normalizeServiceName(serviceName)
     const url = this.serviceUrls.get(normalized)
     if (!url) {
-      throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, { message: `Service "${serviceName}" is not registered in nevo http client`, availableServices: this.serviceUrls.keys().toArray() })
+      throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, {
+        message: `Service "${serviceName}" is not registered in nevo http client`,
+        availableServices: this.serviceUrls.keys().toArray()
+      })
     }
     return url.replace(/\/+$/, "")
   }
 
-  private async sendBuffer(url: string, body: Uint8Array, contentType: string, encoding: "gzip" | "deflate" | "zstd" | "identity", headers?: Record<string, string>, timeoutMs?: number): Promise<{ status: number; body: Uint8Array; headers: Record<string, string> }> {
+  private decodeResponseBody(data: Uint8Array, contentType?: string): unknown {
+    if (contentType) {
+      if (contentType.includes("json") && !this.codec.contentType.includes("json")) return getCodec("json").decode(data)
+      if (contentType.includes("msgpack") && !this.codec.contentType.includes("msgpack")) return getCodec("msgpack").decode(data)
+    }
+    return this.codec.decode(data)
+  }
+
+  private async sendBuffer(
+    url: string,
+    body: Uint8Array,
+    contentType: string,
+    encoding: "gzip" | "deflate" | "zstd" | "identity",
+    headers?: Record<string, string>,
+    timeoutMs?: number
+  ): Promise<{ status: number; body: Uint8Array; headers: Record<string, string> }> {
+    if (this.useUndici) {
+      return this.sendBufferUndici(url, body, contentType, encoding, headers, timeoutMs)
+    }
     const u = new URL(url)
     const lib = u.protocol === "https:" ? https : http
     const agent = u.protocol === "https:" ? this.httpsAgent : this.httpAgent
@@ -253,7 +328,11 @@ export class NevoHttpClient {
 
     const { promise, resolve, reject } = Promise.withResolvers<{ status: number; body: Uint8Array; headers: Record<string, string> }>()
     const req = lib.request(reqOpts, (res) => {
-      if (this.recvBufferSize) { try { (res.socket as any)?.setRecvBufferSize?.(this.recvBufferSize) } catch {} }
+      if (this.recvBufferSize) {
+        try {
+          ;(res.socket as any)?.setRecvBufferSize?.(this.recvBufferSize)
+        } catch {}
+      }
       const expected = Number(res.headers["content-length"])
       const knownLen = Number.isFinite(expected) && expected > 0 ? expected : -1
       let preBuf: Buffer | null = knownLen > 0 ? Buffer.allocUnsafe(knownLen) : null
@@ -281,15 +360,24 @@ export class NevoHttpClient {
       })
     })
     // Wall-clock deadline alongside the socket-inactivity timeout below.
-    const deadline = setTimeout(() => { req.destroy(new Error("timeout")) }, timeoutMs ?? this.timeoutMs)
+    const deadline = setTimeout(() => {
+      req.destroy(new Error("timeout"))
+    }, timeoutMs ?? this.timeoutMs)
     req.setTimeout(timeoutMs ?? this.timeoutMs, () => {
       req.destroy(new Error("timeout"))
     })
-    req.on("error", (err) => { clearTimeout(deadline); reject(err) })
+    req.on("error", (err) => {
+      clearTimeout(deadline)
+      reject(err)
+    })
     if (this.tcpNoDelay) {
       req.on("socket", (socket) => {
-        try { socket.setNoDelay(true) } catch {}
-        try { socket.setKeepAlive(true, 1000) } catch {}
+        try {
+          socket.setNoDelay(true)
+        } catch {}
+        try {
+          socket.setKeepAlive(true, 1000)
+        } catch {}
       })
     }
     req.write(body)
@@ -297,90 +385,190 @@ export class NevoHttpClient {
     return promise
   }
 
-  async query<T = unknown>(serviceName: string, method: string, params: unknown, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; timeoutMs?: number; tenantId?: string }): Promise<T> {
+  private async sendBufferUndici(
+    url: string,
+    body: Uint8Array,
+    contentType: string,
+    encoding: "gzip" | "deflate" | "zstd" | "identity",
+    headers?: Record<string, string>,
+    timeoutMs?: number
+  ): Promise<{ status: number; body: Uint8Array; headers: Record<string, string> }> {
+    if (!this.undiciRequest || !this.undiciDispatcher) {
+      throw new MessagingError(ErrorCode.INTERNAL, { message: "Undici dispatcher is not initialized" })
+    }
+    const timeout = timeoutMs ?? this.timeoutMs
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(new Error("timeout")), timeout)
+    if (typeof timer.unref === "function") timer.unref()
+    try {
+      const response = await this.undiciRequest(url, {
+        method: "POST",
+        dispatcher: this.undiciDispatcher,
+        signal: controller.signal,
+        headersTimeout: timeout,
+        bodyTimeout: timeout,
+        headers: {
+          "content-type": contentType,
+          "content-length": String(body.byteLength),
+          accept: contentType,
+          ...(encoding !== "identity" ? { "content-encoding": encoding } : {}),
+          ...(headers || {})
+        },
+        body
+      })
+      const arrayBuffer = await response.body.arrayBuffer()
+      const responseHeaders: Record<string, string> = {}
+      for (const [key, value] of Object.entries(response.headers ?? {})) {
+        responseHeaders[key] = Array.isArray(value) ? value.join(",") : String(value)
+      }
+      return {
+        status: Number(response.statusCode) || 0,
+        body: new Uint8Array(arrayBuffer),
+        headers: responseHeaders
+      }
+    } catch (err) {
+      if (controller.signal.aborted) throw new Error("timeout")
+      throw err
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  async query<T = unknown>(
+    serviceName: string,
+    method: string,
+    params: unknown,
+    opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; timeoutMs?: number; tenantId?: string }
+  ): Promise<T> {
     const cbKey = `${normalizeServiceName(serviceName)}:${method}`
     const url = this.getServiceUrl(serviceName)
     const endpoint = `${url}/${normalizeServiceName(serviceName)}${DEFAULT_EVENTS_SUFFIX}`
 
-    return this.shutdown.trackInflight((async () => {
-      if (opts?.idempotencyKey && this.idempotencyCache.isEnabled() && this.idempotencyCache.has(opts.idempotencyKey)) {
-        return this.idempotencyCache.get(opts.idempotencyKey) as T
-      }
-
-      const result = await withRetry(async (attempt) => {
-        this.circuitBreaker.before(cbKey)
-        const startMs = Date.now()
-        let lastUuid: string | undefined
-        let lastChainId: string | undefined
-        try {
-          const { buf, encoding, uuid, meta } = await this.createBody(method, params, "query", { ...opts, headers: { ...(opts?.headers || {}), "nevo-attempt": String(attempt) } })
-          lastUuid = uuid
-          lastChainId = meta.nevoChainId
-          const span = this.tracer.startSpan(`nevo.client.query ${serviceName}.${method}`, { "nevo.method": method, "nevo.service": serviceName, "nevo.attempt": attempt })
-          try {
-            const res = await this.sendBuffer(endpoint, buf, this.codec.contentType, encoding, undefined, opts?.timeoutMs)
-            this.metrics.observeHistogram(NEVO_METRIC_NAMES.payloadBytes, { direction: "in", service: this.serviceName ?? "unknown" }, res.body.byteLength)
-            const respEncoding = res.headers["content-encoding"]
-            const decompressed = shouldDecompressAsync(res.body.byteLength, respEncoding)
-              ? await maybeDecompressAsync(res.body, respEncoding, this.maxPayloadBytes)
-              : maybeDecompress(res.body, respEncoding, this.maxPayloadBytes)
-            enforcePayloadLimit(decompressed, this.maxPayloadBytes)
-            let payload: any
-            try {
-              payload = decompressed.byteLength === 0 ? undefined : this.codec.decode(decompressed)
-            } catch (decodeErr) {
-              // Non-nevo error body may not decode; prefer the HTTP status.
-              if (res.status >= 400) throw httpStatusToError(res.status, serviceName)
-              throw decodeErr
-            }
-            if (payload?.params?.result === "error" && payload?.params?.error) {
-              const err = payload.params.error
-              throw new MessagingError(err.code, err.details ?? { message: err.message }, err.service || serviceName)
-            }
-            // Non-envelope error status must not count as success.
-            if (res.status >= 400) throw httpStatusToError(res.status, serviceName)
-            this.circuitBreaker.onSuccess(cbKey)
-            span.setStatus({ code: 1 })
-            publishClientEvent(this.devtoolsBus, { service: serviceName, method, uuid, chainId: lastChainId, durationMs: Date.now() - startMs, status: "ok", transport: "http", origin: this.serviceName })
-            return payload?.params?.result as T
-          } catch (err: any) {
-            span.recordException(err)
-            span.setStatus({ code: 2, message: err?.message })
-            if (err?.message === "timeout") throw new TimeoutError(serviceName, method, opts?.timeoutMs ?? this.timeoutMs)
-            throw err
-          } finally {
-            span.end()
-            this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, { transport: "http", service: serviceName, method: methodLabel(method), role: "client" })
-            if (attempt > 1) this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "http", service: serviceName, method: methodLabel(method) })
-          }
-        } catch (err: any) {
-          this.circuitBreaker.onFailure(cbKey, err)
-          publishClientEvent(this.devtoolsBus, {
-            service: serviceName, method, uuid: lastUuid, chainId: lastChainId,
-            durationMs: Date.now() - startMs, status: "error", transport: "http", origin: this.serviceName,
-            error: { code: err instanceof MessagingError ? err.code : err?.code, message: err?.message ?? String(err) }
-          })
-          throw err
+    return this.shutdown.trackInflight(
+      (async () => {
+        if (opts?.idempotencyKey && this.idempotencyCache.isEnabled() && this.idempotencyCache.has(opts.idempotencyKey)) {
+          return this.idempotencyCache.get(opts.idempotencyKey) as T
         }
-      }, this.retryOptions)
 
-      if (opts?.idempotencyKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(opts.idempotencyKey, result)
-      return result
-    })())
+        const requestUuid = uuidv7()
+        const result = await withRetry(async (attempt) => {
+          this.circuitBreaker.before(cbKey)
+          const startMs = Date.now()
+          let lastUuid: string | undefined
+          let lastChainId: string | undefined
+          try {
+            const { buf, encoding, uuid, meta } = await this.createBody(method, params, "query", {
+              ...opts,
+              uuid: requestUuid,
+              headers: { ...(opts?.headers || {}), "nevo-attempt": String(attempt) }
+            })
+            lastUuid = uuid
+            lastChainId = meta.nevoChainId
+            const span = this.tracer.startSpan(`nevo.client.query ${serviceName}.${method}`, {
+              "nevo.method": method,
+              "nevo.service": serviceName,
+              "nevo.attempt": attempt
+            })
+            try {
+              const res = await this.sendBuffer(endpoint, buf, this.codec.contentType, encoding, undefined, opts?.timeoutMs)
+              this.metrics.observeHistogram(
+                NEVO_METRIC_NAMES.payloadBytes,
+                { direction: "in", service: this.serviceName ?? "unknown" },
+                res.body.byteLength
+              )
+              const respEncoding = res.headers["content-encoding"]
+              const decompressed = shouldDecompressAsync(res.body.byteLength, respEncoding)
+                ? await maybeDecompressAsync(res.body, respEncoding, this.maxPayloadBytes)
+                : maybeDecompress(res.body, respEncoding, this.maxPayloadBytes)
+              enforcePayloadLimit(decompressed, this.maxPayloadBytes)
+              let payload: any
+              try {
+                payload = decompressed.byteLength === 0 ? undefined : this.decodeResponseBody(decompressed, res.headers["content-type"])
+              } catch (decodeErr) {
+                // Non-nevo error body may not decode; prefer the HTTP status.
+                if (res.status >= 400) throw httpStatusToError(res.status, serviceName)
+                throw decodeErr
+              }
+              if (payload?.params?.result === "error" && payload?.params?.error) {
+                const err = payload.params.error
+                throw new MessagingError(err.code, err.details ?? { message: err.message }, err.service || serviceName)
+              }
+              // Non-envelope error status must not count as success.
+              if (res.status >= 400) throw httpStatusToError(res.status, serviceName)
+              this.circuitBreaker.onSuccess(cbKey)
+              span.setStatus({ code: 1 })
+              publishClientEvent(this.devtoolsBus, {
+                service: serviceName,
+                method,
+                uuid,
+                chainId: lastChainId,
+                durationMs: Date.now() - startMs,
+                status: "ok",
+                transport: "http",
+                origin: this.serviceName
+              })
+              return payload?.params?.result as T
+            } catch (err: any) {
+              span.recordException(err)
+              span.setStatus({ code: 2, message: err?.message })
+              if (err?.message === "timeout") throw new TimeoutError(serviceName, method, opts?.timeoutMs ?? this.timeoutMs)
+              throw err
+            } finally {
+              span.end()
+              this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, {
+                transport: "http",
+                service: serviceName,
+                method: methodLabel(method),
+                role: "client"
+              })
+              if (attempt > 1)
+                this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "http", service: serviceName, method: methodLabel(method) })
+            }
+          } catch (err: any) {
+            this.circuitBreaker.onFailure(cbKey, err)
+            publishClientEvent(this.devtoolsBus, {
+              service: serviceName,
+              method,
+              uuid: lastUuid,
+              chainId: lastChainId,
+              durationMs: Date.now() - startMs,
+              status: "error",
+              transport: "http",
+              origin: this.serviceName,
+              error: { code: err instanceof MessagingError ? err.code : err?.code, message: err?.message ?? String(err) }
+            })
+            throw err
+          }
+        }, this.retryOptions)
+
+        if (opts?.idempotencyKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(opts.idempotencyKey, result)
+        return result
+      })()
+    )
   }
 
-  async emit(serviceName: string, method: string, params: unknown, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<void> {
+  async emit(
+    serviceName: string,
+    method: string,
+    params: unknown,
+    opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }
+  ): Promise<void> {
     const url = this.getServiceUrl(serviceName)
     const endpoint = `${url}/${normalizeServiceName(serviceName)}${DEFAULT_EVENTS_SUFFIX}`
     const { buf, encoding } = await this.createBody(method, params, "emit", opts)
-    await this.sendBuffer(endpoint, buf, this.codec.contentType, encoding)
+    const res = await this.sendBuffer(endpoint, buf, this.codec.contentType, encoding)
+    if (res.status >= 400) throw httpStatusToError(res.status, serviceName)
   }
 
   async publish(serviceName: string, method: string, params: unknown, opts?: { version?: string; headers?: Record<string, string> }): Promise<void> {
     const url = this.getServiceUrl(serviceName)
     const endpoint = `${url}/__nevo/publish`
-    const { buf, encoding } = await this.createBody(method, params, "sub", { ...opts, headers: { ...(opts?.headers || {}), "nevo-service": serviceName } })
-    await this.sendBuffer(endpoint, buf, this.codec.contentType, encoding)
+    const { buf, encoding } = await this.createBody(method, params, "sub", {
+      ...opts,
+      headers: { ...(opts?.headers || {}), "nevo-service": serviceName }
+    })
+    const res = await this.sendBuffer(endpoint, buf, this.codec.contentType, encoding)
+    if (res.status >= 400) throw httpStatusToError(res.status, serviceName)
   }
 
   async broadcast(method: string, params: unknown, opts?: { version?: string; headers?: Record<string, string> }): Promise<void> {
@@ -388,7 +576,8 @@ export class NevoHttpClient {
     if (!url) throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, { message: "No base URL available for broadcast" })
     const endpoint = `${url.replace(/\/+$/, "")}/${DEFAULT_BROADCAST_TOPIC}`
     const { buf, encoding } = await this.createBody(method, params, "broadcast", opts)
-    await this.sendBuffer(endpoint, buf, this.codec.contentType, encoding)
+    const res = await this.sendBuffer(endpoint, buf, this.codec.contentType, encoding)
+    if (res.status >= 400) throw httpStatusToError(res.status, DEFAULT_BROADCAST_TOPIC)
   }
 
   async subscribe<T = unknown>(
@@ -399,7 +588,7 @@ export class NevoHttpClient {
   ): Promise<Subscription> {
     const normalized = normalizeServiceName(serviceName)
     const isBroadcast = normalized === DEFAULT_BROADCAST_TOPIC
-    const baseUrl = isBroadcast ? (this.discoveryUrl || this.serviceUrls.values().next().value) : this.getServiceUrl(serviceName)
+    const baseUrl = isBroadcast ? this.discoveryUrl || this.serviceUrls.values().next().value : this.getServiceUrl(serviceName)
     if (!baseUrl) throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, { message: "No base URL available for subscription" })
 
     const endpoint = isBroadcast
@@ -407,21 +596,27 @@ export class NevoHttpClient {
       : `${baseUrl.replace(/\/+$/, "")}/__nevo/subscribe?service=${encodeURIComponent(serviceName)}`
 
     const controller = new AbortController()
-    const response = await fetch(endpoint, { headers: { Accept: "text/event-stream" }, signal: controller.signal })
+    const signal = controller.signal
 
-    if (!response.ok || !response.body) {
-      throw new MessagingError(ErrorCode.SERVICE_UNAVAILABLE, { message: `Failed to subscribe via SSE: ${response.status}` })
+    const connect = async (): Promise<ReadableStreamDefaultReader<Uint8Array>> => {
+      const response = await fetch(endpoint, {
+        headers: { Accept: "text/event-stream" },
+        signal,
+        ...(this.undiciDispatcher ? { dispatcher: this.undiciDispatcher } : {})
+      } as RequestInit)
+      if (!response.ok || !response.body) {
+        throw new MessagingError(ErrorCode.SERVICE_UNAVAILABLE, { message: `Failed to subscribe via SSE: ${response.status}` })
+      }
+      return response.body.getReader()
     }
 
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ""
-
-    const readLoop = async () => {
+    const consume = async (reader: ReadableStreamDefaultReader<Uint8Array>) => {
+      const decoder = new TextDecoder()
+      let buffer = ""
       for (;;) {
         const { value, done } = await reader.read()
         if (done) break
-        buffer += decoder.decode(value)
+        buffer += decoder.decode(value, { stream: true })
         const parts = buffer.split("\n\n")
         buffer = parts.pop() || ""
         for (const part of parts) {
@@ -430,7 +625,7 @@ export class NevoHttpClient {
           const raw = line.replace(/^data:\s*/, "")
           let payload: any
           try {
-            payload = parseWithBigInt(raw, { acceptLegacy: true })
+            payload = parseWithBigInt(raw)
           } catch {
             continue
           }
@@ -449,30 +644,77 @@ export class NevoHttpClient {
         }
       }
     }
-    void readLoop()
+
+    const initialReader = await connect()
+
+    const readLoop = async (firstReader: ReadableStreamDefaultReader<Uint8Array>) => {
+      let reader: ReadableStreamDefaultReader<Uint8Array> | null = firstReader
+      for (let attempt = 0; ; ) {
+        if (reader) {
+          try {
+            await consume(reader)
+            if (!signal.aborted) this.logger.warn({ event: "http.sub.stream_closed", service: serviceName })
+          } catch (err: any) {
+            if (signal.aborted || isAbortError(err)) return
+            this.logger.error({ event: "http.sub.read_error", service: serviceName, err: err?.message })
+          }
+          reader = null
+        }
+        if (signal.aborted) return
+        attempt++
+        await sleepUnlessAborted(reconnectDelayMs(attempt), signal)
+        if (signal.aborted) return
+        try {
+          reader = await connect()
+          attempt = 0
+          this.logger.info({ event: "http.sub.reconnected", service: serviceName })
+        } catch (err: any) {
+          if (signal.aborted || isAbortError(err)) return
+          this.logger.warn({ event: "http.sub.reconnect_failed", service: serviceName, attempt, err: err?.message })
+        }
+      }
+    }
+    void readLoop(initialReader)
 
     return { unsubscribe: async () => controller.abort() }
   }
 
-  getAvailableServices(): string[] { return this.serviceUrls.keys().toArray() }
-  getDiscoveredServices() { this.discoveryRegistry.prune(this.discoveryTtlMs); return this.discoveryRegistry.list() }
-  isServiceAvailable(serviceName: string): boolean { return this.discoveryRegistry.isAvailable(serviceName, this.discoveryTtlMs) }
+  getAvailableServices(): string[] {
+    return this.serviceUrls.keys().toArray()
+  }
+  getDiscoveredServices() {
+    this.discoveryRegistry.prune(this.discoveryTtlMs)
+    return this.discoveryRegistry.list()
+  }
+  isServiceAvailable(serviceName: string): boolean {
+    return this.discoveryRegistry.isAvailable(serviceName, this.discoveryTtlMs)
+  }
 
   private async initDiscovery(): Promise<void> {
     if (!this.discoveryUrl) return
     this.discoveryAbort = new AbortController()
+    const signal = this.discoveryAbort.signal
     const discoveryEndpoint = `${this.discoveryUrl.replace(/\/+$/, "")}/${DEFAULT_DISCOVERY_TOPIC}`
-    try {
-      const response = await fetch(discoveryEndpoint, { headers: { Accept: "text/event-stream" }, signal: this.discoveryAbort.signal })
-      if (response.ok && response.body) {
-        const reader = response.body.getReader()
-        const decoder = new TextDecoder()
-        let buffer = ""
-        ;(async () => {
+
+    const listenLoop = async () => {
+      for (let attempt = 0; ; ) {
+        try {
+          const response = await fetch(discoveryEndpoint, {
+            headers: { Accept: "text/event-stream" },
+            signal,
+            ...(this.undiciDispatcher ? { dispatcher: this.undiciDispatcher } : {})
+          } as RequestInit)
+          if (!response.ok || !response.body) {
+            throw new MessagingError(ErrorCode.SERVICE_UNAVAILABLE, { message: `Discovery stream returned HTTP ${response.status}` })
+          }
+          attempt = 0
+          const reader = response.body.getReader()
+          const decoder = new TextDecoder()
+          let buffer = ""
           for (;;) {
             const { value, done } = await reader.read()
             if (done) break
-            buffer += decoder.decode(value)
+            buffer += decoder.decode(value, { stream: true })
             const parts = buffer.split("\n\n")
             buffer = parts.pop() || ""
             for (const part of parts) {
@@ -480,16 +722,22 @@ export class NevoHttpClient {
               if (!line) continue
               const raw = line.replace(/^data:\s*/, "")
               try {
-                const payload = parseWithBigInt(raw, { acceptLegacy: true }) as DiscoveryAnnouncement
+                const payload = parseWithBigInt(raw) as DiscoveryAnnouncement
                 if (payload?.serviceName) this.discoveryRegistry.update(payload)
               } catch {}
             }
           }
-        })()
+        } catch (err: any) {
+          if (signal.aborted || isAbortError(err)) return
+          this.logger.warn({ event: "http.discovery.connect_failed", err: err?.message })
+        }
+        if (signal.aborted) return
+        attempt++
+        await sleepUnlessAborted(reconnectDelayMs(attempt), signal)
+        if (signal.aborted) return
       }
-    } catch (err) {
-      this.logger.warn({ event: "http.discovery.connect_failed", err: (err as Error)?.message })
     }
+    void listenLoop()
 
     this.discoveryTimer = setInterval(async () => {
       const announcement: DiscoveryAnnouncement = {
@@ -515,10 +763,35 @@ export class NevoHttpClient {
     if (this.discoveryTimer) clearInterval(this.discoveryTimer)
     this.discoveryRegistry.stopBackgroundPrune()
     if (this.discoveryAbort) this.discoveryAbort.abort()
+    try {
+      await this.undiciDispatcher?.close()
+    } catch {}
     this.httpAgent.destroy()
     this.httpsAgent.destroy()
     await this.shutdown.shutdown(timeoutMs)
   }
+}
+
+function isAbortError(err: unknown): boolean {
+  return (err as Error)?.name === "AbortError"
+}
+
+function reconnectDelayMs(attempt: number): number {
+  return Math.min(30_000, 1000 * 2 ** Math.min(attempt - 1, 5))
+}
+
+function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const onAbort = () => {
+      clearTimeout(timer)
+      resolve()
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort)
+      resolve()
+    }, ms)
+    signal.addEventListener("abort", onAbort, { once: true })
+  })
 }
 
 function tryMsgpackOrJson(): Codec {
@@ -538,7 +811,11 @@ function httpStatusToError(status: number, serviceName: string): MessagingError 
       return new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, { message: `Remote returned HTTP ${status}`, httpStatus: status }, serviceName)
     case 502:
     case 503:
-      return new MessagingError(ErrorCode.SERVICE_UNAVAILABLE, { message: `Remote returned HTTP ${status}`, httpStatus: status, retryable: true }, serviceName)
+      return new MessagingError(
+        ErrorCode.SERVICE_UNAVAILABLE,
+        { message: `Remote returned HTTP ${status}`, httpStatus: status, retryable: true },
+        serviceName
+      )
     case 504:
       return new MessagingError(ErrorCode.TIMEOUT, { message: `Remote returned HTTP ${status}`, httpStatus: status, retryable: true }, serviceName)
     default:

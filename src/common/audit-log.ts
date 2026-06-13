@@ -53,7 +53,9 @@ export class AuditLog {
     this.logger = (opts?.logger ?? getDefaultLogger()).child({ component: "audit" })
   }
 
-  isEnabled(): boolean { return this.enabled }
+  isEnabled(): boolean {
+    return this.enabled
+  }
 
   /** Record one request/response. Never throws — sink errors are logged. */
   async record(entry: Omit<AuditEntry, "params" | "result"> & { params: unknown; result?: unknown }): Promise<void> {
@@ -62,10 +64,7 @@ export class AuditLog {
     try {
       await this.sink.write(normalised)
     } catch (err) {
-      this.logger.warn(
-        { event: "audit.sink.failed", uuid: entry.uuid, err: (err as Error)?.message },
-        "Audit sink write failed; entry dropped"
-      )
+      this.logger.warn({ event: "audit.sink.failed", uuid: entry.uuid, err: (err as Error)?.message }, "Audit sink write failed; entry dropped")
     }
   }
 
@@ -139,13 +138,19 @@ export class AuditLog {
 export class InMemoryAuditSink implements AuditSink {
   private readonly entries: AuditEntry[] = []
   private readonly max: number
-  constructor(maxEntries = 10_000) { this.max = maxEntries }
+  constructor(maxEntries = 10_000) {
+    this.max = maxEntries
+  }
   write(entry: AuditEntry): void {
     this.entries.push(entry)
     if (this.entries.length > this.max) this.entries.shift()
   }
-  list(): AuditEntry[] { return [...this.entries] }
-  clear(): void { this.entries.length = 0 }
+  list(): AuditEntry[] {
+    return [...this.entries]
+  }
+  clear(): void {
+    this.entries.length = 0
+  }
 }
 
 export interface FileAuditSinkOptions {
@@ -190,13 +195,18 @@ export class FileAuditSink implements AuditSink {
     if (this.buffer.length >= this.opts.batchSize) {
       await this.flush()
     } else if (!this.timer) {
-      this.timer = setTimeout(() => { void this.flush() }, this.opts.flushIntervalMs)
+      this.timer = setTimeout(() => {
+        void this.flush()
+      }, this.opts.flushIntervalMs)
       if (typeof this.timer.unref === "function") this.timer.unref()
     }
   }
 
   async flush(): Promise<void> {
-    if (this.timer) { clearTimeout(this.timer); this.timer = undefined }
+    if (this.timer) {
+      clearTimeout(this.timer)
+      this.timer = undefined
+    }
     if (this.buffer.length === 0) return
     await this.ensureOpen()
     if (!this.handle) return
@@ -281,7 +291,12 @@ export class PgAuditSink implements AuditSink {
     if (this.buffer.length === 0) return
     const pending = this.buffer.splice(0, this.buffer.length)
     for (const p of pending) {
-      try { await this.insertOne(p) } catch { this.buffer.unshift(p); break }
+      try {
+        await this.insertOne(p)
+      } catch {
+        this.buffer.unshift(p)
+        break
+      }
     }
   }
 }

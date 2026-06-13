@@ -1,10 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import {
-  WorkflowEngine,
-  WorkflowSignalTimeout,
-  type WorkflowContext
-} from "../src/common/workflow"
+import { WorkflowEngine, WorkflowSignalTimeout, type WorkflowContext } from "../src/common/workflow"
 import { Scheduler } from "../src/common/scheduler"
 import { InMemoryEventStore } from "../src/common/event-store"
 
@@ -49,10 +45,7 @@ test("two distinct waitForSignal calls each get their own signal across resumes 
   const consumed = events.filter((e) => e.type === "workflow.signal.consumed")
   assert.equal(consumed.length, 2, "each wait consumes exactly once, durably")
   const byOrdinal = consumed.map((e) => e.payload as { name: string; ordinal: number })
-  assert.deepEqual(
-    byOrdinal.map((p) => `${p.ordinal}:${p.name}`).sort(),
-    ["1:a", "2:b"]
-  )
+  assert.deepEqual(byOrdinal.map((p) => `${p.ordinal}:${p.name}`).sort(), ["1:a", "2:b"])
 })
 
 test("two same-name waitForSignal calls consume two distinct payloads in FIFO order", async () => {
@@ -175,11 +168,7 @@ test("a signal that arrives before the timeout wins; the late timeout is a no-op
   assert.equal(state?.result, "signal:ok")
 
   const events = await store.read({ aggregateId: started.workflowId })
-  assert.equal(
-    events.filter((e) => e.type === "workflow.signal.timeout").length,
-    0,
-    "no timeout event once the signal settled the wait"
-  )
+  assert.equal(events.filter((e) => e.type === "workflow.signal.timeout").length, 0, "no timeout event once the signal settled the wait")
 })
 
 test("a sleep is driven by a completion event, not the wall clock", async () => {

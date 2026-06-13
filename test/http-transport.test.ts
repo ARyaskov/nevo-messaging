@@ -23,7 +23,11 @@ async function startStub(onReq: (req: http.IncomingMessage, res: http.ServerResp
   return {
     url: `http://127.0.0.1:${port}`,
     requests: () => count,
-    close: () => new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()) })
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections?.()
+        server.close(() => resolve())
+      })
   }
 }
 
@@ -45,7 +49,10 @@ test("query throws a mapped MessagingError (not undefined) on error statuses", a
     { status: 404, code: ErrorCode.REMOTE_ERROR }
   ]
   for (const { status, code } of cases) {
-    const stub = await startStub((_req, res) => { res.writeHead(status); res.end() })
+    const stub = await startStub((_req, res) => {
+      res.writeHead(status)
+      res.end()
+    })
     const client = new NevoHttpClient({ svc: stub.url }, { codec: new JsonCodec(), retry: { enabled: false } })
     try {
       await expectCode(client.query("svc", "m", {}), code)
@@ -57,7 +64,10 @@ test("query throws a mapped MessagingError (not undefined) on error statuses", a
 })
 
 test("an error status with an undecodable body still maps to the status, not a parse error", async () => {
-  const stub = await startStub((_req, res) => { res.writeHead(503, { "content-type": "text/plain" }); res.end("upstream down") })
+  const stub = await startStub((_req, res) => {
+    res.writeHead(503, { "content-type": "text/plain" })
+    res.end("upstream down")
+  })
   const client = new NevoHttpClient({ svc: stub.url }, { codec: new JsonCodec(), retry: { enabled: false } })
   try {
     await expectCode(client.query("svc", "m", {}), ErrorCode.SERVICE_UNAVAILABLE)
@@ -70,7 +80,10 @@ test("an error status with an undecodable body still maps to the status, not a p
 test("only 502/503/504 are retried; 500 is terminal", async () => {
   const retry = { maxAttempts: 3, baseMs: 1, maxMs: 2, jitter: false }
 
-  const s503 = await startStub((_req, res) => { res.writeHead(503); res.end() })
+  const s503 = await startStub((_req, res) => {
+    res.writeHead(503)
+    res.end()
+  })
   const c503 = new NevoHttpClient({ svc: s503.url }, { codec: new JsonCodec(), retry })
   try {
     await assert.rejects(() => c503.query("svc", "m", {}))
@@ -80,7 +93,10 @@ test("only 502/503/504 are retried; 500 is terminal", async () => {
     await s503.close()
   }
 
-  const s500 = await startStub((_req, res) => { res.writeHead(500); res.end() })
+  const s500 = await startStub((_req, res) => {
+    res.writeHead(500)
+    res.end()
+  })
   const c500 = new NevoHttpClient({ svc: s500.url }, { codec: new JsonCodec(), retry })
   try {
     await assert.rejects(() => c500.query("svc", "m", {}))
@@ -108,6 +124,22 @@ test("a 2xx nevo envelope is still returned as the result (happy path intact)", 
   }
 })
 
+test("useUndici sends RPC traffic through the pooled undici dispatcher", async () => {
+  const codec = new JsonCodec()
+  const stub = await startStub((_req, res) => {
+    res.writeHead(200, { "content-type": codec.contentType })
+    res.end(codec.encode({ uuid: "u", method: "m", params: { result: "ok" }, meta: {} }))
+  })
+  const client = new NevoHttpClient({ svc: stub.url }, { codec, retry: { enabled: false }, useUndici: true })
+  try {
+    assert.equal(await client.query("svc", "m", {}), "ok")
+    assert.equal(stub.requests(), 1)
+  } finally {
+    await client.close()
+    await stub.close()
+  }
+})
+
 test("an overall deadline fires even while the response keeps trickling", { timeout: 5000 }, async () => {
   // Headers arrive, then a byte every 20ms and the response never ends. req.setTimeout
   // (socket inactivity) keeps resetting, so only the wall-clock deadline can end this.
@@ -115,7 +147,10 @@ test("an overall deadline fires even while the response keeps trickling", { time
     res.writeHead(200, { "content-type": "application/json" })
     res.on("error", () => {})
     const iv = setInterval(() => {
-      if (res.writableEnded || res.destroyed) { clearInterval(iv); return }
+      if (res.writableEnded || res.destroyed) {
+        clearInterval(iv)
+        return
+      }
       res.write("x")
     }, 20)
     res.on("close", () => clearInterval(iv))

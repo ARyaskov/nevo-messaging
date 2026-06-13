@@ -31,6 +31,9 @@ export async function createKafkaMicroservice(options: NestApplicationOptions): 
       subscribe: {
         fromBeginning: true
       },
+      parser: {
+        keepBinary: true
+      },
       producer: {
         idempotent: true,
         maxInFlightRequests: 1

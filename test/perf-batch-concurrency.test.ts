@@ -40,30 +40,44 @@ test("mapLimit preserves input order regardless of completion order", async () =
     await new Promise((r) => setTimeout(r, item))
     return item * 2
   })
-  assert.deepEqual(results, items.map((n) => n * 2))
+  assert.deepEqual(
+    results,
+    items.map((n) => n * 2)
+  )
 })
 
 test("mapLimit surfaces the first error like Promise.all", async () => {
   await assert.rejects(
-    () => mapLimit([1, 2, 3, 4, 5], 2, async (item) => {
-      if (item === 3) throw new Error("boom-3")
-      await tick()
-      return item
-    }),
+    () =>
+      mapLimit([1, 2, 3, 4, 5], 2, async (item) => {
+        if (item === 3) throw new Error("boom-3")
+        await tick()
+        return item
+      }),
     /boom-3/
   )
 })
 
 test("mapLimit returns an empty array for empty input without invoking fn", async () => {
   let called = false
-  const out = await mapLimit([], 8, async () => { called = true; return 1 })
+  const out = await mapLimit([], 8, async () => {
+    called = true
+    return 1
+  })
   assert.deepEqual(out, [])
   assert.equal(called, false)
 })
 
 const SILENT_LOGGER: any = {
-  trace() {}, debug() {}, info() {}, warn() {}, error() {}, fatal() {},
-  child() { return SILENT_LOGGER }
+  trace() {},
+  debug() {},
+  info() {},
+  warn() {},
+  error() {},
+  fatal() {},
+  child() {
+    return SILENT_LOGGER
+  }
 }
 
 // A codec wrapper that records how many encode calls are concurrently "in flight"
@@ -76,8 +90,13 @@ test("large simulated emitBatch encodes and publishes every item under a bounded
   let encodeCount = 0
   const trackingCodec: any = {
     name: codec.name,
-    encode(v: any) { encodeCount++; return codec.encode(v) },
-    decode(b: any) { return codec.decode(b) }
+    encode(v: any) {
+      encodeCount++
+      return codec.encode(v)
+    },
+    decode(b: any) {
+      return codec.decode(b)
+    }
   }
 
   const fakeClientKafka: any = { subscribeToResponseOf() {}, emit() {}, send() {} }

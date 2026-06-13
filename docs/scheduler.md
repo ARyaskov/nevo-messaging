@@ -71,9 +71,9 @@ The decorated method is invoked with the task payload as its single argument.
 ## Enqueue API
 
 ```ts
-scheduler.enqueueAt(name, payload, runAt)            // epoch ms or Date → task id
-scheduler.enqueueIn(name, payload, ms)               // delay from now → task id
-scheduler.enqueueCron(name, payload, cron, opts?)    // recurring → task id
+scheduler.enqueueAt(name, payload, runAt, { id?, maxAttempts? }) // epoch ms or Date → task id
+scheduler.enqueueIn(name, payload, ms, { id?, maxAttempts? })    // delay from now → task id
+scheduler.enqueueCron(name, payload, cron, opts?)                // recurring → task id
 scheduler.cancel(id)                                 // cancel a pending task (no-op if already ran)
 scheduler.list({ status?, limit? })                  // inspect tasks
 scheduler.registerHandler(name, handler)             // (name) → handler
@@ -91,7 +91,7 @@ The bundled parser is a standard **5-field POSIX cron**: `minute hour day month 
 | hour | 0–23 |
 | day of month | 1–31 |
 | month | 1–12 |
-| weekday | 0–6 (Sunday = 0) |
+| weekday | 0–7 (Sunday = 0 or 7) |
 
 Supported operators: `*` (wildcard), `,` (list), `-` (range), `/` (step). Quartz extensions (`L`, `#`, `?`) are **not** supported. Examples:
 
@@ -120,9 +120,9 @@ The chosen zone is **persisted on the task row** so every reschedule uses the sa
 
 ### Deterministic per-cluster cron id
 
-`enqueueCron` derives the task id from the logical name (`cron:<name>`). Every replica that runs discovery enqueues *the same row*, and the store de-dups via `ON CONFLICT (id) DO NOTHING` (the in-memory store dedups by id too). The result: **a cron fires once per cluster per tick, not once per replica.** First writer wins; re-enqueuing an existing cron is a no-op.
+`enqueueCron` derives the task id from the logical name (`cron:<name>`). Every replica that runs discovery enqueues *the same row*, and the store de-dups by id. The result: **a cron fires once per cluster per tick, not once per replica.** Re-registering an unchanged definition is a no-op. Changing the expression, timezone, or logical name updates the existing row and resets it to the new schedule.
 
-> Use **distinct names** for distinct schedules. One-shot `at`/`in` tasks get a fresh UUID each call and are *not* de-duped — each enqueue is a new run.
+> Use **distinct names** for distinct schedules. One-shot `at`/`in` tasks get a fresh UUID by default. Pass `{ id }` when the caller needs a deterministic, idempotent enqueue; workflow wake-ups use this to avoid duplicate timers during replay.
 
 ### Lease claiming & reaping
 
@@ -132,9 +132,9 @@ Finalizers (`markCompleted`/`markFailed`/`reschedule`) are **fenced**: they only
 
 ### Retries & missed-run policy
 
-A failing handler increments `attempts`; the row goes back to `pending` until `maxAttempts` (default 5) is reached, after which it is marked `failed`. A handler with no registered handler name fails immediately.
+A failing one-shot handler increments `attempts`; the row goes back to `pending` until `maxAttempts` (default 5) is reached, after which it is marked `failed`. A handler with no registered handler name fails immediately.
 
-For cron tasks, the next tick is computed from the task's **scheduled** `runAt`, not the wall clock at completion, so a slow handler doesn't drift the cadence. The missed-run policy is **SKIP**: if the worker was down or the handler ran past one or more ticks, the scheduler jumps to the next tick after *now* rather than replaying every missed occurrence.
+For cron tasks, reaching `maxAttempts` records the last error and advances to the next cron tick instead of terminally deleting the recurring schedule. The next tick is computed from the task's **scheduled** `runAt`, not the wall clock at completion, so a slow handler doesn't drift the cadence. The missed-run policy is **SKIP**: if the worker was down or the handler ran past one or more ticks, the scheduler jumps to the next tick after *now* rather than replaying every missed occurrence.
 
 ## Scheduler options
 
@@ -152,7 +152,7 @@ new Scheduler({
 
 ## Choosing a store
 
-`InMemoryScheduledTaskStore` (default) is fine for tests and single-pod CLIs but loses everything on restart. For production use `PgScheduledTaskStore`, which gives durable rows, DB-clock leases shared across replicas, and the deterministic-id de-dup described above. Run its `migrate()` in your deploy pipeline (or `migrateAllPgStores`). See the [storage matrix](./storage-matrix.md).
+`InMemoryScheduledTaskStore` (default) is fine for tests and single-pod CLIs but loses everything on restart. It prunes terminal tasks after one hour and caps retained terminal rows at 10,000 by default; override with `{ terminalRetentionMs, maxTerminalTasks }`. For production use `PgScheduledTaskStore`, which gives durable rows, DB-clock leases shared across replicas, and the deterministic-id de-dup described above. Run its `migrate()` in your deploy pipeline (or `migrateAllPgStores`). See the [storage matrix](./storage-matrix.md).
 
 ## See also
 

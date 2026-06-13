@@ -141,6 +141,8 @@ CREATE TABLE IF NOT EXISTS nevo_outbox (
 );
 ```
 
+`listPending()` preserves ordered partitions just like the Postgres store: a row is not claimable while an earlier failed row with the same `partitionKey` exists. Ordering uses `(created_at, id)` as a deterministic tie-breaker.
+
 Options:
 
 ```ts

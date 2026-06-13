@@ -25,9 +25,7 @@ test("matching allow rejects unknown caller", () => {
 
 test("deny overrides allow on same rule", () => {
   const cfg: AccessControlConfig = {
-    rules: [
-      { topic: "user-events", method: "*", allow: ["*"], deny: ["evil"] }
-    ]
+    rules: [{ topic: "user-events", method: "*", allow: ["*"], deny: ["evil"] }]
   }
   assert.equal(isAccessAllowed(cfg, "user-events", "any", "evil"), false)
   assert.equal(isAccessAllowed(cfg, "user-events", "any", "frontend"), true)

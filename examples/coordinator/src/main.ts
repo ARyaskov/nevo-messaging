@@ -1,11 +1,4 @@
-import {
-  GracefulShutdown,
-  HealthRegistry,
-  Outbox,
-  createKafkaMicroservice,
-  createLogger,
-  setDefaultLogger
-} from "@riaskov/nevo-messaging"
+import { GracefulShutdown, HealthRegistry, Outbox, createKafkaMicroservice, createLogger, setDefaultLogger } from "@riaskov/nevo-messaging"
 import { AppModule } from "./app.module"
 
 async function bootstrap() {
@@ -19,11 +12,7 @@ async function bootstrap() {
 
   const shutdown = new GracefulShutdown()
   const health = app.get(HealthRegistry)
-  health.register(
-    "not-draining",
-    () => ({ status: shutdown.isShuttingDown() ? "down" : "ok" }),
-    { kind: "readiness" }
-  )
+  health.register("not-draining", () => ({ status: shutdown.isShuttingDown() ? "down" : "ok" }), { kind: "readiness" })
 
   // Flush the outbox before tearing down the Kafka client.
   const outbox = app.get(Outbox)

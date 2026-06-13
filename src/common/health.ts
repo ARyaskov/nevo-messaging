@@ -118,6 +118,10 @@ export class HealthRegistry {
     }
   }
 
-  async liveness(): Promise<HealthStatus> { return this.report("liveness") }
-  async readiness(): Promise<HealthStatus> { return this.report("readiness") }
+  async liveness(): Promise<HealthStatus> {
+    return this.report("liveness")
+  }
+  async readiness(): Promise<HealthStatus> {
+    return this.report("readiness")
+  }
 }

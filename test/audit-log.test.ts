@@ -3,15 +3,7 @@ import assert from "node:assert/strict"
 import { promises as fs } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import {
-  AuditLog,
-  InMemoryAuditSink,
-  FileAuditSink,
-  PgAuditSink,
-  TeeAuditSink,
-  type AuditPgClient,
-  type AuditEntry
-} from "../src/common/audit-log"
+import { AuditLog, InMemoryAuditSink, FileAuditSink, PgAuditSink, TeeAuditSink, type AuditPgClient, type AuditEntry } from "../src/common/audit-log"
 
 test("InMemoryAuditSink records redacted entries", async () => {
   const sink = new InMemoryAuditSink()

@@ -1,10 +1,4 @@
-import {
-  gzipSync,
-  gunzipSync,
-  deflateSync,
-  inflateSync,
-  constants as zlibConstants
-} from "node:zlib"
+import { gzipSync, gunzipSync, deflateSync, inflateSync, constants as zlibConstants } from "node:zlib"
 import { gzip, gunzip, deflate, inflate } from "node:zlib"
 import * as nodeZlib from "node:zlib"
 import { createRequire } from "node:module"
@@ -75,14 +69,20 @@ export function maybeCompress(buf: Uint8Array, opts: ResolvedCompressionOptions)
   return { data: deflateSync(buf, { level: opts.level }), encoding: "deflate" }
 }
 
-export async function maybeCompressAsync(buf: Uint8Array, opts: ResolvedCompressionOptions): Promise<{ data: Uint8Array; encoding: CompressionEncoding }> {
+export async function maybeCompressAsync(
+  buf: Uint8Array,
+  opts: ResolvedCompressionOptions
+): Promise<{ data: Uint8Array; encoding: CompressionEncoding }> {
   if (!opts.enabled || buf.byteLength < opts.threshold) {
     return { data: buf, encoding: "identity" }
   }
   try {
-    const { isCompressionWorkerEnabled, compressionWorkerThreshold, workerCompress } = nodeRequire("./compression-worker") as typeof import("./compression-worker")
+    const { isCompressionWorkerEnabled, compressionWorkerThreshold, workerCompress } = nodeRequire(
+      "./compression-worker"
+    ) as typeof import("./compression-worker")
     if (isCompressionWorkerEnabled() && buf.byteLength >= compressionWorkerThreshold()) {
-      const algo: "gzip" | "deflate" | "zstd" = opts.algorithm === "zstd" && tryLoadZstd() ? "zstd" : opts.algorithm === "deflate" ? "deflate" : "gzip"
+      const algo: "gzip" | "deflate" | "zstd" =
+        opts.algorithm === "zstd" && tryLoadZstd() ? "zstd" : opts.algorithm === "deflate" ? "deflate" : "gzip"
       const data = await workerCompress(buf, algo, opts.level)
       return { data, encoding: algo }
     }
@@ -99,10 +99,9 @@ export async function maybeCompressAsync(buf: Uint8Array, opts: ResolvedCompress
   return { data, encoding: "deflate" }
 }
 
-// Inbound buffers at/above this size decompress off the event loop (worker pool
-// or libuv) via maybeDecompressAsync; smaller ones inflate synchronously so the
-// common path never pays for an async hop.
-export const ASYNC_DECOMPRESS_THRESHOLD = 64 * 1024
+// Every compressed inbound buffer uses the async path. Worker thresholds are
+// handled inside maybeDecompressAsync; smaller buffers still use async zlib.
+export const ASYNC_DECOMPRESS_THRESHOLD = 0
 
 export function shouldDecompressAsync(byteLength: number, encoding?: string): boolean {
   if (!encoding || encoding === "identity") return false

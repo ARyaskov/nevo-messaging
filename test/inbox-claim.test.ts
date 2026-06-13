@@ -7,23 +7,36 @@ function fakeRedis(): InboxRedisClient & { storage: Map<string, string> } {
   const storage = new Map<string, string>()
   return {
     storage,
-    async get(key) { return storage.get(key) ?? null },
+    async get(key) {
+      return storage.get(key) ?? null
+    },
     async set(key, value, opts) {
       if (opts.ifNotExists && storage.has(key)) return null
       storage.set(key, value)
       return "OK"
     },
-    async del(key) { return storage.delete(key) ? 1 : 0 },
-    async exists(key) { return storage.has(key) ? 1 : 0 }
+    async del(key) {
+      return storage.delete(key) ? 1 : 0
+    },
+    async exists(key) {
+      return storage.has(key) ? 1 : 0
+    }
   } as InboxRedisClient & { storage: Map<string, string> }
 }
 
 test("Inbox.dedupe runs the handler exactly once under same-uuid concurrency", async () => {
   let calls = 0
   let release!: () => void
-  const gate = new Promise<void>((r) => { release = r })
+  const gate = new Promise<void>((r) => {
+    release = r
+  })
   const inbox = new Inbox({ store: new InMemoryInboxStore() })
-  const run = () => inbox.dedupe("evt-1", async () => { calls++; await gate; return { v: calls } })
+  const run = () =>
+    inbox.dedupe("evt-1", async () => {
+      calls++
+      await gate
+      return { v: calls }
+    })
 
   const p1 = run()
   const p2 = run()
@@ -42,8 +55,14 @@ test("Inbox.dedupe with RedisInboxStore.claim dedups across two inbox instances 
   const inboxA = new Inbox({ store: new RedisInboxStore({ client: shared }) })
   const inboxB = new Inbox({ store: new RedisInboxStore({ client: shared }) })
 
-  const r1 = await inboxA.dedupe("evt-2", async () => { calls++; return { by: "A" } })
-  const r2 = await inboxB.dedupe("evt-2", async () => { calls++; return { by: "B" } })
+  const r1 = await inboxA.dedupe("evt-2", async () => {
+    calls++
+    return { by: "A" }
+  })
+  const r2 = await inboxB.dedupe("evt-2", async () => {
+    calls++
+    return { by: "B" }
+  })
 
   assert.equal(calls, 1, "only one replica runs the handler")
   assert.deepEqual(r1, { by: "A" })
@@ -67,9 +86,15 @@ test("RedisInboxStore.claim acquires once; markSeen overwrites the sentinel", as
 
 test("RedisInboxStore.hasSeen: fail-open returns false, fail-closed returns true on read error", async () => {
   const boom: InboxRedisClient = {
-    async get() { throw new Error("down") },
-    async set() { return "OK" },
-    async exists() { throw new Error("down") }
+    async get() {
+      throw new Error("down")
+    },
+    async set() {
+      return "OK"
+    },
+    async exists() {
+      throw new Error("down")
+    }
   }
   const open = new RedisInboxStore({ client: boom, readErrorPolicy: "open" })
   assert.equal(await open.hasSeen("u1"), false)
@@ -79,8 +104,12 @@ test("RedisInboxStore.hasSeen: fail-open returns false, fail-closed returns true
 
 test("RedisInboxStore.claim: fail-closed rethrows when the store is down", async () => {
   const boom: InboxRedisClient = {
-    async get() { return null },
-    async set() { throw new Error("down") }
+    async get() {
+      return null
+    },
+    async set() {
+      throw new Error("down")
+    }
   }
   const closed = new RedisInboxStore({ client: boom, readErrorPolicy: "closed" })
   await assert.rejects(() => closed.claim("u1"))

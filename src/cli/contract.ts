@@ -29,20 +29,40 @@ function parseArgs(argv: string[]): CliOptions {
     const next = () => argv[++i]
     switch (a) {
       case "-h":
-      case "--help": out.help = true; break
+      case "--help":
+        out.help = true
+        break
       case "-t":
-      case "--transport": out.transport = next() as any; break
+      case "--transport":
+        out.transport = next() as any
+        break
       case "-s":
-      case "--service": out.service = next(); break
+      case "--service":
+        out.service = next()
+        break
       case "-u":
-      case "--url": out.url = next(); break
-      case "--servers": out.servers = next().split(","); break
+      case "--url":
+        out.url = next()
+        break
+      case "--servers":
+        out.servers = next().split(",")
+        break
       case "-o":
-      case "--out": out.out = next(); break
-      case "--timeout": out.timeoutMs = Number(next()); break
-      case "--name": out.serviceMapName = next(); break
-      case "--auth-token": out.authToken = next(); break
-      case "--print": out.print = true; break
+      case "--out":
+        out.out = next()
+        break
+      case "--timeout":
+        out.timeoutMs = Number(next())
+        break
+      case "--name":
+        out.serviceMapName = next()
+        break
+      case "--auth-token":
+        out.authToken = next()
+        break
+      case "--print":
+        out.print = true
+        break
       default:
         if (a.startsWith("--")) {
           process.stderr.write(`Unknown flag: ${a}\n`)
@@ -140,20 +160,33 @@ async function fetchContractNats(opts: CliOptions): Promise<ServiceContract> {
     const msg = await nc.request(subject, enc.encode(payload), { timeout: opts.timeoutMs ?? 10000 })
     const raw = dec.decode(msg.data)
     let parsed: any
-    try { parsed = JSON.parse(raw) } catch {
-      throw new Error(`Failed to parse contract response (got ${raw.length} bytes — server may use MessagePack; switch to HTTP transport or expose nevo.contract over JSON)`)
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      throw new Error(
+        `Failed to parse contract response (got ${raw.length} bytes — server may use MessagePack; switch to HTTP transport or expose nevo.contract over JSON)`
+      )
     }
     if (parsed?.params?.error) throw new Error(`Service returned error: ${parsed.params.error.message}`)
     return parsed?.params?.result as ServiceContract
   } finally {
-    try { await nc.drain() } catch {}
+    try {
+      await nc.drain()
+    } catch {}
   }
 }
 
 export async function runCli(argv: string[]): Promise<number> {
   const opts = parseArgs(argv)
-  if (opts.help) { printHelp(); return 0 }
-  if (!opts.service) { process.stderr.write("Missing --service\n"); printHelp(); return 2 }
+  if (opts.help) {
+    printHelp()
+    return 0
+  }
+  if (!opts.service) {
+    process.stderr.write("Missing --service\n")
+    printHelp()
+    return 2
+  }
 
   let contract: ServiceContract
   try {
@@ -181,8 +214,10 @@ export async function runCli(argv: string[]): Promise<number> {
 }
 
 if (require.main === module) {
-  runCli(process.argv).then((code) => process.exit(code)).catch((err) => {
-    process.stderr.write(`Unexpected error: ${err?.message ?? err}\n`)
-    process.exit(1)
-  })
+  runCli(process.argv)
+    .then((code) => process.exit(code))
+    .catch((err) => {
+      process.stderr.write(`Unexpected error: ${err?.message ?? err}\n`)
+      process.exit(1)
+    })
 }

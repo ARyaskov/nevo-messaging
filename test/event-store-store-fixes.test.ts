@@ -39,8 +39,13 @@ function fakeEventPg(): PgClient & { rows: any[] } {
           .filter((r) => r.sequence >= from)
           .sort((a, b) => a.sequence - b.sequence)
           .map((r) => ({
-            sequence: r.sequence, id: r.id, type: r.type, aggregate_id: r.aggregate_id,
-            payload: r.payload, meta: r.meta, ts: r.ts
+            sequence: r.sequence,
+            id: r.id,
+            type: r.type,
+            aggregate_id: r.aggregate_id,
+            payload: r.payload,
+            meta: r.meta,
+            ts: r.ts
           }))
         return { rows: out as T[], rowCount: out.length }
       }
@@ -102,7 +107,10 @@ test("pg event-store: a permanently failing handler blocks the cursor (no data l
   // Every delivery attempt must be for event 1 — the loop never advances past
   // the poison event to event 2, so seq 2 is never observed.
   assert.ok(seen.length >= 2, "expected event 1 to be retried at least once")
-  assert.ok(seen.every((s) => s === 1), `expected only seq 1 retries, saw ${seen.join(",")}`)
+  assert.ok(
+    seen.every((s) => s === 1),
+    `expected only seq 1 retries, saw ${seen.join(",")}`
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -137,6 +145,34 @@ test("sqlite outbox: a bigint payload round-trips through save/listPending", asy
   store.close()
 })
 
+test("sqlite outbox: a failed ordered predecessor blocks newer partition records", async () => {
+  const store = new SqliteOutboxStore()
+  await store.save({
+    id: "ordered-1",
+    serviceName: "ledger",
+    method: "entry.post",
+    params: { n: 1 },
+    partitionKey: "account-7",
+    createdAt: 1,
+    attempts: 0,
+    status: "pending"
+  })
+  await store.save({
+    id: "ordered-2",
+    serviceName: "ledger",
+    method: "entry.post",
+    params: { n: 2 },
+    partitionKey: "account-7",
+    createdAt: 2,
+    attempts: 0,
+    status: "pending"
+  })
+  await store.markFailed("ordered-1", "poison", 1)
+
+  assert.deepEqual(await store.listPending(10), [])
+  store.close()
+})
+
 // ---------------------------------------------------------------------------
 // Fix 3: InMemoryEventStore.append must persist synchronously but must NOT block
 // on a slow subscriber.
@@ -147,7 +183,9 @@ test("in-memory event-store: a slow subscriber does not block append, yet the ev
 
   let handlerStarted = false
   let releaseHandler!: () => void
-  const handlerGate = new Promise<void>((resolve) => { releaseHandler = resolve })
+  const handlerGate = new Promise<void>((resolve) => {
+    releaseHandler = resolve
+  })
 
   await store.subscribe(0, async () => {
     handlerStarted = true

@@ -12,13 +12,15 @@ import { ErrorCode } from "../src/common/error-code"
 
 function fakeRedisForRateLimit(): RateLimitRedisClient & { state: Map<string, { tokens: number; lastRefill: number }> } {
   const state = new Map<string, { tokens: number; lastRefill: number }>()
+  let serverNow = 1_000_000
   return {
     state,
     async eval({ keys, args }) {
       const key = keys[0]
       const capacity = Number(args[0])
       const refill = Number(args[1])
-      const now = Number(args[2])
+      const ttl = Number(args[2])
+      const now = ++serverNow
       let entry = state.get(key)
       if (!entry) entry = { tokens: capacity, lastRefill: now }
       const elapsedMs = now - entry.lastRefill
@@ -26,7 +28,7 @@ function fakeRedisForRateLimit(): RateLimitRedisClient & { state: Map<string, { 
         entry.tokens = Math.min(capacity, entry.tokens + (elapsedMs / 1000) * refill)
       }
       if (entry.tokens < 1) {
-        const retryAfterMs = Math.ceil(((1 - entry.tokens) / refill) * 1000)
+        const retryAfterMs = refill > 0 ? Math.ceil(((1 - entry.tokens) / refill) * 1000) : ttl
         entry.lastRefill = now
         state.set(key, entry)
         return [0, retryAfterMs, entry.tokens]
@@ -43,14 +45,20 @@ function fakeRedisForInbox(): InboxRedisClient & { storage: Map<string, string> 
   const storage = new Map<string, string>()
   return {
     storage,
-    async get(key) { return storage.get(key) ?? null },
+    async get(key) {
+      return storage.get(key) ?? null
+    },
     async set(key, value, opts) {
       if (opts.ifNotExists && storage.has(key)) return null
       storage.set(key, value)
       return "OK"
     },
-    async del(key) { return storage.delete(key) ? 1 : 0 },
-    async exists(key) { return storage.has(key) ? 1 : 0 }
+    async del(key) {
+      return storage.delete(key) ? 1 : 0
+    },
+    async exists(key) {
+      return storage.has(key) ? 1 : 0
+    }
   } as InboxRedisClient & { storage: Map<string, string> }
 }
 
@@ -63,7 +71,9 @@ function fakePg(): PgClient & { sql: string[]; params: unknown[][]; rows: Map<st
   const params: unknown[][] = []
   const rows = new Map<string, any[]>() // table → rows
   return {
-    sql, params, rows,
+    sql,
+    params,
+    rows,
     async query<T = unknown>(text: string, values: unknown[] = []): Promise<{ rows: T[]; rowCount?: number }> {
       sql.push(text)
       params.push(values)
@@ -104,6 +114,33 @@ test("RedisRateLimiter allows up to capacity then throws RATE_LIMITED", async ()
   )
 })
 
+test("RedisRateLimiter loads Lua once and uses EVALSHA on subsequent checks", async () => {
+  const fallback = fakeRedisForRateLimit()
+  let loads = 0
+  let evalShaCalls = 0
+  const client: RateLimitRedisClient = {
+    eval: fallback.eval.bind(fallback),
+    async scriptLoad() {
+      loads++
+      return "sha-1"
+    },
+    async evalSha({ keys, args }) {
+      evalShaCalls++
+      return fallback.eval({ script: "", keys, args })
+    }
+  }
+  const limiter = new RedisRateLimiter({
+    client,
+    enabled: true,
+    capacity: 5,
+    refillPerSec: 1
+  })
+  await limiter.check({ topic: "t", method: "m" })
+  await limiter.check({ topic: "t", method: "m" })
+  assert.equal(loads, 1)
+  assert.equal(evalShaCalls, 2)
+})
+
 test("RedisRateLimiter different callers get independent buckets", async () => {
   const rl = new RedisRateLimiter({
     client: fakeRedisForRateLimit(),
@@ -118,7 +155,11 @@ test("RedisRateLimiter different callers get independent buckets", async () => {
 
 test("RedisRateLimiter fails open on Redis errors when failOpen=true", async () => {
   const rl = new RedisRateLimiter({
-    client: { async eval() { throw new Error("ECONNREFUSED") } },
+    client: {
+      async eval() {
+        throw new Error("ECONNREFUSED")
+      }
+    },
     enabled: true,
     capacity: 1,
     refillPerSec: 0,
@@ -130,7 +171,11 @@ test("RedisRateLimiter fails open on Redis errors when failOpen=true", async () 
 
 test("RedisRateLimiter fails closed when failOpen=false", async () => {
   const rl = new RedisRateLimiter({
-    client: { async eval() { throw new Error("ECONNREFUSED") } },
+    client: {
+      async eval() {
+        throw new Error("ECONNREFUSED")
+      }
+    },
     enabled: true,
     capacity: 1,
     refillPerSec: 0,
@@ -153,8 +198,12 @@ test("RedisInboxStore markSeen → hasSeen round-trips", async () => {
 
 test("RedisInboxStore swallows write errors without throwing", async () => {
   const failing: InboxRedisClient = {
-    async get() { return null },
-    async set() { throw new Error("ECONNREFUSED") }
+    async get() {
+      return null
+    },
+    async set() {
+      throw new Error("ECONNREFUSED")
+    }
   }
   const inbox = new RedisInboxStore({ client: failing })
   // markSeen should NOT throw — at-least-once delivery still works; the
@@ -220,8 +269,12 @@ test("PgSagaStore.save upserts saga_id", async () => {
   const pg = fakePg()
   const store = new PgSagaStore({ client: pg })
   await store.save({
-    sagaId: "s-1", steps: ["a", "b"], executed: ["a"], ctx: { foo: 1 },
-    status: "pending", updatedAt: Date.now()
+    sagaId: "s-1",
+    steps: ["a", "b"],
+    executed: ["a"],
+    ctx: { foo: 1 },
+    status: "pending",
+    updatedAt: Date.now()
   })
   const text = pg.sql.join(" ").toLowerCase()
   assert.match(text, /on conflict \(saga_id\) do update/)

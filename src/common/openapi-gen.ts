@@ -12,19 +12,32 @@ function schemaToJsonSchema(schema?: SchemaDescriptor | null): Record<string, un
 function zodShapeToJsonSchema(node: any, depth = 0): Record<string, unknown> {
   if (!node || depth > 10) return { type: "object" }
   switch (node.type) {
-    case "string": return { type: "string" }
-    case "number": return { type: "number" }
-    case "bigint": return { type: "string", format: "bigint" }
-    case "boolean": return { type: "boolean" }
-    case "date": return { type: "string", format: "date-time" }
-    case "literal": return { const: node.value }
-    case "enum": return { enum: node.values }
-    case "array": return { type: "array", items: zodShapeToJsonSchema(node.items, depth + 1) }
-    case "optional": return zodShapeToJsonSchema(node.inner, depth + 1)
-    case "nullable": return { ...zodShapeToJsonSchema(node.inner, depth + 1), nullable: true }
-    case "union": return { oneOf: (node.options ?? []).map((o: any) => zodShapeToJsonSchema(o, depth + 1)) }
-    case "intersection": return { allOf: [zodShapeToJsonSchema(node.left, depth + 1), zodShapeToJsonSchema(node.right, depth + 1)] }
-    case "record": return { type: "object", additionalProperties: zodShapeToJsonSchema(node.valueType, depth + 1) }
+    case "string":
+      return { type: "string" }
+    case "number":
+      return { type: "number" }
+    case "bigint":
+      return { type: "string", format: "bigint" }
+    case "boolean":
+      return { type: "boolean" }
+    case "date":
+      return { type: "string", format: "date-time" }
+    case "literal":
+      return { const: node.value }
+    case "enum":
+      return { enum: node.values }
+    case "array":
+      return { type: "array", items: zodShapeToJsonSchema(node.items, depth + 1) }
+    case "optional":
+      return zodShapeToJsonSchema(node.inner, depth + 1)
+    case "nullable":
+      return { ...zodShapeToJsonSchema(node.inner, depth + 1), nullable: true }
+    case "union":
+      return { oneOf: (node.options ?? []).map((o: any) => zodShapeToJsonSchema(o, depth + 1)) }
+    case "intersection":
+      return { allOf: [zodShapeToJsonSchema(node.left, depth + 1), zodShapeToJsonSchema(node.right, depth + 1)] }
+    case "record":
+      return { type: "object", additionalProperties: zodShapeToJsonSchema(node.valueType, depth + 1) }
     case "tuple": {
       const items = (node.items ?? []).map((it: any) => zodShapeToJsonSchema(it, depth + 1))
       const out: Record<string, unknown> = { type: "array", prefixItems: items, minItems: items.length }
@@ -32,11 +45,23 @@ function zodShapeToJsonSchema(node: any, depth = 0): Record<string, unknown> {
       else out.maxItems = items.length
       return out
     }
-    case "map": return { type: "array", items: { type: "array", prefixItems: [zodShapeToJsonSchema(node.keyType, depth + 1), zodShapeToJsonSchema(node.valueType, depth + 1)], minItems: 2, maxItems: 2 } }
-    case "set": return { type: "array", items: zodShapeToJsonSchema(node.valueType, depth + 1), uniqueItems: true }
-    case "default": return zodShapeToJsonSchema(node.inner, depth + 1)
+    case "map":
+      return {
+        type: "array",
+        items: {
+          type: "array",
+          prefixItems: [zodShapeToJsonSchema(node.keyType, depth + 1), zodShapeToJsonSchema(node.valueType, depth + 1)],
+          minItems: 2,
+          maxItems: 2
+        }
+      }
+    case "set":
+      return { type: "array", items: zodShapeToJsonSchema(node.valueType, depth + 1), uniqueItems: true }
+    case "default":
+      return zodShapeToJsonSchema(node.inner, depth + 1)
     case "effects":
-    case "pipe": return zodShapeToJsonSchema(node.inner, depth + 1)
+    case "pipe":
+      return zodShapeToJsonSchema(node.inner, depth + 1)
     case "object": {
       const properties: Record<string, unknown> = {}
       const required: string[] = []
@@ -89,7 +114,18 @@ export function contractToOpenApi(contract: ServiceContract, opts: OpenApiGenOpt
         responses: {
           "200": {
             description: "OK",
-            content: { "application/json": { schema: { type: "object", properties: { uuid: { type: "string" }, method: { type: "string" }, params: { type: "object", properties: { result: schemaToJsonSchema(m.resultSchema) } } } } } }
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    uuid: { type: "string" },
+                    method: { type: "string" },
+                    params: { type: "object", properties: { result: schemaToJsonSchema(m.resultSchema) } }
+                  }
+                }
+              }
+            }
           }
         }
       }

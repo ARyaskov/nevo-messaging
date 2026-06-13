@@ -22,7 +22,7 @@ The default wire codec is **MessagePack** whenever `@msgpack/msgpack` is resolva
 @@nevo:bigint:<digits>     e.g. 123n  →  "@@nevo:bigint:123"
 ```
 
-The decoder still accepts the **legacy** form `"<digits>n"` (e.g. `"123n"`), controlled by `acceptLegacy` on the revivers, so messages produced by older versions continue to decode.
+The **legacy** form `"<digits>n"` (e.g. `"123n"`) is accepted only when `acceptLegacy: true` is passed to the BigInt helpers. Built-in wire codecs keep it disabled so ordinary strings are never silently converted.
 
 **Action / compatibility:**
 

@@ -10,6 +10,47 @@ export const bigIntReplacer = function (_key: string, value: unknown): unknown {
   return value
 }
 
+const MAX_WIRE_DEPTH = 512
+
+/**
+ * Normalise values to one wire model shared by JSON and MessagePack codecs.
+ * It intentionally follows JSON's undefined semantics and represents Date and
+ * arbitrary-size BigInt without relying on codec-specific extensions.
+ */
+export function normalizeWireValue(value: unknown): unknown {
+  const seen = new WeakSet<object>()
+
+  const visit = (input: unknown, depth: number, inArray: boolean): unknown => {
+    if (input === undefined || typeof input === "function" || typeof input === "symbol") {
+      return inArray ? null : undefined
+    }
+    if (typeof input === "bigint") return `${BIGINT_SENTINEL}${input.toString()}`
+    if (input === null || typeof input !== "object") return input
+    if (input instanceof Date) return input.toISOString()
+    if (depth >= MAX_WIRE_DEPTH) {
+      throw new RangeError(`normalizeWireValue: maximum nesting depth (${MAX_WIRE_DEPTH}) exceeded`)
+    }
+    if (seen.has(input)) throw new TypeError("normalizeWireValue: circular reference detected")
+    seen.add(input)
+    try {
+      if (Array.isArray(input)) {
+        return input.map((item) => visit(item, depth + 1, true))
+      }
+      if (ArrayBuffer.isView(input) || input instanceof ArrayBuffer) return input
+      const out: Record<string, unknown> = {}
+      for (const [key, item] of Object.entries(input as Record<string, unknown>)) {
+        const normalized = visit(item, depth + 1, false)
+        if (normalized !== undefined) setRebuiltKey(out, key, normalized)
+      }
+      return out
+    } finally {
+      seen.delete(input)
+    }
+  }
+
+  return visit(value, 0, true)
+}
+
 export function makeBigIntReviver(opts?: { acceptLegacy?: boolean }): (key: string, value: unknown) => unknown {
   const acceptLegacy = opts?.acceptLegacy === true
   return function (_key, value) {
@@ -32,6 +73,16 @@ const legacyReviver = makeBigIntReviver({ acceptLegacy: true })
 
 const MAX_BIGINT_DEPTH = 512
 
+// Assigning a "__proto__" key from untrusted input would mutate the prototype
+// of the rebuilt object instead of creating a data property.
+function setRebuiltKey(target: Record<string, unknown>, key: string, value: unknown): void {
+  if (key === "__proto__") {
+    Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true })
+  } else {
+    target[key] = value
+  }
+}
+
 function serializeBigIntInner(obj: any, depth: number, seen: WeakSet<object>): any {
   if (obj === null || obj === undefined) return obj
   if (typeof obj === "bigint") return `${BIGINT_SENTINEL}${obj.toString()}`
@@ -47,7 +98,7 @@ function serializeBigIntInner(obj: any, depth: number, seen: WeakSet<object>): a
   try {
     if (Array.isArray(obj)) return obj.map((v) => serializeBigIntInner(v, depth + 1, seen))
     const serialized: Record<string, unknown> = {}
-    for (const [key, value] of Object.entries(obj)) serialized[key] = serializeBigIntInner(value, depth + 1, seen)
+    for (const [key, value] of Object.entries(obj)) setRebuiltKey(serialized, key, serializeBigIntInner(value, depth + 1, seen))
     return serialized
   } finally {
     seen.delete(obj)
@@ -85,7 +136,7 @@ function deserializeBigIntInner(obj: any, options: { acceptLegacy?: boolean } | 
   try {
     if (Array.isArray(obj)) return obj.map((v) => deserializeBigIntInner(v, options, depth + 1, seen))
     const deserialized: Record<string, unknown> = {}
-    for (const [key, value] of Object.entries(obj)) deserialized[key] = deserializeBigIntInner(value, options, depth + 1, seen)
+    for (const [key, value] of Object.entries(obj)) setRebuiltKey(deserialized, key, deserializeBigIntInner(value, options, depth + 1, seen))
     return deserialized
   } finally {
     seen.delete(obj)

@@ -41,18 +41,16 @@ test("assertTenantAllowed no-ops when tenantId is undefined", () => {
 })
 
 test("buildResilienceKey appends declared dimensions", () => {
-  const key = buildResilienceKey(
-    { service: "user", method: "user.getById", tenantId: "tnt-1", callerService: "frontend" },
-    ["service", "method", "tenantId"]
-  )
+  const key = buildResilienceKey({ service: "user", method: "user.getById", tenantId: "tnt-1", callerService: "frontend" }, [
+    "service",
+    "method",
+    "tenantId"
+  ])
   assert.equal(key, "user:user.getById:tnt-1")
 })
 
 test("buildResilienceKey defaults to service:method when keyBy is empty", () => {
-  const key = buildResilienceKey(
-    { service: "user", method: "user.getById" },
-    []
-  )
+  const key = buildResilienceKey({ service: "user", method: "user.getById" }, [])
   assert.equal(key, "user:user.getById")
 })
 

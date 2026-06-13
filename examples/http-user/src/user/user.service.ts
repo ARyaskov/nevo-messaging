@@ -1,12 +1,5 @@
 import { Inject, Injectable } from "@nestjs/common"
-import {
-  Cacheable,
-  HttpClientBase,
-  NevoHttpClient,
-  RateLimit,
-  Schema,
-  type ServiceContract
-} from "@riaskov/nevo-messaging"
+import { Cacheable, HttpClientBase, NevoHttpClient, RateLimit, Schema, type ServiceContract } from "@riaskov/nevo-messaging"
 import { z } from "zod"
 
 const GetByIdInput = z.object({ id: z.bigint() })

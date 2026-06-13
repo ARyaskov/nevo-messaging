@@ -22,7 +22,7 @@ const jwtVerifier = process.env.AUTH_JWKS_URI
 
   accessControl: {
     rules: [
-      { topic: "user-events", method: "*",           allow: ["frontend"] },
+      { topic: "user-events", method: "*", allow: ["frontend"] },
       { topic: "user-events", method: "user.delete", allow: ["coordinator"] }
     ],
     logDenied: true,

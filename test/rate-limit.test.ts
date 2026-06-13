@@ -58,3 +58,21 @@ test("scopes match by predicate", () => {
   assert.throws(() => rl.check({ topic: "t", method: "expensive", callerService: "x" }), MessagingError)
   for (let i = 0; i < 10; i++) rl.check({ topic: "t", method: "cheap" })
 })
+
+test("high-cardinality keys cannot evict and reset an active bucket", () => {
+  const rl = new RateLimiter({
+    enabled: true,
+    capacity: 1,
+    refillPerSec: 0,
+    maxEntries: 1,
+    idleEvictMs: 60_000
+  })
+  rl.check({ topic: "t", method: "m", callerService: "victim" })
+  for (let i = 0; i < 20; i++) {
+    try {
+      rl.check({ topic: "t", method: "m", callerService: `flood-${i}` })
+    } catch {}
+  }
+  assert.throws(() => rl.check({ topic: "t", method: "m", callerService: "victim" }), MessagingError)
+  rl.stop()
+})

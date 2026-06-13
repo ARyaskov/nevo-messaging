@@ -1,11 +1,11 @@
 import { createRequire } from "node:module"
-import { bigIntReplacer, makeBigIntReviver } from "./bigint.utils"
+import { deserializeBigInt, makeBigIntReviver, normalizeWireValue } from "./bigint.utils"
 import { MessagingError } from "./errors"
 import { ErrorCode } from "./error-code"
 
 const nodeRequire = createRequire(__filename)
 
-const legacyReviver = makeBigIntReviver({ acceptLegacy: true })
+const bigintReviver = makeBigIntReviver()
 
 export type CodecName = "msgpack" | "json" | "json-fast" | string
 
@@ -19,15 +19,19 @@ export interface Codec {
 const textDecoder = new TextDecoder()
 const textEncoder = new TextEncoder()
 
-export function getSharedTextDecoder() { return textDecoder }
-export function getSharedTextEncoder() { return textEncoder }
+export function getSharedTextDecoder() {
+  return textDecoder
+}
+export function getSharedTextEncoder() {
+  return textEncoder
+}
 
 export class JsonCodec implements Codec {
   readonly name: CodecName = "json"
   readonly contentType = "application/json"
 
   encode(value: unknown): Uint8Array {
-    const str = JSON.stringify(value, bigIntReplacer)
+    const str = JSON.stringify(normalizeWireValue(value))
     const byteLen = Buffer.byteLength(str, "utf8")
     const buf = Buffer.allocUnsafe(byteLen)
     buf.write(str, 0, byteLen, "utf8")
@@ -37,7 +41,7 @@ export class JsonCodec implements Codec {
   decode<T = unknown>(data: Uint8Array | string): T {
     const str = typeof data === "string" ? data : textDecoder.decode(data)
     try {
-      return JSON.parse(str, legacyReviver) as T
+      return JSON.parse(str, bigintReviver) as T
     } catch (err: any) {
       throw new MessagingError(ErrorCode.PARSE_ERROR, { message: `JSON parse error: ${err.message}` })
     }
@@ -49,7 +53,7 @@ export class JsonCodecFast implements Codec {
   readonly contentType = "application/json"
 
   encode(value: unknown): Uint8Array {
-    const str = JSON.stringify(value)
+    const str = JSON.stringify(normalizeWireValue(value))
     const byteLen = Buffer.byteLength(str, "utf8")
     const buf = Buffer.allocUnsafe(byteLen)
     buf.write(str, 0, byteLen, "utf8")
@@ -59,7 +63,7 @@ export class JsonCodecFast implements Codec {
   decode<T = unknown>(data: Uint8Array | string): T {
     const str = typeof data === "string" ? data : textDecoder.decode(data)
     try {
-      return JSON.parse(str) as T
+      return JSON.parse(str, bigintReviver) as T
     } catch (err: any) {
       throw new MessagingError(ErrorCode.PARSE_ERROR, { message: `JSON parse error: ${err.message}` })
     }
@@ -82,7 +86,7 @@ export class MessagePackCodec implements Codec {
   encode(value: unknown): Uint8Array {
     this.ensureLoaded()
     try {
-      const out = this.encoder!.encode(value)
+      const out = this.encoder!.encode(normalizeWireValue(value))
       if (out.byteOffset !== 0 || out.byteLength !== out.buffer.byteLength) {
         const copy = new Uint8Array(out.byteLength)
         copy.set(out)
@@ -100,7 +104,7 @@ export class MessagePackCodec implements Codec {
       data = Buffer.from(data, "binary")
     }
     try {
-      return this.decoder!.decode(data) as T
+      return deserializeBigInt(this.decoder!.decode(data)) as T
     } catch (err: any) {
       throw new MessagingError(ErrorCode.PARSE_ERROR, { message: `MessagePack decode error: ${err.message}` })
     }
@@ -115,7 +119,7 @@ function getOrCreateSharedMsgpack(): { encoder: { encode(v: unknown): Uint8Array
     const mp = nodeRequire("@msgpack/msgpack") as typeof import("@msgpack/msgpack")
     const EncoderCtor = (mp as unknown as { Encoder?: new (opts: object) => { encode(v: unknown): Uint8Array } }).Encoder
     const DecoderCtor = (mp as unknown as { Decoder?: new (opts: object) => { decode(b: Uint8Array): unknown } }).Decoder
-    const opts = { useBigInt64: true }
+    const opts = {}
     sharedMsgpack = {
       encoder: EncoderCtor ? new EncoderCtor(opts) : { encode: (v) => mp.encode(v, opts) },
       decoder: DecoderCtor ? new DecoderCtor(opts) : { decode: (b) => mp.decode(b, opts) }

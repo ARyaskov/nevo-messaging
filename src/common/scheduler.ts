@@ -26,30 +26,43 @@ export interface ScheduledTaskStore {
   claimDue(workerId: string, now: number, limit: number, claimTtlMs: number): Promise<ScheduledTask[]>
   markCompleted(id: string, workerId: string): Promise<void>
   markFailed(id: string, error: string, workerId: string): Promise<void>
-  reschedule(id: string, nextRunAt: number, workerId: string): Promise<void>
+  reschedule(id: string, nextRunAt: number, workerId: string, error?: string): Promise<void>
   cancel(id: string): Promise<void>
   list(filter?: { status?: ScheduledTask["status"]; limit?: number }): Promise<ScheduledTask[]>
 }
 
 export class InMemoryScheduledTaskStore implements ScheduledTaskStore {
   private readonly map = new Map<string, ScheduledTask>()
+  private readonly terminalRetentionMs: number
+  private readonly maxTerminalTasks: number
+
+  constructor(opts: { terminalRetentionMs?: number; maxTerminalTasks?: number } = {}) {
+    this.terminalRetentionMs = Math.max(0, opts.terminalRetentionMs ?? 60 * 60_000)
+    this.maxTerminalTasks = Math.max(0, opts.maxTerminalTasks ?? 10_000)
+  }
 
   async enqueue(task: ScheduledTask): Promise<void> {
-    // Dedup by id (cron ids are deterministic) so the job fires once per cluster.
-    if (this.map.has(task.id)) return
+    this.pruneTerminal()
+    const existing = this.map.get(task.id)
+    // Cron IDs are deterministic. Re-registering the same definition is a
+    // no-op, while a changed expression/timezone replaces the old schedule.
+    if (existing) {
+      if (task.cron && (existing.cron !== task.cron || existing.timezone !== task.timezone || existing.name !== task.name)) {
+        this.map.set(task.id, { ...task, createdAt: existing.createdAt })
+      }
+      return
+    }
     this.map.set(task.id, { ...task })
   }
 
   async claimDue(workerId: string, now: number, limit: number, claimTtlMs: number): Promise<ScheduledTask[]> {
+    this.pruneTerminal(now)
     const claimed: ScheduledTask[] = []
     for (const task of this.map.values()) {
       if (claimed.length >= limit) break
       if (task.runAt > now) continue
       // Claimable when pending, or when a prior claim's lease has expired.
-      const leaseExpired =
-        task.status === "running" &&
-        task.claimedAt !== undefined &&
-        now - task.claimedAt >= claimTtlMs
+      const leaseExpired = task.status === "running" && task.claimedAt !== undefined && now - task.claimedAt >= claimTtlMs
       if (task.status !== "pending" && !leaseExpired) continue
       task.claimedAt = now
       task.claimedBy = workerId
@@ -74,16 +87,19 @@ export class InMemoryScheduledTaskStore implements ScheduledTaskStore {
     t.claimedAt = undefined
     t.claimedBy = undefined
     t.status = t.attempts >= t.maxAttempts ? "failed" : "pending"
+    if (t.status === "failed") t.completedAt = Date.now()
   }
 
-  async reschedule(id: string, nextRunAt: number, workerId: string): Promise<void> {
+  async reschedule(id: string, nextRunAt: number, workerId: string, error?: string): Promise<void> {
     const t = this.map.get(id)
     if (!this.owns(t, workerId)) return
     t.runAt = nextRunAt
     t.status = "pending"
     t.attempts = 0
+    if (error !== undefined) t.lastError = error
     t.claimedAt = undefined
     t.claimedBy = undefined
+    t.completedAt = undefined
   }
 
   // Fence: only the worker that still holds the (running) claim may finalize.
@@ -95,13 +111,33 @@ export class InMemoryScheduledTaskStore implements ScheduledTaskStore {
     const t = this.map.get(id)
     if (!t) return
     t.status = "cancelled"
+    t.completedAt = Date.now()
   }
 
   async list(filter?: { status?: ScheduledTask["status"]; limit?: number }): Promise<ScheduledTask[]> {
+    this.pruneTerminal()
     let out = Array.from(this.map.values())
     if (filter?.status) out = out.filter((t) => t.status === filter.status)
     if (filter?.limit) out = out.slice(0, filter.limit)
     return out.map((t) => ({ ...t }))
+  }
+
+  private pruneTerminal(now = Date.now()): void {
+    const terminal: ScheduledTask[] = []
+    for (const task of this.map.values()) {
+      if (task.status !== "completed" && task.status !== "failed" && task.status !== "cancelled") continue
+      const terminalAt = task.completedAt ?? task.createdAt
+      if (now - terminalAt > this.terminalRetentionMs) {
+        this.map.delete(task.id)
+      } else {
+        terminal.push(task)
+      }
+    }
+    if (terminal.length <= this.maxTerminalTasks) return
+    terminal.sort((a, b) => (a.completedAt ?? a.createdAt) - (b.completedAt ?? b.createdAt))
+    for (let i = 0; i < terminal.length - this.maxTerminalTasks; i++) {
+      this.map.delete(terminal[i].id)
+    }
   }
 }
 
@@ -147,24 +183,31 @@ export class Scheduler {
     this.handlers.delete(name)
   }
 
-  hasHandler(name: string): boolean { return this.handlers.has(name) }
+  hasHandler(name: string): boolean {
+    return this.handlers.has(name)
+  }
 
   /** Run `name` at the given epoch ms. */
-  async enqueueAt(name: string, payload: unknown, runAt: number | Date): Promise<string> {
-    return this.enqueue(name, payload, typeof runAt === "number" ? runAt : runAt.getTime())
+  async enqueueAt(name: string, payload: unknown, runAt: number | Date, opts: { id?: string; maxAttempts?: number } = {}): Promise<string> {
+    return this.enqueue(name, payload, typeof runAt === "number" ? runAt : runAt.getTime(), opts)
   }
 
   /** Run `name` after `ms` milliseconds. */
-  async enqueueIn(name: string, payload: unknown, ms: number): Promise<string> {
-    return this.enqueue(name, payload, Date.now() + Math.max(0, ms))
+  async enqueueIn(name: string, payload: unknown, ms: number, opts: { id?: string; maxAttempts?: number } = {}): Promise<string> {
+    return this.enqueue(name, payload, Date.now() + Math.max(0, ms), opts)
   }
 
   /** Schedule `name` to recur on a cron expression (deduped per cluster by a name-derived id). */
-  async enqueueCron(name: string, payload: unknown, cron: string, opts: CronOptions = {}): Promise<string> {
+  async enqueueCron(name: string, payload: unknown, cron: string, opts: CronOptions & { id?: string; maxAttempts?: number } = {}): Promise<string> {
     if (!isValidCron(cron)) throw new Error(`Scheduler: invalid cron "${cron}"`)
     const timezone = opts.utc ? "UTC" : opts.timezone
     const next = nextCronTick(cron, Date.now(), opts)
-    return this.enqueue(name, payload, next, { cron, timezone, id: `cron:${name}` })
+    return this.enqueue(name, payload, next, {
+      cron,
+      timezone,
+      id: opts.id ?? `cron:${name}`,
+      maxAttempts: opts.maxAttempts
+    })
   }
 
   /** Cancel a pending task. No-op if it already ran. */
@@ -182,7 +225,9 @@ export class Scheduler {
     this.stopped = false
     const tick = async () => {
       if (this.stopped) return
-      try { await this.flushOnce() } catch (err) {
+      try {
+        await this.flushOnce()
+      } catch (err) {
         this.logger.warn({ event: "scheduler.tick.failed", err: (err as Error)?.message })
       }
       if (!this.stopped) {
@@ -235,7 +280,18 @@ export class Scheduler {
           executed++
         }
       } catch (err) {
-        await this.store.markFailed(task.id, (err as Error)?.message ?? String(err), this.workerId)
+        const error = (err as Error)?.message ?? String(err)
+        if (task.cron && task.attempts + 1 >= task.maxAttempts) {
+          const cronOpts = task.timezone ? { timezone: task.timezone } : undefined
+          const next = nextCronTick(task.cron, Date.now(), cronOpts)
+          if (next > 0) {
+            await this.store.reschedule(task.id, next, this.workerId, error)
+            failed++
+            rescheduled++
+            continue
+          }
+        }
+        await this.store.markFailed(task.id, error, this.workerId)
         failed++
       }
     }
@@ -246,7 +302,7 @@ export class Scheduler {
     name: string,
     payload: unknown,
     runAt: number,
-    opts: { cron?: string; timezone?: string; id?: string } = {}
+    opts: { cron?: string; timezone?: string; id?: string; maxAttempts?: number } = {}
   ): Promise<string> {
     const id = opts.id ?? uuidv7()
     const task: ScheduledTask = {
@@ -257,7 +313,7 @@ export class Scheduler {
       cron: opts.cron,
       timezone: opts.timezone,
       attempts: 0,
-      maxAttempts: this.maxAttempts,
+      maxAttempts: Math.max(1, opts.maxAttempts ?? this.maxAttempts),
       status: "pending",
       createdAt: Date.now()
     }
@@ -296,8 +352,7 @@ interface ScheduledMeta extends ScheduledDecoratorOptions {
 export function Scheduled(options: ScheduledDecoratorOptions = {}): MethodDecorator {
   return (target, propertyKey) => {
     const ctor = (target as any)?.constructor ?? target
-    const list =
-      (Reflect.getMetadata(NEVO_METHOD_SCHEDULED, ctor) as ScheduledMeta[] | undefined) ?? []
+    const list = (Reflect.getMetadata(NEVO_METHOD_SCHEDULED, ctor) as ScheduledMeta[] | undefined) ?? []
     list.push({ ...options, propertyKey: propertyKey as string })
     Reflect.defineMetadata(NEVO_METHOD_SCHEDULED, list, ctor)
   }
@@ -309,10 +364,7 @@ export function getScheduledMethods(target: any): ScheduledMeta[] {
 }
 
 /** Find `@Scheduled` methods on `instances`, register them, and enqueue an initial run. */
-export async function discoverAndRegisterScheduled(
-  scheduler: Scheduler,
-  instances: object[]
-): Promise<Array<{ name: string; taskId?: string }>> {
+export async function discoverAndRegisterScheduled(scheduler: Scheduler, instances: object[]): Promise<Array<{ name: string; taskId?: string }>> {
   const out: Array<{ name: string; taskId?: string }> = []
   for (const instance of instances) {
     const className = instance.constructor?.name ?? "Unknown"
@@ -325,12 +377,17 @@ export async function discoverAndRegisterScheduled(
       if (meta.cron) {
         taskId = await scheduler.enqueueCron(handlerName, undefined, meta.cron, {
           timezone: meta.timezone,
-          utc: meta.utc
+          utc: meta.utc,
+          maxAttempts: meta.maxAttempts
         })
       } else if (meta.at !== undefined) {
-        taskId = await scheduler.enqueueAt(handlerName, undefined, meta.at)
+        taskId = await scheduler.enqueueAt(handlerName, undefined, meta.at, {
+          maxAttempts: meta.maxAttempts
+        })
       } else if (meta.in !== undefined) {
-        taskId = await scheduler.enqueueIn(handlerName, undefined, meta.in)
+        taskId = await scheduler.enqueueIn(handlerName, undefined, meta.in, {
+          maxAttempts: meta.maxAttempts
+        })
       }
       out.push({ name: handlerName, taskId })
     }

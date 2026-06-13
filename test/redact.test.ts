@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { redactObject, jsonByteSize } from "../src/common/redact"
+import { redactObject, jsonByteSize, pinoRedactPaths } from "../src/common/redact"
 
 test("redacts known secret keys", () => {
   const x = { username: "alice", password: "p@ss", auth: { token: "abc" }, nested: { secret: "s" } }
@@ -10,6 +10,12 @@ test("redacts known secret keys", () => {
   // "auth" matches the sensitive-substring set, so the whole blob is redacted.
   assert.equal(r.auth, "[REDACTED]")
   assert.equal(r.nested.secret, "[REDACTED]")
+})
+
+test("pino redaction paths cover secrets nested beyond depth two", () => {
+  const paths = pinoRedactPaths()
+  assert.ok(paths.includes("*.*.*.token"))
+  assert.ok(paths.includes('*.*.*["x-api-key"]'))
 })
 
 test("handles cycles", () => {
@@ -81,7 +87,10 @@ test("summarizes binary data instead of expanding it", () => {
 test("unfolds Map/Set and passes Date/RegExp through", () => {
   const when = new Date("2020-01-02T03:04:05.000Z")
   const r = redactObject({
-    map: new Map<string, unknown>([["password", "x"], ["name", "alice"]]),
+    map: new Map<string, unknown>([
+      ["password", "x"],
+      ["name", "alice"]
+    ]),
     set: new Set([1, 2, 2]),
     when,
     re: /abc/g

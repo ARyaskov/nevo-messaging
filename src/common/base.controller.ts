@@ -25,7 +25,7 @@ import { ReplayGuard } from "./replay-protection"
 import { getSchemaFor, toValidator } from "./schema"
 import { parseMethod, isVersionCompatible, DEFAULT_METHOD_VERSION } from "./version"
 import { getDefaultMetrics, NEVO_METRIC_NAMES, methodLabel } from "./metrics"
-import { getDefaultTracer, NevoTracer } from "./tracing"
+import { getDefaultTracer, NevoTracer, runWithSpan, SpanLike } from "./tracing"
 import { DlqRouter } from "./dlq"
 import { RateLimiter, resolveRateLimiter, RateLimiterOptions } from "./rate-limit"
 import { NEVO_CONTRACT_METHOD, buildContract, ServiceContract } from "./contract"
@@ -62,6 +62,8 @@ export abstract class BaseMessageController {
   protected readonly tracer: NevoTracer | null
   protected readonly defaultVersion: string
   protected readonly rateLimiter: RateLimiter
+  private readonly ownsRateLimiter: boolean
+  private readonly disableBuiltinHandlers: boolean
   protected readonly healthRegistry?: HealthRegistry
   protected readonly instanceId?: string
   protected readonly capabilities?: string[]
@@ -120,6 +122,8 @@ export abstract class BaseMessageController {
     this.tracer = options?.tracing?.enabled === false ? null : getDefaultTracer()
     this.defaultVersion = options?.defaultVersion || DEFAULT_METHOD_VERSION
     this.rateLimiter = options?.rateLimit !== undefined ? resolveRateLimiter(options.rateLimit) : new RateLimiter()
+    this.ownsRateLimiter = !(options?.rateLimit instanceof RateLimiter)
+    this.disableBuiltinHandlers = options?.disableBuiltinHandlers === true
     this.healthRegistry = options?.health
     this.instanceId = options?.instanceId
     this.capabilities = options?.capabilities
@@ -223,7 +227,7 @@ export abstract class BaseMessageController {
         result: "error",
         error: {
           code: ErrorCode.INTERNAL,
-          message: !IS_PROD ? error?.message ?? String(error) : "Internal server error",
+          message: !IS_PROD ? (error?.message ?? String(error)) : "Internal server error",
           details: {},
           service: this.serviceName
         }
@@ -268,7 +272,9 @@ export abstract class BaseMessageController {
 
     // Establish a chain context so outbound calls inherit the same chain id.
     const chainId = resolveInboundChainId(meta?.nevoChainId)
-    return runInChain({ chainId, parentUuid: uuid }, () => this.runProcessMessage(data, method, uuid, params, meta, nowMs, startMs, success, chainId, metrics))
+    return runInChain({ chainId, parentUuid: uuid }, () =>
+      this.runProcessMessage(data, method, uuid, params, meta, nowMs, startMs, success, chainId, metrics)
+    )
   }
 
   private async runProcessMessage(
@@ -287,11 +293,6 @@ export abstract class BaseMessageController {
     let idemKey: string | undefined
     let idemBegan = false
     let idemCommitted = false
-
-    if (!this["__disableBuiltinHandlers"]) {
-      const builtin = await this.handleBuiltinMethod(method, uuid, meta).catch(() => null)
-      if (builtin) return builtin
-    }
 
     const baseContext = { method, serviceName: this.serviceName, uuid, rawData: data, meta }
     const requestContext = { ...baseContext, params }
@@ -315,20 +316,6 @@ export abstract class BaseMessageController {
           ts: nowMs
         })
         return this.createErrorResponse(uuid, method, err, meta)
-      }
-
-      // Idempotency (claim-before-execute): dedup on idempotencyKey, else uuid.
-      idemKey = meta?.idempotencyKey || uuid
-      if (idemKey && this.idem.isEnabled()) {
-        const began = await this.idem.begin(idemKey)
-        if (began.status === "hit") return began.value
-        idemBegan = true
-      }
-
-      let processedParams = params
-      if (this.beforeHook) {
-        const hookResult = await this.beforeHook(requestContext)
-        if (hookResult !== undefined) processedParams = hookResult
       }
 
       const callerService = await extractCallerService(meta, this.accessControl?.jwtVerifier)
@@ -355,6 +342,30 @@ export abstract class BaseMessageController {
         return finalResponse
       }
 
+      if (!this.disableBuiltinHandlers) {
+        const builtin = await this.handleBuiltinMethod(method, uuid, meta)
+        if (builtin) {
+          finalResponse = builtin
+          return builtin
+        }
+      }
+
+      // Idempotency (claim-before-execute): dedup on idempotencyKey, else uuid,
+      // scoped by caller identity so one caller's key never serves another's cache.
+      const baseIdemKey = meta?.idempotencyKey || uuid
+      idemKey = baseIdemKey ? `${callerService ?? "anon"}::${meta?.tenantId ?? ""}::${baseIdemKey}` : undefined
+      if (idemKey && this.idem.isEnabled()) {
+        const began = await this.idem.begin(idemKey)
+        if (began.status === "hit") return { ...began.value, uuid, meta }
+        idemBegan = true
+      }
+
+      let processedParams = params
+      if (this.beforeHook) {
+        const hookResult = await this.beforeHook(requestContext)
+        if (hookResult !== undefined) processedParams = hookResult
+      }
+
       const handler = this.methodRegistry[parsed.name] ?? this.methodRegistry[method]
       if (!handler) {
         const suggestion = suggestClosestMethod(parsed.name, Object.keys(this.methodRegistry))
@@ -370,22 +381,30 @@ export abstract class BaseMessageController {
         })
       }
 
-      const span = this.tracer?.startSpan(`nevo.serve ${this.serviceName}.${parsed.name}`, {
-        "nevo.method": method,
-        "nevo.service": this.serviceName
-      })
-
-      let result: unknown
-      try {
-        result = await this.executeHandler(handler, processedParams)
-        span?.setStatus({ code: 1 })
-      } catch (err) {
-        span?.recordException(err)
-        span?.setStatus({ code: 2, message: (err as Error)?.message })
-        throw err
-      } finally {
-        span?.end()
+      const invokeWithSpan = async (span: SpanLike | null): Promise<unknown> => {
+        try {
+          const value = await this.executeHandler(handler, processedParams)
+          span?.setStatus({ code: 1 })
+          return value
+        } catch (err) {
+          span?.recordException(err)
+          span?.setStatus({ code: 2, message: (err as Error)?.message })
+          throw err
+        }
       }
+
+      const result: unknown = this.tracer
+        ? await runWithSpan(
+            this.tracer,
+            `nevo.serve ${this.serviceName}.${parsed.name}`,
+            {
+              "nevo.method": method,
+              "nevo.service": this.serviceName
+            },
+            meta,
+            invokeWithSpan
+          )
+        : await invokeWithSpan(null)
       const formattedResult = await this.formatResult(result)
 
       let response: MessageResponse = { uuid, method, params: { result: formattedResult }, meta }
@@ -462,7 +481,9 @@ export abstract class BaseMessageController {
       }
       // Release a still-held claim when no result was committed.
       if (idemKey && idemBegan && !idemCommitted) {
-        try { await this.idem.release(idemKey) } catch {}
+        try {
+          await this.idem.release(idemKey)
+        } catch {}
       }
     }
   }
@@ -470,4 +491,12 @@ export abstract class BaseMessageController {
   protected abstract extractMessageData(data: any): { method: string; uuid: string; params: any; meta?: MessageMeta }
 
   public abstract handleMessage(data: any): Promise<MessageResponse>
+
+  async close(): Promise<void> {
+    if (this.ownsRateLimiter) this.rateLimiter.stop()
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await this.close()
+  }
 }

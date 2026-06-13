@@ -1,17 +1,14 @@
 import { MessagingError } from "./errors"
 import { ErrorCode } from "./error-code"
-import {
-  RateLimiter,
-  type RateLimiterKeyContext,
-  type RateLimiterKeyExtractor,
-  type RateLimiterOptions
-} from "./rate-limit"
+import { RateLimiter, type RateLimiterKeyContext, type RateLimiterKeyExtractor, type RateLimiterOptions } from "./rate-limit"
 import { getDefaultLogger, type NevoLogger } from "./logger"
 
 /** Redis-backed token-bucket rate limiter shared across replicas. */
 
 export interface RateLimitRedisClient {
   eval(args: { script: string; keys: string[]; args: string[] }): Promise<unknown>
+  scriptLoad?(script: string): Promise<string>
+  evalSha?(args: { sha: string; keys: string[]; args: string[] }): Promise<unknown>
   scanKeys?(prefix: string, count?: number): Promise<string[]>
   get?(key: string): Promise<string | null>
   hget?(key: string, field: string): Promise<string | null>
@@ -31,14 +28,14 @@ const TOKEN_BUCKET_LUA = `
 -- KEYS[1] = bucket key
 -- ARGV[1] = capacity (number)
 -- ARGV[2] = refillPerSec (number)
--- ARGV[3] = now (ms)
--- ARGV[4] = ttlMs
+-- ARGV[3] = ttlMs
 -- Returns { allowed: 0|1, retryAfterMs, tokensRemaining }
 
 local capacity     = tonumber(ARGV[1])
 local refill       = tonumber(ARGV[2])
-local now          = tonumber(ARGV[3])
-local ttl          = tonumber(ARGV[4])
+local ttl          = tonumber(ARGV[3])
+local serverTime   = redis.call('TIME')
+local now          = tonumber(serverTime[1]) * 1000 + math.floor(tonumber(serverTime[2]) / 1000)
 
 local data = redis.call('HMGET', KEYS[1], 'tokens', 'lastRefill')
 local tokens     = tonumber(data[1])
@@ -57,7 +54,7 @@ end
 
 if tokens < 1 then
   local need = 1 - tokens
-  local retryAfterMs = math.ceil((need / refill) * 1000.0)
+  local retryAfterMs = refill > 0 and math.ceil((need / refill) * 1000.0) or ttl
   redis.call('HMSET', KEYS[1], 'tokens', tokens, 'lastRefill', now)
   redis.call('PEXPIRE', KEYS[1], ttl)
   return { 0, retryAfterMs, tokens }
@@ -98,6 +95,8 @@ export class RedisRateLimiter {
   private readonly logger: NevoLogger
   private readonly failOpen: boolean
   private readonly ttlMs: number
+  private scriptSha?: string
+  private scriptLoad?: Promise<string>
 
   constructor(opts: RedisRateLimiterOptions) {
     if (!opts.client) throw new Error("RedisRateLimiter: `client` is required")
@@ -112,7 +111,41 @@ export class RedisRateLimiter {
     this.ttlMs = Math.max(60_000, opts.idleEvictMs ?? 10 * 60_000)
   }
 
-  isEnabled(): boolean { return this.enabled }
+  isEnabled(): boolean {
+    return this.enabled
+  }
+
+  private async loadScript(): Promise<string> {
+    if (this.scriptSha) return this.scriptSha
+    if (!this.client.scriptLoad) throw new Error("Redis client does not support SCRIPT LOAD")
+    if (!this.scriptLoad) {
+      this.scriptLoad = this.client
+        .scriptLoad(TOKEN_BUCKET_LUA)
+        .then((sha) => {
+          this.scriptSha = sha
+          return sha
+        })
+        .finally(() => {
+          this.scriptLoad = undefined
+        })
+    }
+    return this.scriptLoad
+  }
+
+  private async executeScript(key: string, args: string[]): Promise<unknown> {
+    if (!this.client.evalSha || !this.client.scriptLoad) {
+      return this.client.eval({ script: TOKEN_BUCKET_LUA, keys: [key], args })
+    }
+    let sha = await this.loadScript()
+    try {
+      return await this.client.evalSha({ sha, keys: [key], args })
+    } catch (err) {
+      if (!/NOSCRIPT/i.test((err as Error)?.message ?? "")) throw err
+      this.scriptSha = undefined
+      sha = await this.loadScript()
+      return this.client.evalSha({ sha, keys: [key], args })
+    }
+  }
 
   async check(ctx: RateLimiterKeyContext): Promise<void> {
     if (!this.enabled) return
@@ -122,21 +155,9 @@ export class RedisRateLimiter {
 
     let result: unknown
     try {
-      result = await this.client.eval({
-        script: TOKEN_BUCKET_LUA,
-        keys: [key],
-        args: [
-          String(this.defaultCapacity),
-          String(this.defaultRefill),
-          String(Date.now()),
-          String(this.ttlMs)
-        ]
-      })
+      result = await this.executeScript(key, [String(this.defaultCapacity), String(this.defaultRefill), String(this.ttlMs)])
     } catch (err) {
-      this.logger.warn(
-        { event: "rate-limit.redis.eval.failed", err: (err as Error)?.message },
-        "Redis eval failed for rate limit"
-      )
+      this.logger.warn({ event: "rate-limit.redis.eval.failed", err: (err as Error)?.message }, "Redis eval failed for rate limit")
       if (!this.failOpen) {
         throw new MessagingError(ErrorCode.INTERNAL, {
           message: "RedisRateLimiter eval failed",

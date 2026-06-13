@@ -21,10 +21,17 @@ function gaugedRedis() {
   const storage = new Map<string, string>()
   let inFlight = 0
   let maxInFlight = 0
-  const enter = () => { inFlight++; if (inFlight > maxInFlight) maxInFlight = inFlight }
-  const leave = () => { inFlight-- }
+  const enter = () => {
+    inFlight++
+    if (inFlight > maxInFlight) maxInFlight = inFlight
+  }
+  const leave = () => {
+    inFlight--
+  }
   const client: IdempotencyRedisLike & InboxRedisClient = {
-    async get(key: string) { return storage.get(key) ?? null },
+    async get(key: string) {
+      return storage.get(key) ?? null
+    },
     async set(key: string, value: string, opts: { ttlMs: number; ifNotExists?: boolean }) {
       enter()
       try {
@@ -36,10 +43,20 @@ function gaugedRedis() {
         leave()
       }
     },
-    async del(key: string) { return storage.delete(key) ? 1 : 0 },
-    async exists(key: string) { return storage.has(key) ? 1 : 0 }
+    async del(key: string) {
+      return storage.delete(key) ? 1 : 0
+    },
+    async exists(key: string) {
+      return storage.has(key) ? 1 : 0
+    }
   }
-  return { client, storage, get maxInFlight() { return maxInFlight } }
+  return {
+    client,
+    storage,
+    get maxInFlight() {
+      return maxInFlight
+    }
+  }
 }
 
 // ===========================================================================
@@ -144,14 +161,20 @@ function fakeInboxRedis(): InboxRedisClient & { storage: Map<string, string> } {
   const storage = new Map<string, string>()
   return {
     storage,
-    async get(key) { return storage.get(key) ?? null },
+    async get(key) {
+      return storage.get(key) ?? null
+    },
     async set(key, value, opts) {
       if (opts.ifNotExists && storage.has(key)) return null
       storage.set(key, value)
       return "OK"
     },
-    async del(key) { return storage.delete(key) ? 1 : 0 },
-    async exists(key) { return storage.has(key) ? 1 : 0 }
+    async del(key) {
+      return storage.delete(key) ? 1 : 0
+    },
+    async exists(key) {
+      return storage.has(key) ? 1 : 0
+    }
   } as InboxRedisClient & { storage: Map<string, string> }
 }
 
@@ -184,8 +207,13 @@ test("Inbox.dedupe with RedisInboxStore: void handler runs ONCE across replicas"
   const inboxA = new Inbox({ store: new RedisInboxStore({ client: shared }), awaitTimeoutMs: 500 })
   const inboxB = new Inbox({ store: new RedisInboxStore({ client: shared }), awaitTimeoutMs: 500 })
 
-  const r1 = await inboxA.dedupe("void-evt", async () => { calls++; /* returns undefined */ })
-  const r2 = await inboxB.dedupe("void-evt", async () => { calls++; return { should: "not run" } })
+  const r1 = await inboxA.dedupe("void-evt", async () => {
+    calls++ /* returns undefined */
+  })
+  const r2 = await inboxB.dedupe("void-evt", async () => {
+    calls++
+    return { should: "not run" }
+  })
 
   assert.equal(calls, 1, "the second replica must see the void completion and skip the handler")
   assert.equal(r1, undefined)
@@ -195,9 +223,15 @@ test("Inbox.dedupe with RedisInboxStore: void handler runs ONCE across replicas"
 test("Inbox.dedupe with RedisInboxStore: void handler deduped under same-instance concurrency", async () => {
   let calls = 0
   let release!: () => void
-  const gate = new Promise<void>((r) => { release = r })
+  const gate = new Promise<void>((r) => {
+    release = r
+  })
   const inbox = new Inbox({ store: new RedisInboxStore({ client: fakeInboxRedis() }), awaitTimeoutMs: 500 })
-  const run = () => inbox.dedupe("void-cc", async () => { calls++; await gate /* returns undefined */ })
+  const run = () =>
+    inbox.dedupe("void-cc", async () => {
+      calls++
+      await gate /* returns undefined */
+    })
 
   const p1 = run()
   const p2 = run()
@@ -227,7 +261,9 @@ test("LruIdempotencyCache.delete removes the entry (has/get report absent)", () 
 
 test("LruIdempotencyCache.delete unlinks the LRU node (list stays consistent)", () => {
   const c = new LruIdempotencyCache<number>({ enabled: true, maxEntries: 3, ttlMs: 60_000 })
-  c.set("a", 1); c.set("b", 2); c.set("c", 3)
+  c.set("a", 1)
+  c.set("b", 2)
+  c.set("c", 3)
   c.delete("b") // remove a middle node
   assert.equal(c.has("b"), false)
   // The remaining entries are intact and still tracked.
@@ -235,7 +271,8 @@ test("LruIdempotencyCache.delete unlinks the LRU node (list stays consistent)", 
   assert.equal(c.get("c"), 3)
   assert.equal(c.size(), 2)
   // Re-inserting after delete works and respects capacity.
-  c.set("d", 4); c.set("e", 5)
+  c.set("d", 4)
+  c.set("e", 5)
   assert.equal(c.size(), 3, "capacity still enforced after delete + reinsert")
 })
 

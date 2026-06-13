@@ -47,7 +47,9 @@ export class ContractPoller {
     void loop()
   }
 
-  async pollOnce(): Promise<void> { await this.tick() }
+  async pollOnce(): Promise<void> {
+    await this.tick()
+  }
 
   stop(): void {
     this.stopped = true
@@ -121,7 +123,9 @@ export async function broadcastContractChanged(
   }
 }
 
-export function createContractFetcherForClient(client: { query: (svc: string, method: string, params: unknown) => Promise<unknown> }): ContractFetcher {
+export function createContractFetcherForClient(client: {
+  query: (svc: string, method: string, params: unknown) => Promise<unknown>
+}): ContractFetcher {
   return {
     fetch: async (serviceName: string) => {
       const result = await client.query(serviceName, NEVO_CONTRACT_METHOD, {})

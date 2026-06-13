@@ -6,7 +6,9 @@ export class GracefulShutdown {
   private shuttingDown = false
   private resolveDrain?: () => void
 
-  isShuttingDown(): boolean { return this.shuttingDown }
+  isShuttingDown(): boolean {
+    return this.shuttingDown
+  }
 
   register(name: string, fn: ShutdownHook): void {
     this.hooks.push({ name, fn })
@@ -37,9 +39,7 @@ export class GracefulShutdown {
       this.resolveDrain = undefined
     }
     if (this.inflight.size > 0) {
-      console.warn(
-        `[GracefulShutdown] drain timed out after ${timeoutMs}ms with ${this.inflight.size} inflight task(s) remaining`
-      )
+      console.warn(`[GracefulShutdown] drain timed out after ${timeoutMs}ms with ${this.inflight.size} inflight task(s) remaining`)
     }
   }
 

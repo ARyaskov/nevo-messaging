@@ -1,4 +1,5 @@
 import { ClientKafka } from "@nestjs/microservices"
+import type { OnModuleDestroy } from "@nestjs/common"
 import { lastValueFrom, timeout, TimeoutError as RxTimeoutError } from "rxjs"
 import { randomUUID } from "node:crypto"
 import { uuidv7 } from "../../common/uuid"
@@ -78,12 +79,14 @@ interface StickyGroup {
   dispatcher: Map<string, Set<StickyHandlerEntry>>
   manualAck: boolean
   deliveryCounts: Map<string, number>
+  running: boolean
+  lifecycle: Promise<void>
 }
 
 // Defensive upper bound on a consumer's deliveryCounts map.
 const MAX_DELIVERY_COUNTS = 10_000
 
-export class NevoKafkaClient {
+export class NevoKafkaClient implements OnModuleDestroy {
   private readonly kafkaClient: ClientKafka
   private readonly serviceNames: string[]
   private readonly timeoutMs: number
@@ -108,10 +111,12 @@ export class NevoKafkaClient {
   private readonly discoveryTtlMs: number
   private discoveryProducer?: Producer
   private batchProducer?: Producer
+  private batchProducerPromise?: Promise<Producer>
   private discoveryConsumer?: Consumer
   private discoveryTimer?: NodeJS.Timeout
   private readonly subscriptionConsumers = new Set<Consumer>()
   private readonly stickyGroups = new Map<string, StickyGroup>()
+  private readonly stickyGroupPromises = new Map<string, Promise<StickyGroup>>()
   private readonly enableStickyRouter: boolean
   private readonly sharedKafkaForSubs: KafkaType
   private readonly capabilities?: string[]
@@ -149,7 +154,7 @@ export class NevoKafkaClient {
     this.version = options?.discovery?.version
     this.dlq = new DlqRouter({ enabled: (options as any)?.dlq?.enabled === true })
     this.enableStickyRouter = (options as any)?.stickyRouter !== false
-    this.devtoolsBus = options?.devtools === false ? null : (options?.devtools instanceof Object ? (options.devtools as DevToolsBus) : getDevToolsBus())
+    this.devtoolsBus = options?.devtools === false ? null : options?.devtools instanceof Object ? (options.devtools as DevToolsBus) : getDevToolsBus()
     this.metaStaticPart = Object.freeze({
       service: this.serviceName,
       instanceId: this.instanceId,
@@ -165,9 +170,7 @@ export class NevoKafkaClient {
 
     this.serviceNames.forEach((serviceName) => {
       const topicName = `${serviceName}-events`
-      const replyTopicName = `${topicName}.reply`
       this.kafkaClient.subscribeToResponseOf(topicName)
-      this.kafkaClient.subscribeToResponseOf(replyTopicName)
     })
 
     if (this.discoveryEnabled) {
@@ -176,9 +179,14 @@ export class NevoKafkaClient {
     }
   }
 
-  getInstanceId(): string { return this.instanceId }
+  getInstanceId(): string {
+    return this.instanceId
+  }
 
-  private buildMeta(type: MessageType, opts?: { idempotencyKey?: string; version?: string; headers?: Record<string, string>; tenantId?: string }): MessageMeta {
+  private buildMeta(
+    type: MessageType,
+    opts?: { idempotencyKey?: string; version?: string; headers?: Record<string, string>; tenantId?: string }
+  ): MessageMeta {
     const baseMeta: MessageMeta = {
       ...this.metaStaticPart,
       type,
@@ -192,8 +200,13 @@ export class NevoKafkaClient {
     return this.tracer.inject(baseMeta)
   }
 
-  private encodeRequestSync(method: string, params: unknown, type: MessageType, opts?: { idempotencyKey?: string; version?: string; headers?: Record<string, string>; tenantId?: string }): { key: string; value: Uint8Array; meta: MessageMeta; uuid: string; method: string } {
-    const uuid = uuidv7()
+  private encodeRequestSync(
+    method: string,
+    params: unknown,
+    type: MessageType,
+    opts?: { idempotencyKey?: string; version?: string; headers?: Record<string, string>; tenantId?: string; uuid?: string }
+  ): { key: string; value: Uint8Array; meta: MessageMeta; uuid: string; method: string; encoding: string } {
+    const uuid = opts?.uuid ?? uuidv7()
     const meta = this.buildMeta(type, opts)
     const versioned = method.includes("@") ? method : formatMethod(method, opts?.version || DEFAULT_METHOD_VERSION)
     const body = { uuid, method: versioned, params, meta }
@@ -202,18 +215,33 @@ export class NevoKafkaClient {
       throw new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, { message: `Payload size ${raw.byteLength}B exceeds ${this.maxPayloadBytes}B` })
     }
     const compressed = maybeCompress(raw, this.compression)
-    meta.contentEncoding = compressed.encoding
-    this.metrics.observeHistogram(NEVO_METRIC_NAMES.payloadBytes, { direction: "out", service: this.serviceName ?? "unknown" }, compressed.data.byteLength)
-    return { key: uuid, value: compressed.data, meta, uuid, method: versioned }
+    this.metrics.observeHistogram(
+      NEVO_METRIC_NAMES.payloadBytes,
+      { direction: "out", service: this.serviceName ?? "unknown" },
+      compressed.data.byteLength
+    )
+    return { key: uuid, value: compressed.data, meta, uuid, method: versioned, encoding: compressed.encoding }
   }
 
-  private encodeRequest(method: string, params: unknown, type: MessageType, opts?: { idempotencyKey?: string; version?: string; headers?: Record<string, string>; tenantId?: string }): { key: string; value: Uint8Array; meta: MessageMeta; uuid: string; method: string } | Promise<{ key: string; value: Uint8Array; meta: MessageMeta; uuid: string; method: string }> {
+  private encodeRequest(
+    method: string,
+    params: unknown,
+    type: MessageType,
+    opts?: { idempotencyKey?: string; version?: string; headers?: Record<string, string>; tenantId?: string; uuid?: string }
+  ):
+    | { key: string; value: Uint8Array; meta: MessageMeta; uuid: string; method: string; encoding: string }
+    | Promise<{ key: string; value: Uint8Array; meta: MessageMeta; uuid: string; method: string; encoding: string }> {
     if (this.compression.async && this.compression.enabled) return this.encodeRequestAsync(method, params, type, opts)
     return this.encodeRequestSync(method, params, type, opts)
   }
 
-  private async encodeRequestAsync(method: string, params: unknown, type: MessageType, opts?: { idempotencyKey?: string; version?: string; headers?: Record<string, string>; tenantId?: string }): Promise<{ key: string; value: Uint8Array; meta: MessageMeta; uuid: string; method: string }> {
-    const uuid = uuidv7()
+  private async encodeRequestAsync(
+    method: string,
+    params: unknown,
+    type: MessageType,
+    opts?: { idempotencyKey?: string; version?: string; headers?: Record<string, string>; tenantId?: string; uuid?: string }
+  ): Promise<{ key: string; value: Uint8Array; meta: MessageMeta; uuid: string; method: string; encoding: string }> {
+    const uuid = opts?.uuid ?? uuidv7()
     const meta = this.buildMeta(type, opts)
     const versioned = method.includes("@") ? method : formatMethod(method, opts?.version || DEFAULT_METHOD_VERSION)
     const body = { uuid, method: versioned, params, meta }
@@ -222,15 +250,22 @@ export class NevoKafkaClient {
       throw new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, { message: `Payload size ${raw.byteLength}B exceeds ${this.maxPayloadBytes}B` })
     }
     const compressed = await maybeCompressAsync(raw, this.compression)
-    meta.contentEncoding = compressed.encoding
-    this.metrics.observeHistogram(NEVO_METRIC_NAMES.payloadBytes, { direction: "out", service: this.serviceName ?? "unknown" }, compressed.data.byteLength)
-    return { key: uuid, value: compressed.data, meta, uuid, method: versioned }
+    this.metrics.observeHistogram(
+      NEVO_METRIC_NAMES.payloadBytes,
+      { direction: "out", service: this.serviceName ?? "unknown" },
+      compressed.data.byteLength
+    )
+    return { key: uuid, value: compressed.data, meta, uuid, method: versioned, encoding: compressed.encoding }
+  }
+
+  private toKafkaHeaders(encoding: string): Record<string, string> | undefined {
+    return encoding !== "identity" ? { "content-encoding": encoding } : undefined
   }
 
   private decodePayload<T = any>(data: Uint8Array | Buffer | string, encoding?: string): T | Promise<T> {
     const buf = typeof data === "string" ? Buffer.from(data, "utf8") : Buffer.from(data as any)
     this.metrics.observeHistogram(NEVO_METRIC_NAMES.payloadBytes, { direction: "in", service: this.serviceName ?? "unknown" }, buf.byteLength)
-    // Small/identity payloads inflate synchronously; larger ones offload to the worker pool.
+    // Identity is synchronous; compressed payloads use async zlib or the worker pool.
     if (!shouldDecompressAsync(buf.byteLength, encoding)) {
       const decompressed = maybeDecompress(buf, encoding, this.maxPayloadBytes)
       enforcePayloadLimit(decompressed, this.maxPayloadBytes)
@@ -248,96 +283,171 @@ export class NevoKafkaClient {
   private ensureServiceRegistered(serviceName: string): string {
     const normalized = normalizeServiceName(serviceName)
     if (!this.serviceNames.includes(normalized)) {
-      throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, { message: `Service "${serviceName}" is not registered in nevo kafka client`, availableServices: this.serviceNames })
+      throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, {
+        message: `Service "${serviceName}" is not registered in nevo kafka client`,
+        availableServices: this.serviceNames
+      })
     }
     return normalized
   }
 
-  async query<T = unknown>(serviceName: string, method: string, params: unknown, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; tenantId?: string; timeoutMs?: number }): Promise<T> {
+  async query<T = unknown>(
+    serviceName: string,
+    method: string,
+    params: unknown,
+    opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; tenantId?: string; timeoutMs?: number }
+  ): Promise<T> {
     const normalized = this.ensureServiceRegistered(serviceName)
     const topic = `${normalized}-events`
     const cbKey = `${normalized}:${method}`
 
-    return this.shutdown.trackInflight((async () => {
-      const idempotencyKey = opts?.idempotencyKey
-      if (idempotencyKey && this.idempotencyCache.isEnabled() && this.idempotencyCache.has(idempotencyKey)) {
-        return this.idempotencyCache.get(idempotencyKey) as T
-      }
-
-      const result = await withRetry(async (attempt) => {
-        this.circuitBreaker.before(cbKey)
-        const startMs = Date.now()
-        let lastUuid: string | undefined
-        let lastChainId: string | undefined
-        try {
-          const { key, value, uuid, meta } = await this.encodeRequest(method, params, "query", { ...opts, headers: { ...(opts?.headers || {}), "nevo-attempt": String(attempt) } })
-          lastUuid = uuid
-          lastChainId = meta.nevoChainId
-          const span = this.tracer.startSpan(`nevo.client.query ${normalized}.${method}`, { "nevo.method": method, "nevo.service": normalized, "nevo.attempt": attempt })
-          try {
-            const response: any = await lastValueFrom(this.kafkaClient.send<any>(topic, { key, value: Buffer.from(value) }).pipe(timeout(opts?.timeoutMs ?? this.timeoutMs)))
-            const payload = typeof response === "string" || response instanceof Uint8Array ? await this.decodePayload(response as any) : response
-            if (payload?.params?.result === "error" && payload?.params?.error) {
-              const err = payload.params.error
-              throw new MessagingError(err.code, err.details ?? { message: err.message }, err.service || normalized)
-            }
-            this.circuitBreaker.onSuccess(cbKey)
-            span.setStatus({ code: 1 })
-            publishClientEvent(this.devtoolsBus, { service: normalized, method, uuid, chainId: lastChainId, durationMs: Date.now() - startMs, status: "ok", transport: "kafka", origin: this.serviceName })
-            return payload?.params?.result as T
-          } catch (err: any) {
-            span.recordException(err)
-            span.setStatus({ code: 2, message: err?.message })
-            if (err instanceof RxTimeoutError) throw new TimeoutError(serviceName, method, opts?.timeoutMs ?? this.timeoutMs)
-            throw err
-          } finally {
-            span.end()
-            this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, { transport: "kafka", service: normalized, method: methodLabel(method), role: "client" })
-            if (attempt > 1) this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "kafka", service: normalized, method: methodLabel(method) })
-          }
-        } catch (err: any) {
-          this.circuitBreaker.onFailure(cbKey, err)
-          publishClientEvent(this.devtoolsBus, {
-            service: normalized, method, uuid: lastUuid, chainId: lastChainId,
-            durationMs: Date.now() - startMs, status: "error", transport: "kafka", origin: this.serviceName,
-            error: { code: err instanceof MessagingError ? err.code : err?.code, message: err?.message ?? String(err) }
-          })
-          throw err
+    return this.shutdown.trackInflight(
+      (async () => {
+        const idempotencyKey = opts?.idempotencyKey
+        if (idempotencyKey && this.idempotencyCache.isEnabled() && this.idempotencyCache.has(idempotencyKey)) {
+          return this.idempotencyCache.get(idempotencyKey) as T
         }
-      }, this.retryOptions)
 
-      if (idempotencyKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(idempotencyKey, result)
-      return result
-    })())
+        const requestUuid = uuidv7()
+        const result = await withRetry(async (attempt) => {
+          this.circuitBreaker.before(cbKey)
+          const startMs = Date.now()
+          let lastUuid: string | undefined
+          let lastChainId: string | undefined
+          try {
+            const { key, value, uuid, meta, encoding } = await this.encodeRequest(method, params, "query", {
+              ...opts,
+              headers: { ...(opts?.headers || {}), "nevo-attempt": String(attempt) },
+              uuid: requestUuid
+            })
+            lastUuid = uuid
+            lastChainId = meta.nevoChainId
+            const span = this.tracer.startSpan(`nevo.client.query ${normalized}.${method}`, {
+              "nevo.method": method,
+              "nevo.service": normalized,
+              "nevo.attempt": attempt
+            })
+            try {
+              const response: any = await lastValueFrom(
+                this.kafkaClient
+                  .send<any>(topic, { key, value: Buffer.from(value), headers: this.toKafkaHeaders(encoding) })
+                  .pipe(timeout(opts?.timeoutMs ?? this.timeoutMs))
+              )
+              const payload = typeof response === "string" || response instanceof Uint8Array ? await this.decodePayload(response as any) : response
+              if (payload?.params?.result === "error" && payload?.params?.error) {
+                const err = payload.params.error
+                throw new MessagingError(err.code, err.details ?? { message: err.message }, err.service || normalized)
+              }
+              this.circuitBreaker.onSuccess(cbKey)
+              span.setStatus({ code: 1 })
+              publishClientEvent(this.devtoolsBus, {
+                service: normalized,
+                method,
+                uuid,
+                chainId: lastChainId,
+                durationMs: Date.now() - startMs,
+                status: "ok",
+                transport: "kafka",
+                origin: this.serviceName
+              })
+              return payload?.params?.result as T
+            } catch (err: any) {
+              span.recordException(err)
+              span.setStatus({ code: 2, message: err?.message })
+              if (err instanceof RxTimeoutError) throw new TimeoutError(serviceName, method, opts?.timeoutMs ?? this.timeoutMs)
+              throw err
+            } finally {
+              span.end()
+              this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, {
+                transport: "kafka",
+                service: normalized,
+                method: methodLabel(method),
+                role: "client"
+              })
+              if (attempt > 1)
+                this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "kafka", service: normalized, method: methodLabel(method) })
+            }
+          } catch (err: any) {
+            this.circuitBreaker.onFailure(cbKey, err)
+            publishClientEvent(this.devtoolsBus, {
+              service: normalized,
+              method,
+              uuid: lastUuid,
+              chainId: lastChainId,
+              durationMs: Date.now() - startMs,
+              status: "error",
+              transport: "kafka",
+              origin: this.serviceName,
+              error: { code: err instanceof MessagingError ? err.code : err?.code, message: err?.message ?? String(err) }
+            })
+            throw err
+          }
+        }, this.retryOptions)
+
+        if (idempotencyKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(idempotencyKey, result)
+        return result
+      })()
+    )
   }
 
-  async emit(serviceName: string, method: string, params: unknown, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<void> {
+  async emit(
+    serviceName: string,
+    method: string,
+    params: unknown,
+    opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }
+  ): Promise<void> {
     const normalized = this.ensureServiceRegistered(serviceName)
     const topic = `${normalized}-events`
-    const { key, value } = await this.encodeRequest(method, params, "emit", opts)
-    this.kafkaClient.emit(topic, { key, value: Buffer.from(value) })
+    const { key, value, encoding } = await this.encodeRequest(method, params, "emit", opts)
+    await lastValueFrom(this.kafkaClient.emit(topic, { key, value: Buffer.from(value), headers: this.toKafkaHeaders(encoding) }))
   }
 
-  async emitBatch(items: Array<{ serviceName: string; method: string; params: unknown; opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> } }>): Promise<void> {
-    if (items.length === 0) return
-    if (!this.batchProducer) {
+  private ensureBatchProducer(): Promise<Producer> {
+    if (this.batchProducer) return Promise.resolve(this.batchProducer)
+    if (!this.batchProducerPromise) {
       // Idempotent + single in-flight request for ordered, exactly-once appends.
-      this.batchProducer = this.sharedKafkaForSubs.producer({ idempotent: true, maxInFlightRequests: 1, allowAutoTopicCreation: true })
-      await this.batchProducer.connect()
+      const producer = this.sharedKafkaForSubs.producer({ idempotent: true, maxInFlightRequests: 1, allowAutoTopicCreation: true })
+      this.batchProducerPromise = producer.connect().then(() => {
+        this.batchProducer = producer
+        return producer
+      })
+      this.batchProducerPromise.catch(() => {
+        this.batchProducerPromise = undefined
+      })
     }
-    const byTopic = new Map<string, Array<{ key: string; value: Buffer }>>()
+    return this.batchProducerPromise
+  }
+
+  async emitBatch(
+    items: Array<{
+      serviceName: string
+      method: string
+      params: unknown
+      opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }
+    }>
+  ): Promise<void> {
+    if (items.length === 0) return
+    const producer = await this.ensureBatchProducer()
+    const byTopic = new Map<string, Array<{ key: string; value: Buffer; headers?: Record<string, string> }>>()
     if (this.compression.async && this.compression.enabled) {
       // Encode under a concurrency cap, then group in input order to keep per-topic order deterministic.
       const encoded = await mapLimit(items, BATCH_ENCODE_CONCURRENCY, async (item) => {
         const normalized = this.ensureServiceRegistered(item.serviceName)
         const topic = `${normalized}-events`
-        const { key, value } = await this.encodeRequest(item.method, item.params, "emit", item.opts) as { key: string; value: Uint8Array }
-        return { topic, key, value: Buffer.from(value) }
+        const { key, value, encoding } = (await this.encodeRequest(item.method, item.params, "emit", item.opts)) as {
+          key: string
+          value: Uint8Array
+          encoding: string
+        }
+        return { topic, key, value: Buffer.from(value), headers: this.toKafkaHeaders(encoding) }
       })
       for (const e of encoded) {
         let arr = byTopic.get(e.topic)
-        if (!arr) { arr = []; byTopic.set(e.topic, arr) }
-        arr.push({ key: e.key, value: e.value })
+        if (!arr) {
+          arr = []
+          byTopic.set(e.topic, arr)
+        }
+        arr.push({ key: e.key, value: e.value, headers: e.headers })
       }
     } else {
       for (const item of items) {
@@ -345,27 +455,32 @@ export class NevoKafkaClient {
         const topic = `${normalized}-events`
         const enc = this.encodeRequestSync(item.method, item.params, "emit", item.opts)
         let arr = byTopic.get(topic)
-        if (!arr) { arr = []; byTopic.set(topic, arr) }
-        arr.push({ key: enc.key, value: Buffer.from(enc.value) })
+        if (!arr) {
+          arr = []
+          byTopic.set(topic, arr)
+        }
+        arr.push({ key: enc.key, value: Buffer.from(enc.value), headers: this.toKafkaHeaders(enc.encoding) })
       }
     }
-    const topicMessages: { topic: string; messages: { key: string; value: Buffer }[] }[] = []
+    const topicMessages: { topic: string; messages: { key: string; value: Buffer; headers?: Record<string, string> }[] }[] = []
     for (const [topic, messages] of byTopic.entries()) topicMessages.push({ topic, messages })
-    await this.batchProducer!.sendBatch({ topicMessages, acks: -1 })
+    await producer.sendBatch({ topicMessages, acks: -1 })
   }
 
-  getAvailableServices(): string[] { return [...this.serviceNames] }
+  getAvailableServices(): string[] {
+    return [...this.serviceNames]
+  }
 
   async publish(serviceName: string, method: string, params: unknown, opts?: { version?: string; headers?: Record<string, string> }): Promise<void> {
     const normalized = this.ensureServiceRegistered(serviceName)
     const topic = `${normalized}${DEFAULT_SUBSCRIPTION_SUFFIX}`
-    const { key, value } = await this.encodeRequest(method, params, "sub", opts)
-    this.kafkaClient.emit(topic, { key, value: Buffer.from(value) })
+    const { key, value, encoding } = await this.encodeRequest(method, params, "sub", opts)
+    await lastValueFrom(this.kafkaClient.emit(topic, { key, value: Buffer.from(value), headers: this.toKafkaHeaders(encoding) }))
   }
 
   async broadcast(method: string, params: unknown, opts?: { version?: string; headers?: Record<string, string> }): Promise<void> {
-    const { key, value } = await this.encodeRequest(method, params, "broadcast", opts)
-    this.kafkaClient.emit(DEFAULT_BROADCAST_TOPIC, { key, value: Buffer.from(value) })
+    const { key, value, encoding } = await this.encodeRequest(method, params, "broadcast", opts)
+    await lastValueFrom(this.kafkaClient.emit(DEFAULT_BROADCAST_TOPIC, { key, value: Buffer.from(value), headers: this.toKafkaHeaders(encoding) }))
   }
 
   // Evict oldest-first (insertion order) once the counter map exceeds its cap.
@@ -391,7 +506,9 @@ export class NevoKafkaClient {
       return
     }
     const timer = setTimeout(() => {
-      try { resume() } catch {}
+      try {
+        resume()
+      } catch {}
     }, this.resumeBackoffMs(attempts))
     if (typeof timer.unref === "function") timer.unref()
   }
@@ -406,8 +523,7 @@ export class NevoKafkaClient {
     const isBroadcast = normalized === DEFAULT_BROADCAST_TOPIC
     if (!isBroadcast) this.ensureServiceRegistered(serviceName)
 
-    const explicitGroupId = options?.groupId
-      || (options?.durableKey ? `nevo-sub-${options.durableKey}` : undefined)
+    const explicitGroupId = options?.groupId || (options?.durableKey ? `nevo-sub-${options.durableKey}` : undefined)
     const topic = isBroadcast ? DEFAULT_BROADCAST_TOPIC : `${normalized}${DEFAULT_SUBSCRIPTION_SUFFIX}`
     const manualAck = options?.ack === true
     const maxAttempts = options?.maxDeliveryAttempts ?? 3
@@ -514,7 +630,12 @@ export class NevoKafkaClient {
     if (!topicEntries) {
       topicEntries = new Set()
       group.dispatcher.set(topic, topicEntries)
-      await group.consumer.subscribe({ topic, fromBeginning: options?.fromBeginning || false })
+      try {
+        await this.addStickyTopic(group, topic, options?.fromBeginning || false)
+      } catch (err) {
+        group.dispatcher.delete(topic)
+        throw err
+      }
     }
     topicEntries.add(entry)
 
@@ -526,25 +647,59 @@ export class NevoKafkaClient {
         }
         if (group.dispatcher.size === 0) {
           this.stickyGroups.delete(groupId)
-          try { await group.consumer.disconnect() } catch {}
+          this.stickyGroupPromises.delete(groupId)
+          this.subscriptionConsumers.delete(group.consumer)
+          try {
+            await group.consumer.disconnect()
+          } catch {}
         }
       }
     }
   }
 
-  private async ensureStickyGroup(groupId: string, manualAck: boolean): Promise<StickyGroup> {
-    let group = this.stickyGroups.get(groupId)
-    if (group) return group
+  private ensureStickyGroup(groupId: string, manualAck: boolean): Promise<StickyGroup> {
+    const pending = this.stickyGroupPromises.get(groupId)
+    if (pending) return pending
+    const created = this.createStickyGroup(groupId, manualAck)
+    this.stickyGroupPromises.set(groupId, created)
+    created.catch(() => {
+      this.stickyGroupPromises.delete(groupId)
+    })
+    return created
+  }
 
+  private async createStickyGroup(groupId: string, manualAck: boolean): Promise<StickyGroup> {
     const consumer = this.sharedKafkaForSubs.consumer({ groupId, allowAutoTopicCreation: true })
     await consumer.connect()
-    const dispatcher = new Map<string, Set<StickyHandlerEntry>>()
-    const deliveryCounts = new Map<string, number>()
-
-    group = { consumer, dispatcher, manualAck, deliveryCounts }
+    const group: StickyGroup = {
+      consumer,
+      dispatcher: new Map<string, Set<StickyHandlerEntry>>(),
+      manualAck,
+      deliveryCounts: new Map<string, number>(),
+      running: false,
+      lifecycle: Promise.resolve()
+    }
     this.stickyGroups.set(groupId, group)
     this.subscriptionConsumers.add(consumer)
+    return group
+  }
 
+  private addStickyTopic(group: StickyGroup, topic: string, fromBeginning: boolean): Promise<void> {
+    const op = group.lifecycle.then(async () => {
+      if (group.running) {
+        await group.consumer.stop()
+        group.running = false
+      }
+      await group.consumer.subscribe({ topic, fromBeginning })
+      await this.runStickyGroup(group)
+      group.running = true
+    })
+    group.lifecycle = op.catch(() => {})
+    return op
+  }
+
+  private async runStickyGroup(group: StickyGroup): Promise<void> {
+    const { consumer, dispatcher, manualAck, deliveryCounts } = group
     await consumer.run({
       autoCommit: !manualAck,
       eachMessage: async ({ topic, partition, message, pause }) => {
@@ -607,12 +762,15 @@ export class NevoKafkaClient {
         if (!retryScheduled) deliveryCounts.delete(msgKey)
       }
     })
-
-    return group
   }
 
-  getDiscoveredServices() { this.discoveryRegistry.prune(this.discoveryTtlMs); return this.discoveryRegistry.list() }
-  isServiceAvailable(serviceName: string): boolean { return this.discoveryRegistry.isAvailable(serviceName, this.discoveryTtlMs) }
+  getDiscoveredServices() {
+    this.discoveryRegistry.prune(this.discoveryTtlMs)
+    return this.discoveryRegistry.list()
+  }
+  isServiceAvailable(serviceName: string): boolean {
+    return this.discoveryRegistry.isAvailable(serviceName, this.discoveryTtlMs)
+  }
 
   private async initDiscovery(): Promise<void> {
     try {
@@ -660,17 +818,43 @@ export class NevoKafkaClient {
     }
   }
 
+  onModuleDestroy(): Promise<void> {
+    return this.close()
+  }
+
   async close(timeoutMs = 30_000): Promise<void> {
     if (this.discoveryTimer) clearInterval(this.discoveryTimer)
     this.discoveryRegistry.stopBackgroundPrune()
-    if (this.discoveryConsumer) { try { await this.discoveryConsumer.disconnect() } catch {} }
-    if (this.discoveryProducer) { try { await this.discoveryProducer.disconnect() } catch {} }
-    if (this.batchProducer) { try { await this.batchProducer.disconnect() } catch {} }
+    if (this.discoveryConsumer) {
+      try {
+        await this.discoveryConsumer.disconnect()
+      } catch {}
+    }
+    if (this.discoveryProducer) {
+      try {
+        await this.discoveryProducer.disconnect()
+      } catch {}
+    }
+    if (this.batchProducer) {
+      try {
+        await this.batchProducer.disconnect()
+      } catch {}
+    } else if (this.batchProducerPromise) {
+      try {
+        await (await this.batchProducerPromise).disconnect()
+      } catch {}
+    }
     this.stickyGroups.clear()
+    this.stickyGroupPromises.clear()
     for (const c of this.subscriptionConsumers) {
-      try { await c.disconnect() } catch {}
+      try {
+        await c.disconnect()
+      } catch {}
     }
     this.subscriptionConsumers.clear()
     await this.shutdown.shutdown(timeoutMs)
+    try {
+      await this.kafkaClient.close()
+    } catch {}
   }
 }

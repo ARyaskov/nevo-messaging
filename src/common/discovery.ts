@@ -49,7 +49,10 @@ export class DiscoveryRegistry {
   }
 
   listByService(serviceName: string): DiscoveryEntry[] {
-    return this.services.values().filter((e) => e.serviceName === serviceName).toArray()
+    return this.services
+      .values()
+      .filter((e) => e.serviceName === serviceName)
+      .toArray()
   }
 
   isAvailable(serviceName: string, ttlMs: number = this.ttlMs): boolean {

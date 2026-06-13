@@ -32,3 +32,21 @@ test("resets after timeout", async () => {
   cb.before(key)
   cb.onSuccess(key)
 })
+
+test("half-open allows only one concurrent probe", async () => {
+  const cb = new CircuitBreakerRegistry({
+    enabled: true,
+    failureThreshold: 1,
+    resetTimeoutMs: 20,
+    halfOpenSuccessThreshold: 1
+  })
+  const key = "svc:probe"
+  cb.before(key)
+  cb.onFailure(key, new Error("boom"))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+
+  cb.before(key)
+  assert.throws(() => cb.before(key), CircuitOpenError)
+  cb.onSuccess(key)
+  cb.before(key)
+})

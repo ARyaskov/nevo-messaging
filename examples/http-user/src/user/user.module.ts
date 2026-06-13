@@ -1,12 +1,5 @@
 import { Module } from "@nestjs/common"
-import {
-  HealthRegistry,
-  HttpTransportController,
-  createNevoHttpClient,
-  eventLoopLagPing,
-  httpPing,
-  memoryUsagePing
-} from "@riaskov/nevo-messaging"
+import { HealthRegistry, HttpTransportController, createNevoHttpClient, eventLoopLagPing, httpPing, memoryUsagePing } from "@riaskov/nevo-messaging"
 import { UserController } from "./user.controller"
 import { UserService } from "./user.service"
 
@@ -23,11 +16,7 @@ const COORDINATOR_URL = process.env.HTTP_COORDINATOR ?? "http://127.0.0.1:8091"
         reg.register("eventLoop", eventLoopLagPing(100), { kind: "liveness" })
         reg.register("memory", memoryUsagePing(1024), { kind: "liveness" })
         // Readiness depends on the coordinator being reachable.
-        reg.register(
-          "coordinator",
-          httpPing(`${COORDINATOR_URL}/healthz`, { timeoutMs: 2_000 }),
-          { kind: "readiness", timeoutMs: 3_000 }
-        )
+        reg.register("coordinator", httpPing(`${COORDINATOR_URL}/healthz`, { timeoutMs: 2_000 }), { kind: "readiness", timeoutMs: 3_000 })
         return reg
       }
     },

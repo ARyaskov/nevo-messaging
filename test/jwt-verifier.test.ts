@@ -30,9 +30,15 @@ function ecKeyPair(kid: string, namedCurve = "P-256"): KeyPair {
 }
 
 const HASH: Record<string, string> = {
-  RS256: "sha256", RS384: "sha384", RS512: "sha512",
-  PS256: "sha256", PS384: "sha384", PS512: "sha512",
-  ES256: "sha256", ES384: "sha384", ES512: "sha512"
+  RS256: "sha256",
+  RS384: "sha384",
+  RS512: "sha512",
+  PS256: "sha256",
+  PS384: "sha384",
+  PS512: "sha512",
+  ES256: "sha256",
+  ES384: "sha384",
+  ES512: "sha512"
 }
 
 function sign(alg: string, key: KeyObject, signingInput: string): Buffer {
@@ -125,7 +131,9 @@ test("rejects an unknown kid without falling back to another key", async () => {
 })
 
 test("fails closed (throws) when the JWKS fetch fails with nothing cached", async () => {
-  const { fn } = countingFetch(async () => { throw new Error("network down") })
+  const { fn } = countingFetch(async () => {
+    throw new Error("network down")
+  })
   const verify = createJwksVerifier({ jwksUri: "u", fetchImpl: fn })
   const token = makeToken({ alg: "RS256", key: RSA.privateKey, kid: "rsa-1", payload: { sub: "x", exp: nowSec() + 3600 } })
   await assert.rejects(() => verify(token))
@@ -147,9 +155,7 @@ test("serves a stale cached key set when a later JWKS refetch fails", async () =
 test("refetches once on a kid miss to pick up a rotated key", async () => {
   const oldKey = rsaKeyPair("old-1")
   const newKey = rsaKeyPair("new-1")
-  const { fn, calls } = countingFetch(async (call) =>
-    call === 1 ? { keys: [oldKey.jwk] } : { keys: [oldKey.jwk, newKey.jwk] }
-  )
+  const { fn, calls } = countingFetch(async (call) => (call === 1 ? { keys: [oldKey.jwk] } : { keys: [oldKey.jwk, newKey.jwk] }))
   const verify = createJwksVerifier({ jwksUri: "u", fetchImpl: fn })
   const token = makeToken({ alg: "RS256", key: newKey.privateKey, kid: "new-1", payload: { sub: "svc-a", exp: nowSec() + 3600 } })
   // call 1 fills the cache (old key only) -> kid miss -> call 2 refetch finds new-1.
@@ -191,7 +197,13 @@ test("rejects an expired token but tolerates clock skew", async () => {
 
 test("rejects unknown crit header parameters", async () => {
   const verify = rsaVerifier()
-  const token = makeToken({ alg: "RS256", key: RSA.privateKey, kid: "rsa-1", header: { crit: ["http://example/exp"] }, payload: { sub: "x", exp: nowSec() + 3600 } })
+  const token = makeToken({
+    alg: "RS256",
+    key: RSA.privateKey,
+    kid: "rsa-1",
+    header: { crit: ["http://example/exp"] },
+    payload: { sub: "x", exp: nowSec() + 3600 }
+  })
   assert.equal(await verify(token), null)
 })
 
@@ -229,17 +241,37 @@ test("rejects a token whose signature does not verify", async () => {
 
 test("enforces issuer and audience when configured", async () => {
   const verify = rsaVerifier({ issuer: "https://iss", audience: "svc-a" })
-  const good = makeToken({ alg: "RS256", key: RSA.privateKey, kid: "rsa-1", payload: { sub: "x", iss: "https://iss", aud: ["svc-a", "other"], exp: nowSec() + 3600 } })
+  const good = makeToken({
+    alg: "RS256",
+    key: RSA.privateKey,
+    kid: "rsa-1",
+    payload: { sub: "x", iss: "https://iss", aud: ["svc-a", "other"], exp: nowSec() + 3600 }
+  })
   assert.equal((await verify(good))?.sub, "x")
-  const badIss = makeToken({ alg: "RS256", key: RSA.privateKey, kid: "rsa-1", payload: { sub: "x", iss: "https://evil", aud: "svc-a", exp: nowSec() + 3600 } })
+  const badIss = makeToken({
+    alg: "RS256",
+    key: RSA.privateKey,
+    kid: "rsa-1",
+    payload: { sub: "x", iss: "https://evil", aud: "svc-a", exp: nowSec() + 3600 }
+  })
   assert.equal(await verify(badIss), null)
-  const badAud = makeToken({ alg: "RS256", key: RSA.privateKey, kid: "rsa-1", payload: { sub: "x", iss: "https://iss", aud: "nope", exp: nowSec() + 3600 } })
+  const badAud = makeToken({
+    alg: "RS256",
+    key: RSA.privateKey,
+    kid: "rsa-1",
+    payload: { sub: "x", iss: "https://iss", aud: "nope", exp: nowSec() + 3600 }
+  })
   assert.equal(await verify(badAud), null)
 })
 
 test("ignores non-string aud entries when matching audience", async () => {
   const verify = rsaVerifier({ audience: "svc-a" })
-  const mixed = makeToken({ alg: "RS256", key: RSA.privateKey, kid: "rsa-1", payload: { sub: "x", aud: [123, { x: 1 }, "svc-a"], exp: nowSec() + 3600 } })
+  const mixed = makeToken({
+    alg: "RS256",
+    key: RSA.privateKey,
+    kid: "rsa-1",
+    payload: { sub: "x", aud: [123, { x: 1 }, "svc-a"], exp: nowSec() + 3600 }
+  })
   assert.equal((await verify(mixed))?.sub, "x")
   const junk = makeToken({ alg: "RS256", key: RSA.privateKey, kid: "rsa-1", payload: { sub: "x", aud: [123, null], exp: nowSec() + 3600 } })
   assert.equal(await verify(junk), null)
@@ -249,7 +281,12 @@ test("requireIss and requireAud reject tokens missing those claims", async () =>
   const verify = rsaVerifier({ requireIss: true, requireAud: true })
   const missing = makeToken({ alg: "RS256", key: RSA.privateKey, kid: "rsa-1", payload: { sub: "x", exp: nowSec() + 3600 } })
   assert.equal(await verify(missing), null)
-  const present = makeToken({ alg: "RS256", key: RSA.privateKey, kid: "rsa-1", payload: { sub: "x", iss: "whoever", aud: "anything", exp: nowSec() + 3600 } })
+  const present = makeToken({
+    alg: "RS256",
+    key: RSA.privateKey,
+    kid: "rsa-1",
+    payload: { sub: "x", iss: "whoever", aud: "anything", exp: nowSec() + 3600 }
+  })
   assert.equal((await verify(present))?.sub, "x")
 })
 

@@ -1,10 +1,4 @@
-import {
-  GracefulShutdown,
-  HealthRegistry,
-  createHttpMicroservice,
-  createLogger,
-  setDefaultLogger
-} from "@riaskov/nevo-messaging"
+import { GracefulShutdown, HealthRegistry, createHttpMicroservice, createLogger, setDefaultLogger } from "@riaskov/nevo-messaging"
 import { AppModule } from "./app.module"
 
 async function bootstrap() {
@@ -19,11 +13,7 @@ async function bootstrap() {
 
   const shutdown = new GracefulShutdown()
   const health = app.get(HealthRegistry)
-  health.register(
-    "not-draining",
-    () => ({ status: shutdown.isShuttingDown() ? "down" : "ok" }),
-    { kind: "readiness" }
-  )
+  health.register("not-draining", () => ({ status: shutdown.isShuttingDown() ? "down" : "ok" }), { kind: "readiness" })
   shutdown.register("close nest app", () => app.close())
 
   for (const sig of ["SIGTERM", "SIGINT"] as const) {

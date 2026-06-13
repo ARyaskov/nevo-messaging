@@ -12,36 +12,65 @@ import { ContractPoller, createContractFetcherForClient } from "../src/common/co
 
 test("hedge returns the first successful copy", async () => {
   const t0 = Date.now()
-  const result = await hedge(async (attempt, signal) => {
-    if (attempt === 1) {
-      await new Promise((r) => setTimeout(r, 200))
-      return "slow"
-    }
-    return "fast"
-  }, { enabled: true, copies: 2, delayMs: 30 })
+  const result = await hedge(
+    async (attempt, signal) => {
+      if (attempt === 1) {
+        await new Promise((r) => setTimeout(r, 200))
+        return "slow"
+      }
+      return "fast"
+    },
+    { enabled: true, copies: 2, delayMs: 30 }
+  )
   assert.equal(result, "fast")
   assert.ok(Date.now() - t0 < 150)
 })
 
 test("hedge falls back on rejections", async () => {
   await assert.rejects(async () => {
-    await hedge(async () => { throw new Error("nope") }, { enabled: true, copies: 3, delayMs: 1 })
+    await hedge(
+      async () => {
+        throw new Error("nope")
+      },
+      { enabled: true, copies: 3, delayMs: 1 }
+    )
   })
 })
 
 test("sliding-window CB opens after error-rate exceeds threshold with min sample", () => {
   const cb = new SlidingCircuitBreakerRegistry({ enabled: true, windowMs: 60_000, errorRateThreshold: 0.5, minSampleSize: 4, resetTimeoutMs: 1000 })
-  cb.before("svc:m"); cb.onSuccess("svc:m")
-  cb.before("svc:m"); cb.onFailure("svc:m", new Error("x"))
-  cb.before("svc:m"); cb.onFailure("svc:m", new Error("x"))
-  cb.before("svc:m"); cb.onFailure("svc:m", new Error("x"))
+  cb.before("svc:m")
+  cb.onSuccess("svc:m")
+  cb.before("svc:m")
+  cb.onFailure("svc:m", new Error("x"))
+  cb.before("svc:m")
+  cb.onFailure("svc:m", new Error("x"))
+  cb.before("svc:m")
+  cb.onFailure("svc:m", new Error("x"))
   assert.throws(() => cb.before("svc:m"), CircuitOpenError)
 })
 
 test("sliding-window CB ignores validation errors", () => {
   const cb = new SlidingCircuitBreakerRegistry({ enabled: true, errorRateThreshold: 0.1, minSampleSize: 1 })
-  cb.before("svc:m"); cb.onFailure("svc:m", new MessagingError(ErrorCode.VALIDATION_FAILED, { message: "x" }))
   cb.before("svc:m")
+  cb.onFailure("svc:m", new MessagingError(ErrorCode.VALIDATION_FAILED, { message: "x" }))
+  cb.before("svc:m")
+})
+
+test("sliding-window half-open allows only one concurrent probe", async () => {
+  const cb = new SlidingCircuitBreakerRegistry({
+    enabled: true,
+    errorRateThreshold: 1,
+    minSampleSize: 1,
+    resetTimeoutMs: 20
+  })
+  cb.before("svc:probe")
+  cb.onFailure("svc:probe", new Error("boom"))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  cb.before("svc:probe")
+  assert.throws(() => cb.before("svc:probe"), CircuitOpenError)
+  cb.onSuccess("svc:probe")
+  cb.before("svc:probe")
 })
 
 test("AdaptiveTuner observes and tunes retries", () => {
@@ -51,6 +80,17 @@ test("AdaptiveTuner observes and tunes retries", () => {
   const snap = t.snapshot()
   assert.ok(snap.sampleSize > 30)
   assert.ok(snap.retries >= 1 && snap.retries <= 4)
+})
+
+test("AdaptiveTuner reduces retry amplification when the error rate is high", () => {
+  const tuner = new AdaptiveTuner({
+    enabled: true,
+    minRetries: 1,
+    maxRetries: 5,
+    recomputeIntervalMs: 10
+  })
+  for (let i = 0; i < 10; i++) tuner.observe(10, false)
+  assert.equal(tuner.getRetries(), 1)
 })
 
 test("contractToOpenApi produces paths", () => {
@@ -71,15 +111,21 @@ test("event store appends and reads in order", async () => {
   await store.append({ type: "x", payload: 2 })
   const events = await store.read({ from: 1 })
   assert.equal(events.length, 2)
-  assert.equal((events[0].payload as number), 1)
+  assert.equal(events[0].payload as number, 1)
   assert.ok(events[0].sequence < events[1].sequence)
 })
 
 test("inbox dedupes by uuid", async () => {
   const inbox = new Inbox({ store: new InMemoryInboxStore() })
   let calls = 0
-  const result1 = await inbox.dedupe("u1", async () => { calls++; return 42 })
-  const result2 = await inbox.dedupe("u1", async () => { calls++; return 999 })
+  const result1 = await inbox.dedupe("u1", async () => {
+    calls++
+    return 42
+  })
+  const result2 = await inbox.dedupe("u1", async () => {
+    calls++
+    return 999
+  })
   assert.equal(result1, 42)
   assert.equal(result2, 42)
   assert.equal(calls, 1)

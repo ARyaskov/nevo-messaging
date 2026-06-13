@@ -105,18 +105,45 @@ export function jsonByteSize(value: unknown, limit = Number.POSITIVE_INFINITY, c
 
   const walk = (v: unknown): void => {
     if (bytes > limit) return
-    if (v === null || v === undefined) { bytes += 4; return }
+    if (v === null || v === undefined) {
+      bytes += 4
+      return
+    }
     const t = typeof v
-    if (t === "string") { bytes += quoted(v as string); return }
-    if (t === "number") { bytes += Number.isFinite(v as number) ? String(v).length : 4; return }
-    if (t === "boolean") { bytes += v ? 4 : 5; return }
-    if (t !== "object") { bytes += 4; return } // bigint/symbol/function — approximate
+    if (t === "string") {
+      bytes += quoted(v as string)
+      return
+    }
+    if (t === "number") {
+      bytes += Number.isFinite(v as number) ? String(v).length : 4
+      return
+    }
+    if (t === "boolean") {
+      bytes += v ? 4 : 5
+      return
+    }
+    if (t !== "object") {
+      bytes += 4
+      return
+    } // bigint/symbol/function — approximate
 
     const obj = v as object
-    if (obj instanceof Date) { bytes += 26; return } // ISO string + quotes
-    if (obj instanceof RegExp) { bytes += 2; return }
-    if (isBinary(obj)) { bytes += quoted(binarySummary(obj)); return }
-    if (ancestors.includes(obj)) { bytes += quoted(CIRCULAR); return }
+    if (obj instanceof Date) {
+      bytes += 26
+      return
+    } // ISO string + quotes
+    if (obj instanceof RegExp) {
+      bytes += 2
+      return
+    }
+    if (isBinary(obj)) {
+      bytes += quoted(binarySummary(obj))
+      return
+    }
+    if (ancestors.includes(obj)) {
+      bytes += quoted(CIRCULAR)
+      return
+    }
 
     ancestors.push(obj)
     if (Array.isArray(obj)) {
@@ -166,14 +193,18 @@ export function jsonByteSize(value: unknown, limit = Number.POSITIVE_INFINITY, c
   return bytes
 }
 
-// Derive pino/fast-redact paths from REDACT_KEY_NAMES (top-level + one level deep; case-sensitive).
-export function pinoRedactPaths(): string[] {
+// Derive bounded-depth pino/fast-redact paths. Logger inputs are also
+// recursively redacted before pino sees them; these paths are defense in depth.
+export function pinoRedactPaths(maxDepth = 8): string[] {
   const paths: string[] = []
   for (const name of REDACT_KEY_NAMES) {
-    if (/^[A-Za-z0-9_]+$/.test(name)) {
-      paths.push(name, `*.${name}`)
-    } else {
-      paths.push(`["${name}"]`, `*["${name}"]`)
+    for (let depth = 0; depth <= maxDepth; depth++) {
+      if (/^[A-Za-z0-9_]+$/.test(name)) {
+        paths.push(`${depth === 0 ? "" : "*.".repeat(depth)}${name}`)
+      } else {
+        const prefix = depth === 0 ? "" : `${"*.".repeat(depth - 1)}*`
+        paths.push(`${prefix}["${name}"]`)
+      }
     }
   }
   return paths

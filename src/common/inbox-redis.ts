@@ -13,11 +13,7 @@ const INBOX_DONE_NO_VALUE = " nevo:inbox:done "
 
 export interface InboxRedisClient {
   get(key: string): Promise<string | null>
-  set(
-    key: string,
-    value: string,
-    options: { ttlMs: number; ifNotExists?: boolean }
-  ): Promise<"OK" | null | string>
+  set(key: string, value: string, options: { ttlMs: number; ifNotExists?: boolean }): Promise<"OK" | null | string>
   del?(key: string): Promise<number>
   exists?(key: string): Promise<number>
 }
@@ -60,14 +56,13 @@ export class RedisInboxStore implements InboxStore {
     this.metrics = opts.metrics ?? getDefaultMetrics()
   }
 
-  private k(uuid: string): string { return this.keyPrefix + uuid }
+  private k(uuid: string): string {
+    return this.keyPrefix + uuid
+  }
 
   private recordReadError(op: string, err: unknown): void {
     this.metrics.incCounter(NEVO_METRIC_NAMES.storeErrors, { store: "inbox", op, policy: this.readErrorPolicy })
-    this.logger.error(
-      { event: "inbox.redis.read.failed", op, policy: this.readErrorPolicy, err: (err as Error)?.message },
-      "Inbox read failed"
-    )
+    this.logger.error({ event: "inbox.redis.read.failed", op, policy: this.readErrorPolicy, err: (err as Error)?.message }, "Inbox read failed")
   }
 
   /** Read the stored result value, mapping every sentinel/empty marker to `undefined`. */
@@ -78,13 +73,7 @@ export class RedisInboxStore implements InboxStore {
 
   /** Decode a raw blob into a value, mapping sentinels / empties to `undefined`. */
   private decodeBlob(blob: string | null): unknown | undefined {
-    if (
-      blob === null ||
-      blob === "" ||
-      blob === "null" ||
-      blob === INBOX_IN_PROGRESS ||
-      blob === INBOX_DONE_NO_VALUE
-    ) return undefined
+    if (blob === null || blob === "" || blob === "null" || blob === INBOX_IN_PROGRESS || blob === INBOX_DONE_NO_VALUE) return undefined
     return this.decode(blob)
   }
 
@@ -135,10 +124,7 @@ export class RedisInboxStore implements InboxStore {
       await this.client.set(this.k(uuid), blob, { ttlMs: this.ttlMs })
     } catch (err) {
       this.metrics.incCounter(NEVO_METRIC_NAMES.storeErrors, { store: "inbox", op: "markSeen", policy: this.readErrorPolicy })
-      this.logger.warn(
-        { event: "inbox.redis.write.failed", err: (err as Error)?.message },
-        "Inbox markSeen failed; handler may run twice"
-      )
+      this.logger.warn({ event: "inbox.redis.write.failed", err: (err as Error)?.message }, "Inbox markSeen failed; handler may run twice")
     }
   }
 

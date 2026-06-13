@@ -60,8 +60,10 @@ interface ServiceSocket {
   socket: any
   pending: Map<string, PendingQuery>
   subscriptions: Map<string, Set<(payload: any) => void>>
+  subscribeRequests: Map<string, { serviceName: string; method: string }>
   reconnectAttempt: number
   closed: boolean
+  opening: Promise<void> | null
 }
 
 export class NevoWsClient {
@@ -105,7 +107,7 @@ export class NevoWsClient {
     this.metrics = getDefaultMetrics()
     this.maxPayloadBytes = options?.security?.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES
     this.idempotencyCache = new LruIdempotencyCache<unknown>(options?.idempotency)
-    this.devtoolsBus = options?.devtools === false ? null : (options?.devtools instanceof Object ? (options.devtools as DevToolsBus) : getDevToolsBus())
+    this.devtoolsBus = options?.devtools === false ? null : options?.devtools instanceof Object ? (options.devtools as DevToolsBus) : getDevToolsBus()
     this.reconnectIntervalMs = options?.reconnectIntervalMs ?? 1000
     this.maxReconnectAttempts = options?.maxReconnectAttempts ?? -1
     this.protocols = options?.protocols
@@ -120,7 +122,9 @@ export class NevoWsClient {
     })
   }
 
-  getInstanceId(): string { return this.instanceId }
+  getInstanceId(): string {
+    return this.instanceId
+  }
 
   private buildMeta(type: MessageType, opts?: any): MessageMeta {
     const baseMeta: MessageMeta = {
@@ -153,12 +157,24 @@ export class NevoWsClient {
     const normalized = normalizeServiceName(serviceName)
     const url = this.serviceUrls.get(normalized)
     if (!url) {
-      throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, { message: `Service "${serviceName}" is not registered`, availableServices: this.serviceUrls.keys().toArray() })
+      throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, {
+        message: `Service "${serviceName}" is not registered`,
+        availableServices: this.serviceUrls.keys().toArray()
+      })
     }
     let entry = this.sockets.get(normalized)
-    if (entry && entry.socket.readyState === 1) return entry
+    if (entry && entry.socket?.readyState === 1) return entry
     if (!entry) {
-      entry = { url, socket: null, pending: new Map(), subscriptions: new Map(), reconnectAttempt: 0, closed: false }
+      entry = {
+        url,
+        socket: null,
+        pending: new Map(),
+        subscriptions: new Map(),
+        subscribeRequests: new Map(),
+        reconnectAttempt: 0,
+        closed: false,
+        opening: null
+      }
       this.sockets.set(normalized, entry)
     }
     await this.openSocket(normalized, entry)
@@ -166,20 +182,54 @@ export class NevoWsClient {
   }
 
   private openSocket(serviceKey: string, entry: ServiceSocket): Promise<void> {
+    if (entry.opening) return entry.opening
     const { promise, resolve, reject } = Promise.withResolvers<void>()
     const Ws = (globalThis as any).WebSocket
     if (!Ws) {
       reject(new MessagingError(ErrorCode.INTERNAL, { message: "Global WebSocket not available; requires Node 22+ or polyfill" }))
       return promise
     }
+    entry.opening = promise
+    let settled = false
+    const settle = (err?: unknown) => {
+      if (settled) return
+      settled = true
+      if (entry.opening === promise) entry.opening = null
+      if (err) reject(err)
+      else resolve()
+    }
     const ws = new Ws(entry.url, this.protocols)
     ws.binaryType = "arraybuffer"
     entry.socket = ws
-    ws.addEventListener("open", () => { entry.reconnectAttempt = 0; resolve() })
+    const connectTimer = setTimeout(() => {
+      settle(
+        new MessagingError(ErrorCode.TIMEOUT, {
+          message: `WebSocket connect to "${serviceKey}" timed out after ${this.timeoutMs}ms`,
+          retryable: true
+        })
+      )
+      try {
+        ws.close()
+      } catch {}
+    }, this.timeoutMs)
+    ws.addEventListener("open", () => {
+      clearTimeout(connectTimer)
+      entry.reconnectAttempt = 0
+      for (const req of entry.subscribeRequests.values()) {
+        try {
+          ws.send(this.buildEnvelope("__subscribe", req, "sub", {}).data)
+        } catch {}
+      }
+      settle()
+    })
     ws.addEventListener("error", (ev: any) => {
       this.logger.warn({ event: "ws.error", err: ev?.message ?? "ws error", service: serviceKey })
+      clearTimeout(connectTimer)
+      settle(new MessagingError(ErrorCode.CONNECTION_LOST, { message: ev?.message ?? "WebSocket connection failed", retryable: true }))
     })
     ws.addEventListener("close", () => {
+      clearTimeout(connectTimer)
+      settle(new MessagingError(ErrorCode.CONNECTION_LOST, { message: "WebSocket closed before open", retryable: true }))
       for (const [, p] of entry.pending) {
         clearTimeout(p.timer)
         p.reject(new MessagingError(ErrorCode.CONNECTION_LOST, { message: "WebSocket closed before reply" }))
@@ -188,11 +238,14 @@ export class NevoWsClient {
       if (entry.closed) return
       if (this.maxReconnectAttempts >= 0 && entry.reconnectAttempt >= this.maxReconnectAttempts) return
       entry.reconnectAttempt++
-      setTimeout(() => { void this.openSocket(serviceKey, entry) }, this.reconnectIntervalMs)
+      setTimeout(() => {
+        this.openSocket(serviceKey, entry).catch(() => {})
+      }, this.reconnectIntervalMs)
     })
     ws.addEventListener("message", (ev: MessageEvent) => {
       const data = ev.data
-      const buf = data instanceof ArrayBuffer ? new Uint8Array(data) : typeof data === "string" ? new TextEncoder().encode(data) : new Uint8Array(data)
+      const buf =
+        data instanceof ArrayBuffer ? new Uint8Array(data) : typeof data === "string" ? new TextEncoder().encode(data) : new Uint8Array(data)
       this.handleMessage(entry, buf)
     })
     return promise
@@ -225,55 +278,88 @@ export class NevoWsClient {
     for (const [, handlers] of entry.subscriptions) {
       if (!matchesFilter(undefined, envelope.meta)) continue
       for (const h of handlers) {
-        try { h(envelope) } catch {}
+        try {
+          h(envelope)
+        } catch {}
       }
     }
   }
 
-  async query<T = unknown>(serviceName: string, method: string, params: unknown, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; timeoutMs?: number; tenantId?: string }): Promise<T> {
+  async query<T = unknown>(
+    serviceName: string,
+    method: string,
+    params: unknown,
+    opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; timeoutMs?: number; tenantId?: string }
+  ): Promise<T> {
     const cbKey = `${normalizeServiceName(serviceName)}:${method}`
-    return this.shutdown.trackInflight((async () => {
-      if (opts?.idempotencyKey && this.idempotencyCache.isEnabled() && this.idempotencyCache.has(opts.idempotencyKey)) {
-        return this.idempotencyCache.get(opts.idempotencyKey) as T
-      }
-      const result = await withRetry(async (attempt) => {
-        this.circuitBreaker.before(cbKey)
-        const startMs = Date.now()
-        let lastUuid: string | undefined
-        let lastChainId: string | undefined
-        try {
-          const entry = await this.getSocket(serviceName)
-          const { uuid, data, meta } = this.buildEnvelope(method, params, "query", { ...opts, headers: { ...(opts?.headers || {}), "nevo-attempt": String(attempt) } })
-          lastUuid = uuid
-          lastChainId = meta.nevoChainId
-          const { promise, resolve, reject } = Promise.withResolvers<T>()
-          const effectiveTimeout = opts?.timeoutMs ?? this.timeoutMs
-          const timer = setTimeout(() => {
-            entry.pending.delete(uuid)
-            reject(new TimeoutError(serviceName, method, effectiveTimeout))
-          }, effectiveTimeout)
-          entry.pending.set(uuid, { resolve: resolve as any, reject, timer })
-          entry.socket.send(data)
-          const value = await promise
-          this.circuitBreaker.onSuccess(cbKey)
-          publishClientEvent(this.devtoolsBus, { service: serviceName, method, uuid, chainId: lastChainId, durationMs: Date.now() - startMs, status: "ok", transport: "ws", origin: this.serviceName })
-          return value
-        } catch (err: any) {
-          this.circuitBreaker.onFailure(cbKey, err)
-          publishClientEvent(this.devtoolsBus, {
-            service: serviceName, method, uuid: lastUuid, chainId: lastChainId,
-            durationMs: Date.now() - startMs, status: "error", transport: "ws", origin: this.serviceName,
-            error: { code: err instanceof MessagingError ? err.code : err?.code, message: err?.message ?? String(err) }
-          })
-          throw err
-        } finally {
-          this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, { transport: "ws", service: serviceName, method: methodLabel(method), role: "client" })
-          if (attempt > 1) this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "ws", service: serviceName, method: methodLabel(method) })
+    return this.shutdown.trackInflight(
+      (async () => {
+        if (opts?.idempotencyKey && this.idempotencyCache.isEnabled() && this.idempotencyCache.has(opts.idempotencyKey)) {
+          return this.idempotencyCache.get(opts.idempotencyKey) as T
         }
-      }, this.retryOptions)
-      if (opts?.idempotencyKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(opts.idempotencyKey, result)
-      return result
-    })())
+        const result = await withRetry(async (attempt) => {
+          this.circuitBreaker.before(cbKey)
+          const startMs = Date.now()
+          let lastUuid: string | undefined
+          let lastChainId: string | undefined
+          try {
+            const entry = await this.getSocket(serviceName)
+            const { uuid, data, meta } = this.buildEnvelope(method, params, "query", {
+              ...opts,
+              headers: { ...(opts?.headers || {}), "nevo-attempt": String(attempt) }
+            })
+            lastUuid = uuid
+            lastChainId = meta.nevoChainId
+            const { promise, resolve, reject } = Promise.withResolvers<T>()
+            const effectiveTimeout = opts?.timeoutMs ?? this.timeoutMs
+            const timer = setTimeout(() => {
+              entry.pending.delete(uuid)
+              reject(new TimeoutError(serviceName, method, effectiveTimeout))
+            }, effectiveTimeout)
+            entry.pending.set(uuid, { resolve: resolve as any, reject, timer })
+            entry.socket.send(data)
+            const value = await promise
+            this.circuitBreaker.onSuccess(cbKey)
+            publishClientEvent(this.devtoolsBus, {
+              service: serviceName,
+              method,
+              uuid,
+              chainId: lastChainId,
+              durationMs: Date.now() - startMs,
+              status: "ok",
+              transport: "ws",
+              origin: this.serviceName
+            })
+            return value
+          } catch (err: any) {
+            this.circuitBreaker.onFailure(cbKey, err)
+            publishClientEvent(this.devtoolsBus, {
+              service: serviceName,
+              method,
+              uuid: lastUuid,
+              chainId: lastChainId,
+              durationMs: Date.now() - startMs,
+              status: "error",
+              transport: "ws",
+              origin: this.serviceName,
+              error: { code: err instanceof MessagingError ? err.code : err?.code, message: err?.message ?? String(err) }
+            })
+            throw err
+          } finally {
+            this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, {
+              transport: "ws",
+              service: serviceName,
+              method: methodLabel(method),
+              role: "client"
+            })
+            if (attempt > 1)
+              this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "ws", service: serviceName, method: methodLabel(method) })
+          }
+        }, this.retryOptions)
+        if (opts?.idempotencyKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(opts.idempotencyKey, result)
+        return result
+      })()
+    )
   }
 
   async emit(serviceName: string, method: string, params: unknown, opts?: any): Promise<void> {
@@ -309,7 +395,10 @@ export class NevoWsClient {
 
     const key = `${normalized}:${method}`
     let bag = entry.subscriptions.get(key)
-    if (!bag) { bag = new Set(); entry.subscriptions.set(key, bag) }
+    if (!bag) {
+      bag = new Set()
+      entry.subscriptions.set(key, bag)
+    }
     const wrapped = (envelope: any) => {
       if (method && envelope.method !== method && envelope.method?.split("@")[0] !== method) return
       if (!matchesFilter(options?.filter, envelope.meta)) return
@@ -322,26 +411,39 @@ export class NevoWsClient {
     }
     bag.add(wrapped)
 
+    entry.subscribeRequests.set(key, { serviceName, method })
     const subscribeReq = this.buildEnvelope("__subscribe", { serviceName, method }, "sub", {})
     entry.socket.send(subscribeReq.data)
 
     return {
       unsubscribe: async () => {
         bag!.delete(wrapped)
-        if (bag!.size === 0) entry.subscriptions.delete(key)
+        if (bag!.size === 0) {
+          entry.subscriptions.delete(key)
+          entry.subscribeRequests.delete(key)
+        }
       }
     }
   }
 
-  getAvailableServices(): string[] { return this.serviceUrls.keys().toArray() }
-  getDiscoveredServices() { this.discoveryRegistry.prune(this.discoveryTtlMs); return this.discoveryRegistry.list() }
-  isServiceAvailable(name: string): boolean { return this.discoveryRegistry.isAvailable(name, this.discoveryTtlMs) }
+  getAvailableServices(): string[] {
+    return this.serviceUrls.keys().toArray()
+  }
+  getDiscoveredServices() {
+    this.discoveryRegistry.prune(this.discoveryTtlMs)
+    return this.discoveryRegistry.list()
+  }
+  isServiceAvailable(name: string): boolean {
+    return this.discoveryRegistry.isAvailable(name, this.discoveryTtlMs)
+  }
 
   async close(timeoutMs = 30_000): Promise<void> {
     this.discoveryRegistry.stopBackgroundPrune()
     for (const [, entry] of this.sockets) {
       entry.closed = true
-      try { entry.socket?.close?.() } catch {}
+      try {
+        entry.socket?.close?.()
+      } catch {}
     }
     this.sockets.clear()
     await this.shutdown.shutdown(timeoutMs)

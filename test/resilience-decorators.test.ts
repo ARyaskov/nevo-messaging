@@ -27,18 +27,22 @@ import { addSignalMetadata } from "../src/signal.decorator"
 // Nest app the `@Decorator(...)` syntax with `experimentalDecorators: true`
 // applies them at class-declaration time — semantically identical.
 class Svc {
-  async readOne() { return 1 }
-  async risky() { return 2 }
-  async tuned() { return 3 }
-  async ingest() { return 4 }
+  async readOne() {
+    return 1
+  }
+  async risky() {
+    return 2
+  }
+  async tuned() {
+    return 3
+  }
+  async ingest() {
+    return 4
+  }
 }
 
 Hedge({ copies: 2, delayMs: 5 })(Svc.prototype, "readOne", { value: Svc.prototype.readOne })
-CircuitBreaker({ mode: "sliding", windowMs: 1000, errorRateThreshold: 0.5, minSampleSize: 2 })(
-  Svc.prototype,
-  "risky",
-  { value: Svc.prototype.risky }
-)
+CircuitBreaker({ mode: "sliding", windowMs: 1000, errorRateThreshold: 0.5, minSampleSize: 2 })(Svc.prototype, "risky", { value: Svc.prototype.risky })
 Adaptive({ targetP99Ms: 100 })(Svc.prototype, "tuned", { value: Svc.prototype.tuned })
 Backpressure({ maxInflight: 2, highWatermark: 2, lowWatermark: 1 })(Svc.prototype, "ingest", {
   value: Svc.prototype.ingest
@@ -51,6 +55,25 @@ test("decorator metadata is stored and readable", () => {
   assert.equal(cb?.mode, "sliding")
   assert.equal(getMethodAdaptive(s, "tuned")?.targetP99Ms, 100)
   assert.equal(getMethodBackpressure(s, "ingest")?.maxInflight, 2)
+})
+
+test("resilience metadata added by a subclass does not mutate the parent map", () => {
+  class Parent {
+    async base() {
+      return 1
+    }
+  }
+  class Child extends Parent {
+    async child() {
+      return 2
+    }
+  }
+  CircuitBreaker({ failureThreshold: 2 })(Parent.prototype, "base", { value: Parent.prototype.base })
+  Hedge({ copies: 2 })(Child.prototype, "child", { value: Child.prototype.child })
+
+  assert.equal(getMethodHedge(new Parent(), "child"), undefined)
+  assert.equal(getMethodCircuit(new Child(), "base")?.failureThreshold, 2)
+  assert.equal(getMethodHedge(new Child(), "child")?.copies, 2)
 })
 
 test("readMethodResilience compiles full config", () => {
@@ -67,7 +90,10 @@ test("applyResilience runs invoke and feeds adaptive tuner", async () => {
   const res = await applyResilience<number>({
     config: cfg,
     ctx: { key: "svc:tuned" },
-    invoke: async () => { calls++; return 42 }
+    invoke: async () => {
+      calls++
+      return 42
+    }
   })
   assert.equal(res, 42)
   assert.equal(calls, 1)
@@ -99,7 +125,9 @@ test("circuit opens after threshold and rejects further calls", async () => {
     applyResilience<number>({
       config: cfg,
       ctx: { key: "svc:risky" },
-      invoke: async () => { throw new Error("boom") }
+      invoke: async () => {
+        throw new Error("boom")
+      }
     })
   await assert.rejects(fail())
   await assert.rejects(fail())
@@ -109,7 +137,11 @@ test("circuit opens after threshold and rejects further calls", async () => {
 })
 
 test("wrapMethodWithResilience is transparent when no decorator is present", async () => {
-  class Plain { async noop() { return 7 } }
+  class Plain {
+    async noop() {
+      return 7
+    }
+  }
   const p = new Plain()
   const fn = p.noop.bind(p)
   const wrapped = wrapMethodWithResilience(p, "noop", fn, () => ({ key: "x" }))
@@ -143,9 +175,15 @@ test("backpressure config admits up to maxInflight and rejects beyond", async ()
 // ---------------------------------------------------------------------------
 
 class AdaptiveSvc {
-  async failingHigh() { throw new Error("nope") }
-  async failingLow() { throw new Error("nope") }
-  async slow() { return "done" }
+  async failingHigh() {
+    throw new Error("nope")
+  }
+  async failingLow() {
+    throw new Error("nope")
+  }
+  async slow() {
+    return "done"
+  }
 }
 // currentRetries = max(minRetries, 2): floor of 4 → 4 attempts, default floor → 2.
 Adaptive({ minRetries: 4, maxRetries: 5 })(AdaptiveSvc.prototype, "failingHigh", { value: AdaptiveSvc.prototype.failingHigh })
@@ -154,7 +192,7 @@ Adaptive({ minRetries: 1, maxRetries: 2, minTimeoutMs: 30, maxTimeoutMs: 30 })(A
   value: AdaptiveSvc.prototype.slow
 })
 
-test("@Adaptive bounds the retry count by tuner.getRetries() (high floor → 4 attempts)", async () => {
+test("@Adaptive does not retry a non-retryable error", async () => {
   const s = new AdaptiveSvc()
   const cfg = readMethodResilience(s, "failingHigh")!
   let calls = 0
@@ -162,13 +200,16 @@ test("@Adaptive bounds the retry count by tuner.getRetries() (high floor → 4 a
     applyResilience<string>({
       config: cfg,
       ctx: { key: "adaptive:high" },
-      invoke: async () => { calls++; throw new Error("nope") }
+      invoke: async () => {
+        calls++
+        throw new Error("nope")
+      }
     })
   )
-  assert.equal(calls, 4)
+  assert.equal(calls, 1)
 })
 
-test("@Adaptive retry count tracks the tuner — a different floor changes the count (default → 2)", async () => {
+test("@Adaptive retries retryable errors with backoff up to the tuner limit", async () => {
   const s = new AdaptiveSvc()
   const cfg = readMethodResilience(s, "failingLow")!
   let calls = 0
@@ -176,7 +217,10 @@ test("@Adaptive retry count tracks the tuner — a different floor changes the c
     applyResilience<string>({
       config: cfg,
       ctx: { key: "adaptive:low" },
-      invoke: async () => { calls++; throw new Error("nope") }
+      invoke: async () => {
+        calls++
+        throw new MessagingError(ErrorCode.TIMEOUT, { message: "retry me", retryable: true })
+      }
     })
   )
   assert.equal(calls, 2)
@@ -199,8 +243,12 @@ test("@Adaptive enforces a per-attempt timeout derived from tuner.getTimeoutMs()
           if (typeof timer.unref === "function") timer.unref()
           // The runtime's race already rejected by now; settle so no promise is
           // left dangling past the test. `aborted` proves the signal fired.
-          signal.addEventListener("abort", () => { aborted = true; clearTimeout(timer); resolve("aborted") })
-        }),
+          signal.addEventListener("abort", () => {
+            aborted = true
+            clearTimeout(timer)
+            resolve("aborted")
+          })
+        })
     }),
     (err) => err instanceof MessagingError && err.code === ErrorCode.TIMEOUT
   )
@@ -231,6 +279,28 @@ test("runClientPipeline records one breaker outcome per logical call (no retry a
   assert.equal(breaker.snapshot()["amp:method"].failures, 1)
 })
 
+test("shared resilience budget caps adaptive x hedge x transport retry amplification", async () => {
+  const breaker = new CircuitBreakerRegistry({ enabled: false })
+  const retry = resolveRetryOptions({ maxAttempts: 5, baseMs: 1, jitter: false })
+  let calls = 0
+  await assert.rejects(
+    runClientPipeline<number>(
+      breaker,
+      retry,
+      "budget:method",
+      async () => {
+        calls++
+        throw new MessagingError(ErrorCode.TIMEOUT, { message: "down", retryable: true })
+      },
+      {
+        adaptive: { enabled: true, minRetries: 5, maxRetries: 5 },
+        hedge: { enabled: true, copies: 5, delayMs: 0 }
+      }
+    )
+  )
+  assert.ok(calls <= 8, `expected at most 8 physical calls, got ${calls}`)
+})
+
 // ---------------------------------------------------------------------------
 // signal-router.utils end-to-end: the live handler honours decorators on the
 // target service method.
@@ -256,7 +326,10 @@ function buildRouterHandler(serviceType: any, serviceInstance: any, signalName: 
 test("signal-router honours @CircuitBreaker end-to-end (opens → CIRCUIT_OPEN, handler skipped)", async () => {
   class CbSvc {
     calls = 0
-    async doWork() { this.calls++; throw new Error("upstream down") }
+    async doWork() {
+      this.calls++
+      throw new Error("upstream down")
+    }
   }
   CircuitBreaker({ mode: "count", failureThreshold: 2 })(CbSvc.prototype, "doWork", { value: CbSvc.prototype.doWork })
 
@@ -279,10 +352,16 @@ test("signal-router honours @CircuitBreaker end-to-end (opens → CIRCUIT_OPEN, 
 
 test("signal-router honours @Backpressure end-to-end (over-admission → RATE_LIMITED response)", async () => {
   let release!: () => void
-  const gate = new Promise<void>((r) => { release = r })
+  const gate = new Promise<void>((r) => {
+    release = r
+  })
   class BpSvc {
     started = 0
-    async ingest() { this.started++; await gate; return "ok" }
+    async ingest() {
+      this.started++
+      await gate
+      return "ok"
+    }
   }
   Backpressure({ maxInflight: 1, highWatermark: 1, lowWatermark: 0 })(BpSvc.prototype, "ingest", {
     value: BpSvc.prototype.ingest

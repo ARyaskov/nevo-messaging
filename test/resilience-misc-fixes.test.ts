@@ -14,8 +14,13 @@ function makeBridge(remoteCommands: string[], remoteEvents: string[]): CqrsBridg
   const bridge = new CqrsBridge({
     service: "svc",
     client: {
-      async query(_svc, method) { calls.push(`q:${method}`); return `remote:${method}` },
-      async emit(_svc, method) { calls.push(`e:${method}`) }
+      async query(_svc, method) {
+        calls.push(`q:${method}`)
+        return `remote:${method}`
+      },
+      async emit(_svc, method) {
+        calls.push(`e:${method}`)
+      }
     },
     remoteCommands,
     remoteEvents,
@@ -30,7 +35,10 @@ test("attachToCommandBus is idempotent (no double-wrap)", async () => {
   const bridge = makeBridge([], [])
   let executions = 0
   const bus: CqrsLikeBus = {
-    async execute(_cmd) { executions++; return "local" }
+    async execute(_cmd) {
+      executions++
+      return "local"
+    }
   }
 
   const d1 = bridge.attachToCommandBus(bus)
@@ -55,7 +63,9 @@ test("attachToEventBus preserves sync publish (does not turn it async)", () => {
   const bridge = makeBridge([], ["RemoteEvt"])
   let published: unknown
   const bus: CqrsLikeBus = {
-    publish(evt) { published = evt } // sync, returns void
+    publish(evt) {
+      published = evt
+    } // sync, returns void
   }
 
   const detach = bridge.attachToEventBus(bus)
@@ -169,15 +179,23 @@ test("drain waits for tasks started during the drain window", async () => {
   const order: string[] = []
 
   let resolveSecond!: () => void
-  const second = new Promise<void>((r) => { resolveSecond = r })
+  const second = new Promise<void>((r) => {
+    resolveSecond = r
+  })
 
   // First task: completes quickly, then (during the drain window) spawns a
   // second tracked task. Before the fix, the second task was NOT tracked
   // (trackInflight returned early once shuttingDown), so drain could finish
   // before it did.
   let resolveFirst!: () => void
-  const first = new Promise<void>((r) => { resolveFirst = r })
-  const firstTracked = gs.trackInflight(first.then(() => { order.push("first") }))
+  const first = new Promise<void>((r) => {
+    resolveFirst = r
+  })
+  const firstTracked = gs.trackInflight(
+    first.then(() => {
+      order.push("first")
+    })
+  )
 
   const shutdownP = gs.shutdown(2000).then(() => order.push("shutdown-done"))
 
@@ -185,7 +203,11 @@ test("drain waits for tasks started during the drain window", async () => {
   assert.equal(gs.isShuttingDown(), true)
 
   // Spawn a task during the drain window.
-  const secondTracked = gs.trackInflight(second.then(() => { order.push("second") }))
+  const secondTracked = gs.trackInflight(
+    second.then(() => {
+      order.push("second")
+    })
+  )
 
   // Complete the first task; drain must still wait for the second.
   resolveFirst()
@@ -208,7 +230,11 @@ test("drain resolver is not reused across drains", async () => {
   await gs.drain(50)
   // A second drain with inflight work should still resolve cleanly via completion.
   let release!: () => void
-  const work = gs.trackInflight(new Promise<void>((r) => { release = r }))
+  const work = gs.trackInflight(
+    new Promise<void>((r) => {
+      release = r
+    })
+  )
   const d = gs.drain(2000)
   release()
   await work
@@ -222,7 +248,11 @@ test("direct drain() resolves via completion well before its timeout", async () 
   // completion, not force a wait until the (here, very large) timeout.
   const gs = new GracefulShutdown()
   let release!: () => void
-  const work = gs.trackInflight(new Promise<void>((r) => { release = r }))
+  const work = gs.trackInflight(
+    new Promise<void>((r) => {
+      release = r
+    })
+  )
   const started = Date.now()
   const d = gs.drain(60_000)
   release()

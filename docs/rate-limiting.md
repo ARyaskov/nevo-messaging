@@ -83,7 +83,7 @@ rateLimit: {
 
 ## What does `keyBy` do
 
-`keyBy: ["method", "tenantId"]` means buckets are partitioned by the **combination** of method and tenant. With 5 methods and 100 tenants you can have up to 500 buckets. The LRU eviction (`maxEntries`, `idleEvictMs`) keeps memory bounded.
+`keyBy: ["method", "tenantId"]` means buckets are partitioned by the **combination** of method and tenant. With 5 methods and 100 tenants you can have up to 500 buckets. Existing buckets are promoted on access. At capacity, only an idle least-recently-used bucket is evicted; otherwise unseen keys share a bounded overflow bucket so a flood of unique keys cannot reset active callers' token state.
 
 ## Buckets
 
@@ -112,9 +112,24 @@ The limiter increments:
 
 Inspect with `limiter.snapshot()` or via the [metrics](./metrics.md) registry.
 
+## Cluster-wide Redis limiter
+
+`RedisRateLimiter` applies one token bucket across all pods with an atomic Lua script. Refill time comes from Redis `TIME`, so clock skew between clients cannot stop or accelerate refill. Clients that expose `SCRIPT LOAD`/`EVALSHA` load the script once and retry after `NOSCRIPT`; minimal adapters can provide only `eval` as a compatibility fallback.
+
+```ts
+const limiter = new RedisRateLimiter({
+  client,
+  capacity: 1000,
+  refillPerSec: 500,
+  keyBy: ["method", "tenantId"],
+  failOpen: false
+})
+```
+
+`RedisRateLimiter.withLocalShield(local, limiter)` checks the fleet-wide Redis budget first, then consumes a local token only for admitted traffic.
+
 ## What is not provided
 
-- **No distributed store.** The limiter is in-process per Node instance. For a cluster-wide budget you would write a shared store on top — it is not built in.
 - **No "rules per method" config object.** Use either `keyBy: ["method"]` (one bucket per method, same capacity for all), or apply the `@RateLimit` decorator per method with different capacities.
 - **No automatic mapping to HTTP `429`.** The HTTP transport reflects `ErrorCode.RATE_LIMITED` in the error envelope; your gateway / wrapper translates it to a `429` if needed.
 

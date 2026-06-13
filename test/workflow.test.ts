@@ -1,12 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import {
-  WorkflowEngine,
-  Workflow,
-  getWorkflowMethods,
-  discoverAndRegisterWorkflows,
-  type WorkflowContext
-} from "../src/common/workflow"
+import { WorkflowEngine, Workflow, getWorkflowMethods, discoverAndRegisterWorkflows, type WorkflowContext } from "../src/common/workflow"
 import { Scheduler } from "../src/common/scheduler"
 import { InMemoryEventStore } from "../src/common/event-store"
 
@@ -119,9 +113,15 @@ test("step results survive engine instance restart", async () => {
   const engine1 = new WorkflowEngine({ store, scheduler })
   let firstRunInvocations = 0
   engine1.register("twoStage", async (ctx: WorkflowContext) => {
-    const a = await ctx.step("a", async () => { firstRunInvocations++; return 7 })
+    const a = await ctx.step("a", async () => {
+      firstRunInvocations++
+      return 7
+    })
     await ctx.sleep(40)
-    const b = await ctx.step("b", async () => { firstRunInvocations++; return 11 })
+    const b = await ctx.step("b", async () => {
+      firstRunInvocations++
+      return 11
+    })
     return a + b
   })
   const first = await engine1.start("twoStage", null)
@@ -133,9 +133,15 @@ test("step results survive engine instance restart", async () => {
   const engine2 = new WorkflowEngine({ store, scheduler })
   let secondRunInvocations = 0
   engine2.register("twoStage", async (ctx: WorkflowContext) => {
-    const a = await ctx.step("a", async () => { secondRunInvocations++; return 7 })
+    const a = await ctx.step("a", async () => {
+      secondRunInvocations++
+      return 7
+    })
     await ctx.sleep(40)
-    const b = await ctx.step("b", async () => { secondRunInvocations++; return 11 })
+    const b = await ctx.step("b", async () => {
+      secondRunInvocations++
+      return 11
+    })
     return a + b
   })
 

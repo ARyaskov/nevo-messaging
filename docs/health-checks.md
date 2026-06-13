@@ -54,6 +54,8 @@ NEVO_LIVENESS_METHOD  = "nevo.live"
 NEVO_READINESS_METHOD = "nevo.ready"
 ```
 
+They use the normal dispatch security path: caller extraction, rate limiting, tenant policy, and ACL run before a health response is returned. Configure explicit ACL rules for probes, or set `disableBuiltinHandlers: true` on the router/controller when these signals must not be exposed over the messaging transport.
+
 Note the short names — `"nevo.live"` and `"nevo.ready"`, NOT `"nevo.liveness"` / `"nevo.readiness"`.
 
 When the registry is attached to a controller, the framework auto-wires these three signals. They return:

@@ -62,7 +62,9 @@ export class DevToolsBus {
   private emitToListeners(event: DevToolsEvent): void {
     if (this.listeners.size === 0) return
     for (const cb of this.listeners) {
-      try { cb(event) } catch {}
+      try {
+        cb(event)
+      } catch {}
     }
   }
 
@@ -141,19 +143,29 @@ export class DevToolsBus {
     return out
   }
 
-  size(): number { return this.count }
-  capacityHint(): number { return this.capacity }
+  size(): number {
+    return this.count
+  }
+  capacityHint(): number {
+    return this.capacity
+  }
 
   on(handler: Listener): () => void {
     this.listeners.add(handler)
-    return () => { this.listeners.delete(handler) }
+    return () => {
+      this.listeners.delete(handler)
+    }
   }
 
   onLocal(handler: Listener): () => void {
     const origin = this.originId
-    const wrapped: Listener = (event) => { if (event.origin === origin) handler(event) }
+    const wrapped: Listener = (event) => {
+      if (event.origin === origin) handler(event)
+    }
     this.listeners.add(wrapped)
-    return () => { this.listeners.delete(wrapped) }
+    return () => {
+      this.listeners.delete(wrapped)
+    }
   }
 
   private readonly weakRegistry = new FinalizationRegistry<Listener>((wrapped) => {
@@ -162,7 +174,9 @@ export class DevToolsBus {
 
   onWeak(holder: object, handler: Listener): () => void {
     const wrapped: Listener = (event) => {
-      try { handler(event) } catch {}
+      try {
+        handler(event)
+      } catch {}
     }
     this.listeners.add(wrapped)
     this.weakRegistry.register(holder, wrapped, wrapped)

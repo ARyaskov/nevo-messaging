@@ -66,10 +66,11 @@ export class RateLimiter {
   private readonly buckets = new Map<string, Bucket>()
   private readonly maxEntries: number
   private readonly idleEvictMs: number
+  private readonly overflowBuckets = new Map<string, Bucket>()
   private evictTimer?: NodeJS.Timeout
 
   constructor(opts?: RateLimiterOptions) {
-    this.enabled = opts?.enabled !== false && (opts !== undefined)
+    this.enabled = opts?.enabled !== false && opts !== undefined
     this.defaultCapacity = opts?.capacity ?? 100
     this.defaultRefill = opts?.refillPerSec ?? 50
     this.defaultKeyExtractor = opts?.keyExtractor ?? (opts?.keyBy ? buildKeyFn(opts.keyBy) : DEFAULT_KEY)
@@ -83,7 +84,9 @@ export class RateLimiter {
     }
   }
 
-  isEnabled(): boolean { return this.enabled }
+  isEnabled(): boolean {
+    return this.enabled
+  }
 
   stop(): void {
     if (this.evictTimer) clearInterval(this.evictTimer)
@@ -106,27 +109,47 @@ export class RateLimiter {
     let b = this.buckets.get(key)
     const now = Date.now()
     if (!b) {
+      if (this.buckets.size >= this.maxEntries) {
+        const lru = this.buckets.entries().next().value as [string, Bucket] | undefined
+        if (lru && now - lru[1].lastTouched > this.idleEvictMs) {
+          this.buckets.delete(lru[0])
+        } else {
+          const overflowKey = `${capacity}:${refillPerSec}`
+          let overflow = this.overflowBuckets.get(overflowKey)
+          if (!overflow) {
+            overflow = {
+              tokens: capacity,
+              lastRefill: now,
+              capacity,
+              refillPerSec,
+              lastTouched: now
+            }
+            this.overflowBuckets.set(overflowKey, overflow)
+          }
+          overflow.lastTouched = now
+          return overflow
+        }
+      }
       b = { tokens: capacity, lastRefill: now, capacity, refillPerSec, lastTouched: now }
       this.buckets.set(key, b)
-      this.maybeEvictOldest()
       return b
     }
     b.capacity = capacity
     b.refillPerSec = refillPerSec
     b.lastTouched = now
+    // Map insertion order is the LRU list: move a hit to the MRU end.
+    this.buckets.delete(key)
+    this.buckets.set(key, b)
     return b
-  }
-
-  private maybeEvictOldest(): void {
-    if (this.buckets.size <= this.maxEntries) return
-    const firstKey = this.buckets.keys().next().value
-    if (firstKey !== undefined) this.buckets.delete(firstKey)
   }
 
   private evictIdle(): void {
     const now = Date.now()
     for (const [k, b] of this.buckets.entries()) {
       if (now - b.lastTouched > this.idleEvictMs) this.buckets.delete(k)
+    }
+    for (const [k, b] of this.overflowBuckets.entries()) {
+      if (now - b.lastTouched > this.idleEvictMs) this.overflowBuckets.delete(k)
     }
   }
 
@@ -143,7 +166,7 @@ export class RateLimiter {
       b.lastRefill = now
     }
     if (b.tokens < 1) {
-      const retryAfterMs = Math.ceil(((1 - b.tokens) / b.refillPerSec) * 1000)
+      const retryAfterMs = b.refillPerSec > 0 ? Math.ceil(((1 - b.tokens) / b.refillPerSec) * 1000) : this.idleEvictMs
       throw new MessagingError(ErrorCode.RATE_LIMITED, {
         message: `Rate limit exceeded for ${ctx.method}`,
         topic: ctx.topic,

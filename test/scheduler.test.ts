@@ -1,13 +1,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { parseCron, nextCronTick, isValidCron } from "../src/common/cron"
-import {
-  Scheduler,
-  InMemoryScheduledTaskStore,
-  Scheduled,
-  getScheduledMethods,
-  discoverAndRegisterScheduled
-} from "../src/common/scheduler"
+import { Scheduler, InMemoryScheduledTaskStore, Scheduled, getScheduledMethods, discoverAndRegisterScheduled } from "../src/common/scheduler"
 
 // --- cron parser ---
 
@@ -19,9 +13,23 @@ test("parseCron accepts every-minute expression", () => {
 
 test("parseCron supports ranges and steps", () => {
   const p = parseCron("0,30 9-17 * * 1-5")
-  assert.deepEqual([...p.minute.values].sort((a, b) => a - b), [0, 30])
-  assert.deepEqual([...p.hour.values].sort((a, b) => a - b), [9, 10, 11, 12, 13, 14, 15, 16, 17])
-  assert.deepEqual([...p.weekday.values].sort((a, b) => a - b), [1, 2, 3, 4, 5])
+  assert.deepEqual(
+    [...p.minute.values].sort((a, b) => a - b),
+    [0, 30]
+  )
+  assert.deepEqual(
+    [...p.hour.values].sort((a, b) => a - b),
+    [9, 10, 11, 12, 13, 14, 15, 16, 17]
+  )
+  assert.deepEqual(
+    [...p.weekday.values].sort((a, b) => a - b),
+    [1, 2, 3, 4, 5]
+  )
+})
+
+test("parseCron accepts 7 as Sunday", () => {
+  const p = parseCron("0 0 * * 7")
+  assert.deepEqual([...p.weekday.values], [0])
 })
 
 test("parseCron rejects out-of-range", () => {
@@ -52,7 +60,9 @@ test("nextCronTick finds the next firing time", () => {
 test("Scheduler.enqueueIn fires after the delay", async () => {
   const scheduler = new Scheduler({ pollIntervalMs: 20 })
   let fired = 0
-  scheduler.registerHandler("ping", () => { fired++ })
+  scheduler.registerHandler("ping", () => {
+    fired++
+  })
   await scheduler.enqueueIn("ping", { hello: "world" }, 30)
   // Not yet due.
   await scheduler.flushOnce()
@@ -62,12 +72,24 @@ test("Scheduler.enqueueIn fires after the delay", async () => {
   assert.equal(fired, 1)
 })
 
+test("Scheduler.enqueueIn accepts a deterministic id", async () => {
+  const store = new InMemoryScheduledTaskStore()
+  const scheduler = new Scheduler({ store })
+  const first = await scheduler.enqueueIn("wake", { n: 1 }, 1000, { id: "wake:stable" })
+  const second = await scheduler.enqueueIn("wake", { n: 2 }, 1000, { id: "wake:stable" })
+  assert.equal(first, "wake:stable")
+  assert.equal(second, first)
+  assert.equal((await store.list()).length, 1)
+})
+
 test("Scheduler.enqueueCron reschedules after each fire", async () => {
   // Use enqueueIn-style + manual reschedule check; cron with `* * * * *` would
   // need a real minute to roll. Instead, use a tight cron we can verify.
   const scheduler = new Scheduler({ pollIntervalMs: 20 })
   let fired = 0
-  scheduler.registerHandler("daily", () => { fired++ })
+  scheduler.registerHandler("daily", () => {
+    fired++
+  })
   const taskId = await scheduler.enqueueCron("daily", null, "0 0 * * *")
   const before = (await scheduler.list({ status: "pending" })).find((t) => t.id === taskId)
   assert.ok(before, "task should be pending")
@@ -77,7 +99,9 @@ test("Scheduler.enqueueCron reschedules after each fire", async () => {
 test("Scheduler.cancel marks task cancelled", async () => {
   const scheduler = new Scheduler({ pollIntervalMs: 20 })
   let fired = 0
-  scheduler.registerHandler("noop", () => { fired++ })
+  scheduler.registerHandler("noop", () => {
+    fired++
+  })
   const id = await scheduler.enqueueIn("noop", null, 50)
   await scheduler.cancel(id)
   await new Promise((r) => setTimeout(r, 60))
@@ -98,7 +122,7 @@ test("Scheduler retries failed tasks up to maxAttempts", async () => {
     await new Promise((r) => setTimeout(r, 5))
   }
   assert.equal(attempts, 3)
-  const failed = (await scheduler.list({ status: "failed" }))
+  const failed = await scheduler.list({ status: "failed" })
   assert.equal(failed.length, 1)
 })
 
@@ -115,8 +139,12 @@ test("Scheduler skips tasks with no registered handler and marks them failed", a
 
 test("@Scheduled metadata is stored and discoverable", async () => {
   class CronService {
-    async daily() { /* … */ }
-    async startup() { /* … */ }
+    async daily() {
+      /* … */
+    }
+    async startup() {
+      /* … */
+    }
   }
   Scheduled({ cron: "0 0 * * *", name: "cron.daily" })(CronService.prototype, "daily", { value: CronService.prototype.daily })
   Scheduled({ in: 50, name: "cron.startup" })(CronService.prototype, "startup", { value: CronService.prototype.startup })
@@ -131,7 +159,9 @@ test("@Scheduled metadata is stored and discoverable", async () => {
 test("discoverAndRegisterScheduled wires handlers + enqueues initial runs", async () => {
   class CronService {
     fired = 0
-    async startup() { this.fired++ }
+    async startup() {
+      this.fired++
+    }
   }
   Scheduled({ in: 20, name: "cron.startup" })(CronService.prototype, "startup", { value: CronService.prototype.startup })
 
@@ -165,11 +195,74 @@ test("two replicas enqueue the same cron only once (deterministic id)", async ()
   assert.equal(crons.length, 1, "only one row despite two replicas enqueuing")
 })
 
+test("re-registering a cron with a changed expression updates the existing task", async () => {
+  const store = new InMemoryScheduledTaskStore()
+  const scheduler = new Scheduler({ store })
+  const id = await scheduler.enqueueCron("reports.daily", null, "0 0 * * *")
+  await scheduler.enqueueCron("reports.daily", null, "30 1 * * *")
+  const tasks = await store.list()
+  assert.equal(tasks.length, 1)
+  assert.equal(tasks[0].id, id)
+  assert.equal(tasks[0].cron, "30 1 * * *")
+})
+
+test("a cron moves to its next tick after maxAttempts instead of becoming terminal", async () => {
+  const store = new InMemoryScheduledTaskStore()
+  const scheduler = new Scheduler({ store, maxAttempts: 1 })
+  scheduler.registerHandler("cron.fail", () => {
+    throw new Error("still broken")
+  })
+  await store.enqueue({
+    id: "cron:fail",
+    name: "cron.fail",
+    payload: null,
+    runAt: Date.now() - 1000,
+    cron: "* * * * *",
+    attempts: 0,
+    maxAttempts: 1,
+    status: "pending",
+    createdAt: Date.now() - 1000
+  })
+
+  const result = await scheduler.flushOnce()
+  const task = (await store.list()).find((entry) => entry.id === "cron:fail")!
+  assert.equal(result.rescheduled, 1)
+  assert.equal(task.status, "pending")
+  assert.equal(task.attempts, 0)
+  assert.match(task.lastError ?? "", /still broken/)
+  assert.ok(task.runAt > Date.now())
+})
+
+test("in-memory scheduler bounds retained terminal tasks", async () => {
+  const store = new InMemoryScheduledTaskStore({ maxTerminalTasks: 2, terminalRetentionMs: 60_000 })
+  for (let i = 0; i < 4; i++) {
+    await store.enqueue({
+      id: `done-${i}`,
+      name: "done",
+      payload: null,
+      runAt: 0,
+      attempts: 0,
+      maxAttempts: 1,
+      status: "pending",
+      createdAt: i
+    })
+    await store.claimDue("worker", Date.now(), 1, 1000)
+    await store.markCompleted(`done-${i}`, "worker")
+  }
+  assert.equal((await store.list({ status: "completed" })).length, 2)
+})
+
 test("claimDue reclaims a running task whose lease has expired", async () => {
   const store = new InMemoryScheduledTaskStore()
   await store.enqueue({
-    id: "stuck", name: "x", payload: null, runAt: 1_000,
-    attempts: 0, maxAttempts: 3, status: "pending", createdAt: 0
+    id: "stuck",
+    name: "x",
+    payload: null,
+    runAt: 1_000,
+    attempts: 0,
+    maxAttempts: 3,
+    status: "pending",
+    createdAt: 0
   })
 
   // Worker A claims it at t=2000 (10s lease) then "crashes" — never completes.
@@ -190,8 +283,14 @@ test("claimDue reclaims a running task whose lease has expired", async () => {
 test("a reaped worker's markFailed is a no-op on the row the reaper now owns", async () => {
   const store = new InMemoryScheduledTaskStore()
   await store.enqueue({
-    id: "stuck", name: "x", payload: null, runAt: 1_000,
-    attempts: 0, maxAttempts: 3, status: "pending", createdAt: 0
+    id: "stuck",
+    name: "x",
+    payload: null,
+    runAt: 1_000,
+    attempts: 0,
+    maxAttempts: 3,
+    status: "pending",
+    createdAt: 0
   })
 
   // Worker A claims it (10s lease) then stalls — slower than its lease, but
@@ -223,12 +322,19 @@ test("a reaped worker's markFailed is a no-op on the row the reaper now owns", a
 test("a reaped worker's reschedule/markCompleted are no-ops on the reaper's row", async () => {
   const store = new InMemoryScheduledTaskStore()
   await store.enqueue({
-    id: "cron:x", name: "x", payload: null, runAt: 1_000, cron: "0 * * * *",
-    attempts: 0, maxAttempts: 3, status: "pending", createdAt: 0
+    id: "cron:x",
+    name: "x",
+    payload: null,
+    runAt: 1_000,
+    cron: "0 * * * *",
+    attempts: 0,
+    maxAttempts: 3,
+    status: "pending",
+    createdAt: 0
   })
 
-  await store.claimDue("A", 2_000, 10, 10_000)          // worker A claims, then stalls
-  await store.claimDue("B", 20_000, 10, 10_000)         // worker B reaps past the lease
+  await store.claimDue("A", 2_000, 10, 10_000) // worker A claims, then stalls
+  await store.claimDue("B", 20_000, 10, 10_000) // worker B reaps past the lease
 
   // A's late finalizers must not move the row B now owns.
   await store.reschedule("cron:x", 99_999, "A")
@@ -250,13 +356,22 @@ test("a cron that fell behind skips missed runs and reschedules into the future"
   const store = new InMemoryScheduledTaskStore()
   const scheduler = new Scheduler({ store })
   let fired = 0
-  scheduler.registerHandler("hourly", () => { fired++ })
+  scheduler.registerHandler("hourly", () => {
+    fired++
+  })
 
   // Hourly cron whose scheduled runAt is 5 hours in the past (worker was down).
   const fiveHoursAgo = Date.now() - 5 * 60 * 60 * 1000
   await store.enqueue({
-    id: "cron:hourly", name: "hourly", payload: null, runAt: fiveHoursAgo,
-    cron: "0 * * * *", attempts: 0, maxAttempts: 5, status: "pending", createdAt: fiveHoursAgo
+    id: "cron:hourly",
+    name: "hourly",
+    payload: null,
+    runAt: fiveHoursAgo,
+    cron: "0 * * * *",
+    attempts: 0,
+    maxAttempts: 5,
+    status: "pending",
+    createdAt: fiveHoursAgo
   })
 
   const res = await scheduler.flushOnce()
@@ -281,14 +396,14 @@ test("cron ORs day-of-month and day-of-week when both are restricted", () => {
   let next = new Date(nextCronTick("0 0 13 * 5", new Date(2026, 0, 1, 0, 1).getTime()))
   assert.equal(next.getMonth(), 0)
   assert.equal(next.getDate(), 2)
-  assert.equal(next.getDay(), 5)            // Friday
+  assert.equal(next.getDay(), 5) // Friday
   assert.equal(next.getHours(), 0)
   assert.equal(next.getMinutes(), 0)
 
   // From Jan 9 00:01, the next match is Tue Jan 13 (day-of-month, NOT a Friday).
   next = new Date(nextCronTick("0 0 13 * 5", new Date(2026, 0, 9, 0, 1).getTime()))
   assert.equal(next.getDate(), 13)
-  assert.notEqual(next.getDay(), 5)         // proves the 13th matched on its own
+  assert.notEqual(next.getDay(), 5) // proves the 13th matched on its own
 })
 
 test("a UTC cron fires at the expected UTC minute", () => {
@@ -312,7 +427,10 @@ test("an IANA-timezone cron fires at the expected local minute (DST-aware)", () 
 
   // Confirm the New York wall clock reads 02:30.
   const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+    timeZone: "America/New_York",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
   }).formatToParts(next)
   const at = (type: string) => parts.find((p) => p.type === type)?.value
   assert.equal(at("hour"), "02")

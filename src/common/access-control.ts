@@ -122,15 +122,24 @@ function compile(config: AccessControlConfig): CompiledAcl {
     if (topic && method) {
       const key = `${topic}::${method}`
       let arr = compiled.byTopicMethod.get(key)
-      if (!arr) { arr = []; compiled.byTopicMethod.set(key, arr) }
+      if (!arr) {
+        arr = []
+        compiled.byTopicMethod.set(key, arr)
+      }
       arr.push(rule)
     } else if (topic && !method) {
       let arr = compiled.byTopic.get(topic)
-      if (!arr) { arr = []; compiled.byTopic.set(topic, arr) }
+      if (!arr) {
+        arr = []
+        compiled.byTopic.set(topic, arr)
+      }
       arr.push(rule)
     } else if (!topic && method) {
       let arr = compiled.byMethod.get(method)
-      if (!arr) { arr = []; compiled.byMethod.set(method, arr) }
+      if (!arr) {
+        arr = []
+        compiled.byMethod.set(method, arr)
+      }
       arr.push(rule)
     } else {
       compiled.globalDefault.push(rule)
@@ -164,20 +173,18 @@ export function isAccessAllowed(config: AccessControlConfig | undefined, topic: 
 
   if (candidates.length === 0) return compiled.allowAllByDefault
 
-  let matched = false
-  let denied = false
+  // Deny is authoritative: a matching deny in any candidate rule wins over any allow.
   for (const rule of candidates) {
-    matched = true
-    if (listHasValue(rule.deny, callerService)) { denied = true; continue }
+    if (listHasValue(rule.deny, callerService)) return false
+  }
+  for (const rule of candidates) {
     if (rule.allow && rule.allow.length > 0) {
       if (listHasValue(rule.allow, callerService)) return true
       continue
     }
     return true
   }
-
-  if (denied) return false
-  return matched ? false : compiled.allowAllByDefault
+  return false
 }
 
 export function logAccessDenied(config: AccessControlConfig | undefined, details: Record<string, unknown>) {

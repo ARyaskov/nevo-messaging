@@ -16,9 +16,7 @@ test("RegistryDiscoverySink replace evicts disappearing instances", () => {
     { serviceName: "user", instanceId: "u-b", transport: "http", ts: Date.now() }
   ])
   assert.equal(reg.list().length, 2)
-  sink.replace("user", [
-    { serviceName: "user", instanceId: "u-a", transport: "http", ts: Date.now() }
-  ])
+  sink.replace("user", [{ serviceName: "user", instanceId: "u-a", transport: "http", ts: Date.now() }])
   const ids = reg.listInstanceIdsFor("user")
   assert.deepEqual(ids, ["u-a"])
 })
@@ -33,7 +31,10 @@ test("ConsulDiscoveryProvider polls /v1/health/service and writes to registry", 
     }
     return new Response(
       JSON.stringify([
-        { Service: { ServiceID: "u-1", ServiceName: "user", ServiceAddress: "10.0.0.1", ServicePort: 8080, ServiceTags: ["user.getById"] }, Node: { Address: "10.0.0.1" } }
+        {
+          Service: { ServiceID: "u-1", ServiceName: "user", ServiceAddress: "10.0.0.1", ServicePort: 8080, ServiceTags: ["user.getById"] },
+          Node: { Address: "10.0.0.1" }
+        }
       ]),
       { status: 200, headers: { "content-type": "application/json" } }
     )
@@ -57,10 +58,11 @@ test("KubernetesDnsDiscoveryProvider resolves headless service A records", async
     services: [{ name: "user", port: 8080 }],
     pollIntervalMs: 50,
     resolver: {
-      lookup: async () => [
-        { address: "10.0.0.1", family: 4 },
-        { address: "10.0.0.2", family: 4 }
-      ] as any
+      lookup: async () =>
+        [
+          { address: "10.0.0.1", family: 4 },
+          { address: "10.0.0.2", family: 4 }
+        ] as any
     }
   })
   const detach = await attachDiscoveryProvider(reg, provider)

@@ -1,5 +1,7 @@
 import { setTimeout as sleep } from "node:timers/promises"
 import { uuidv7 } from "./uuid"
+import { MessagingError } from "./errors"
+import { ErrorCode } from "./error-code"
 import type { DlqSink } from "./dlq"
 import type { NevoLogger } from "./logger"
 import { NEVO_METRIC_NAMES, type MetricsRegistry } from "./metrics"
@@ -58,8 +60,12 @@ export interface SagaStore {
 
 export class InMemorySagaStore implements SagaStore {
   private readonly data = new Map<string, SagaSnapshot>()
-  async save(s: SagaSnapshot): Promise<void> { this.data.set(s.sagaId, structuredClone(s)) }
-  async load(id: string): Promise<SagaSnapshot | null> { return this.data.get(id) ? structuredClone(this.data.get(id)!) : null }
+  async save(s: SagaSnapshot): Promise<void> {
+    this.data.set(s.sagaId, structuredClone(s))
+  }
+  async load(id: string): Promise<SagaSnapshot | null> {
+    return this.data.get(id) ? structuredClone(this.data.get(id)!) : null
+  }
   async listPending(): Promise<SagaSnapshot[]> {
     return this.data
       .values()
@@ -67,7 +73,9 @@ export class InMemorySagaStore implements SagaStore {
       .toArray()
       .map((s) => structuredClone(s))
   }
-  async delete(id: string): Promise<void> { this.data.delete(id) }
+  async delete(id: string): Promise<void> {
+    this.data.delete(id)
+  }
 }
 
 // Never-aborting signal handed to steps with no timeout, so they always receive an AbortSignal.
@@ -79,7 +87,9 @@ async function withTimeout<T>(fn: (signal: AbortSignal) => Promise<T>, timeoutMs
   const { promise, resolve, reject } = Promise.withResolvers<T>()
   const onAbort = () => reject(new Error(`Saga step timeout after ${timeoutMs}ms`))
   signal.addEventListener("abort", onAbort, { once: true })
-  fn(signal).then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort))
+  fn(signal)
+    .then(resolve, reject)
+    .finally(() => signal.removeEventListener("abort", onAbort))
   return promise
 }
 
@@ -187,9 +197,7 @@ export class Saga<C = any> {
       if (executed.includes(step.name)) continue
       const retries = (step.retries ?? 0) + 1
       try {
-        await runWithRetry(retries, step.timeoutMs, step.backoff, (signal) =>
-          Promise.resolve(step.execute(ctx, signal))
-        )
+        await runWithRetry(retries, step.timeoutMs, step.backoff, (signal) => Promise.resolve(step.execute(ctx, signal)))
         executed.push(step.name)
         await this.persist(ctx, executed, "pending")
       } catch (lastErr) {
@@ -215,15 +223,15 @@ export class Saga<C = any> {
     return { status: "failed", error: err, executed, compensated, sagaId }
   }
 
-  private async compensate(
-    ctx: C,
-    executed: string[],
-    lastErr: unknown
-  ): Promise<{ compensated: string[]; failed: string[] }> {
+  private async compensate(ctx: C, executed: string[], lastErr: unknown): Promise<{ compensated: string[]; failed: string[] }> {
     const compensated: string[] = []
     const failed: string[] = []
     let snapshot: C
-    try { snapshot = structuredClone(ctx) } catch { snapshot = ctx }
+    try {
+      snapshot = structuredClone(ctx)
+    } catch {
+      snapshot = ctx
+    }
     for (let i = executed.length - 1; i >= 0; i--) {
       const name = executed[i]
       const original = this.steps.find((s) => s.name === name)
@@ -242,13 +250,7 @@ export class Saga<C = any> {
     return { compensated, failed }
   }
 
-  private async reportCompensationFailure(
-    step: string,
-    ctx: C,
-    cause: unknown,
-    compErr: unknown,
-    attempts: number
-  ): Promise<void> {
+  private async reportCompensationFailure(step: string, ctx: C, cause: unknown, compErr: unknown, attempts: number): Promise<void> {
     const message = compErr instanceof Error ? compErr.message : String(compErr)
     const stack = compErr instanceof Error ? compErr.stack : undefined
     this.metrics?.incCounter(NEVO_METRIC_NAMES.sagaCompensationFailures, { type: this.type, step })
@@ -285,12 +287,7 @@ export class Saga<C = any> {
     }
   }
 
-  static async resume<C>(
-    store: SagaStore,
-    sagaId: string,
-    steps: SagaStep<C>[],
-    opts: SagaResumeOptions = {}
-  ): Promise<SagaResult> {
+  static async resume<C>(store: SagaStore, sagaId: string, steps: SagaStep<C>[], opts: SagaResumeOptions = {}): Promise<SagaResult> {
     const snapshot = await store.load(sagaId)
     if (!snapshot) throw new Error(`Saga ${sagaId} not found`)
     const saga = new Saga<C>(opts.type ?? snapshot.type ?? DEFAULT_SAGA_TYPE)
@@ -305,6 +302,13 @@ export class Saga<C = any> {
     // Crashed mid-compensation: don't re-run forward steps, just finish undoing.
     if (snapshot.status === "compensating") {
       return await saga.fail(ctx, snapshot.executed, snapshot.error)
+    }
+    if (snapshot.status !== "pending") {
+      throw new MessagingError(ErrorCode.BAD_REQUEST, {
+        message: `Saga ${sagaId} is terminal (status "${snapshot.status}") and cannot be resumed`,
+        sagaId,
+        status: snapshot.status
+      })
     }
     return await saga.forward(ctx, snapshot.executed)
   }
@@ -351,6 +355,8 @@ export class SagaStepRegistry<C = any> {
 export interface SagaRecoveryOptions {
   /** How often to poll the store for stuck sagas. Default 30s. */
   intervalMs?: number
+  /** Only resume sagas whose `updatedAt` is at least this old, so live sagas aren't re-run in parallel. Default 2× `intervalMs`. */
+  staleAfterMs?: number
   dlq?: DlqSink
   metrics?: MetricsRegistry
   logger?: NevoLogger
@@ -369,6 +375,7 @@ export class SagaRecovery<C = any> {
   private readonly store: SagaStore
   private readonly registry: SagaStepRegistry<C>
   private readonly intervalMs: number
+  private readonly staleAfterMs: number
   private readonly dlq?: DlqSink
   private readonly metrics?: MetricsRegistry
   private readonly logger?: NevoLogger
@@ -381,6 +388,7 @@ export class SagaRecovery<C = any> {
     this.store = store
     this.registry = registry
     this.intervalMs = opts.intervalMs ?? 30_000
+    this.staleAfterMs = opts.staleAfterMs ?? this.intervalMs * 2
     this.dlq = opts.dlq
     this.metrics = opts.metrics
     this.logger = opts.logger
@@ -420,7 +428,9 @@ export class SagaRecovery<C = any> {
     const result: SagaRecoveryResult = { recovered: 0, skipped: 0, failed: 0 }
     try {
       const pending = await this.store.listPending()
+      const staleBefore = Date.now() - this.staleAfterMs
       for (const snapshot of pending) {
+        if (snapshot.updatedAt > staleBefore) continue
         const type = snapshot.type ?? DEFAULT_SAGA_TYPE
         const steps = this.registry.resolve(type, snapshot.steps)
         if (!steps) {

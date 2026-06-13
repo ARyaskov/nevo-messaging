@@ -16,7 +16,7 @@ function detachBuffers(value: unknown, depth = 0): unknown {
   }
   if (typeof value === "object") {
     for (const k of Object.keys(value as object)) {
-      (value as Record<string, unknown>)[k] = detachBuffers((value as Record<string, unknown>)[k], depth + 1)
+      ;(value as Record<string, unknown>)[k] = detachBuffers((value as Record<string, unknown>)[k], depth + 1)
     }
   }
   return value
@@ -44,8 +44,12 @@ export class LruIdempotencyCache<T = unknown> {
     this.ttlMs = opts?.ttlMs ?? 5 * 60_000
   }
 
-  isEnabled(): boolean { return this.enabled }
-  size(): number { return this.map.size }
+  isEnabled(): boolean {
+    return this.enabled
+  }
+  size(): number {
+    return this.map.size
+  }
 
   private detach(node: Node<T>): void {
     if (node.prev) node.prev.next = node.next

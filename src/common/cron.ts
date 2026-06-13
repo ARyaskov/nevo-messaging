@@ -25,7 +25,7 @@ const RANGES = {
   hour: [0, 23],
   day: [1, 31],
   month: [1, 12],
-  weekday: [0, 6]
+  weekday: [0, 7]
 } as const
 
 function parseField(spec: string, name: keyof typeof RANGES): CronField {
@@ -51,7 +51,9 @@ function parseField(spec: string, name: keyof typeof RANGES): CronField {
     if (!Number.isFinite(from) || !Number.isFinite(to) || from < min || to > max || from > to) {
       throw new Error(`cron: out-of-range "${spec}" for ${name}`)
     }
-    for (let v = from; v <= to; v += step) values.add(v)
+    for (let v = from; v <= to; v += step) {
+      values.add(name === "weekday" && v === 7 ? 0 : v)
+    }
   }
   return { values, wildcard: spec === "*" }
 }
@@ -70,10 +72,10 @@ export function parseCron(expr: string): ParsedCron {
 
 interface WallClock {
   year: number
-  month: number   // 1-12
-  day: number     // 1-31
-  hour: number    // 0-23
-  minute: number  // 0-59
+  month: number // 1-12
+  day: number // 1-31
+  hour: number // 0-23
+  minute: number // 0-59
   weekday: number // 0-6, Sunday = 0
 }
 
@@ -207,5 +209,10 @@ export function nextCronTick(expr: string, from: number, opts: CronOptions = {})
 
 /** Quick sanity check. */
 export function isValidCron(expr: string): boolean {
-  try { parseCron(expr); return true } catch { return false }
+  try {
+    parseCron(expr)
+    return true
+  } catch {
+    return false
+  }
 }

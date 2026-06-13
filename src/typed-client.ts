@@ -41,12 +41,7 @@ export interface TypedClient<TContract extends ServiceContractShape> {
   ): Promise<TContract[K]["result"]>
 
   /** Fire-and-forget against `method`, with params inferred from the contract. */
-  emit<K extends keyof TContract & string>(
-    service: string,
-    method: K,
-    params: TContract[K]["params"],
-    opts?: TypedEmitOptions
-  ): Promise<void>
+  emit<K extends keyof TContract & string>(service: string, method: K, params: TContract[K]["params"], opts?: TypedEmitOptions): Promise<void>
 }
 
 /** Wrap a transport client in a typed facade for `TContract` (a pure type-level cast). */

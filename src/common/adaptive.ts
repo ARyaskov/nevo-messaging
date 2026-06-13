@@ -6,9 +6,15 @@ export interface AdaptiveOptions {
   maxRetries?: number
   minTimeoutMs?: number
   maxTimeoutMs?: number
+  /** Minimum interval between O(n) window recomputations. Default 250ms. */
+  recomputeIntervalMs?: number
 }
 
-interface Sample { ts: number; durationMs: number; ok: boolean }
+interface Sample {
+  ts: number
+  durationMs: number
+  ok: boolean
+}
 
 const MAX_SAMPLES = 2048
 
@@ -52,6 +58,9 @@ export class AdaptiveTuner {
   private size = 0
   private currentRetries: number
   private currentTimeoutMs: number
+  private readonly recomputeIntervalMs: number
+  private observationsSinceRecompute = 0
+  private lastRecomputeAt = 0
 
   constructor(opts?: AdaptiveOptions) {
     this.enabled = opts?.enabled === true
@@ -61,11 +70,14 @@ export class AdaptiveTuner {
     this.maxRetries = opts?.maxRetries ?? 5
     this.minTimeoutMs = opts?.minTimeoutMs ?? 500
     this.maxTimeoutMs = opts?.maxTimeoutMs ?? 30_000
+    this.recomputeIntervalMs = Math.max(10, opts?.recomputeIntervalMs ?? 250)
     this.currentRetries = Math.max(this.minRetries, 2)
     this.currentTimeoutMs = Math.max(this.minTimeoutMs, Math.min(this.maxTimeoutMs, this.target * 4))
   }
 
-  isEnabled(): boolean { return this.enabled }
+  isEnabled(): boolean {
+    return this.enabled
+  }
 
   observe(durationMs: number, ok: boolean): void {
     if (!this.enabled) return
@@ -77,7 +89,13 @@ export class AdaptiveTuner {
     } else {
       this.start = (this.start + 1) % MAX_SAMPLES
     }
-    this.recompute(now)
+    this.observationsSinceRecompute++
+    if (
+      this.size >= 10 &&
+      (this.lastRecomputeAt === 0 || this.observationsSinceRecompute >= 64 || now - this.lastRecomputeAt >= this.recomputeIntervalMs)
+    ) {
+      this.recompute(now)
+    }
   }
 
   /** Collect in-window durations into a fresh array and count errors in one pass. */
@@ -106,6 +124,8 @@ export class AdaptiveTuner {
     if (durations.length < 10) return
     const p99 = this.percentile(durations, 99)
     const err = errors / durations.length
+    this.lastRecomputeAt = now
+    this.observationsSinceRecompute = 0
 
     if (p99 > this.target * 1.5 && this.currentTimeoutMs < this.maxTimeoutMs) {
       this.currentTimeoutMs = Math.min(this.maxTimeoutMs, Math.floor(this.currentTimeoutMs * 1.5))
@@ -113,24 +133,36 @@ export class AdaptiveTuner {
       this.currentTimeoutMs = Math.max(this.minTimeoutMs, Math.floor(this.currentTimeoutMs * 0.8))
     }
 
-    if (err > 0.1 && this.currentRetries < this.maxRetries) {
-      this.currentRetries++
-    } else if (err < 0.01 && this.currentRetries > this.minRetries) {
+    // High error rates reduce amplification. Only a healthy, low-latency
+    // window may cautiously restore retry capacity.
+    if (err > 0.1 && this.currentRetries > this.minRetries) {
       this.currentRetries--
+    } else if (err < 0.01 && p99 <= this.target && this.currentRetries < this.maxRetries) {
+      this.currentRetries++
     }
   }
 
-  getRetries(): number { return this.currentRetries }
-  getTimeoutMs(): number { return this.currentTimeoutMs }
+  getRetries(): number {
+    return this.currentRetries
+  }
+  getTimeoutMs(): number {
+    return this.currentTimeoutMs
+  }
 
   snapshot(): { p50: number; p95: number; p99: number; errorRate: number; sampleSize: number; retries: number; timeoutMs: number } {
     const { durations, errors } = this.window(Date.now())
+    const sorted = durations.slice().sort((a, b) => a - b)
     const sampleSize = durations.length
     const errorRate = sampleSize === 0 ? 0 : errors / sampleSize
+    const percentile = (p: number) => {
+      if (sorted.length === 0) return this.target
+      const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))
+      return sorted[idx]
+    }
     return {
-      p50: this.percentile(durations, 50),
-      p95: this.percentile(durations, 95),
-      p99: this.percentile(durations, 99),
+      p50: percentile(50),
+      p95: percentile(95),
+      p99: percentile(99),
       errorRate,
       sampleSize,
       retries: this.currentRetries,

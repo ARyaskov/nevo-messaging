@@ -4,11 +4,7 @@ import { createSignalRouterDecorator, type SignalRouterOptions } from "../src/si
 import { addSignalMetadata } from "../src/signal.decorator"
 import { RedisIdempotencyStore, type IdempotencyRedisLike } from "../src/common/idempotency-store"
 import { AuditLog, InMemoryAuditSink } from "../src/common/audit-log"
-import {
-  TenantPolicyRegistry,
-  setTenantPolicyRegistry,
-  getTenantPolicyRegistry
-} from "../src/common/tenant-policy"
+import { TenantPolicyRegistry, setTenantPolicyRegistry, getTenantPolicyRegistry } from "../src/common/tenant-policy"
 import { ErrorCode } from "../src/common/error-code"
 import type { MessageResponse } from "../src/common/types"
 
@@ -20,24 +16,22 @@ function fakeRedis(): IdempotencyRedisLike & { storage: Map<string, string> } {
   const storage = new Map<string, string>()
   return {
     storage,
-    async get(key) { return storage.get(key) ?? null },
+    async get(key) {
+      return storage.get(key) ?? null
+    },
     async set(key, value, opts) {
       if (opts.ifNotExists && storage.has(key)) return null
       storage.set(key, value)
       return "OK"
     },
-    async del(key) { return storage.delete(key) ? 1 : 0 }
+    async del(key) {
+      return storage.delete(key) ? 1 : 0
+    }
   } as IdempotencyRedisLike & { storage: Map<string, string> }
 }
 
 /** Build a `handleSignalMessage`-style entrypoint wired to a service instance. */
-function buildRouter(
-  serviceType: any,
-  serviceInstance: any,
-  signalName: string,
-  methodName: string,
-  options?: Partial<SignalRouterOptions>
-) {
+function buildRouter(serviceType: any, serviceInstance: any, signalName: string, methodName: string, options?: Partial<SignalRouterOptions>) {
   class Ctrl {
     svc: any = serviceInstance
   }
@@ -56,9 +50,15 @@ function buildRouter(
 test("signal-router: concurrent same-key requests execute the handler exactly once", async () => {
   let calls = 0
   let release!: () => void
-  const gate = new Promise<void>((r) => { release = r })
+  const gate = new Promise<void>((r) => {
+    release = r
+  })
   class Svc {
-    async run() { calls++; await gate; return { n: calls } }
+    async run() {
+      calls++
+      await gate
+      return { n: calls }
+    }
   }
   const store = new RedisIdempotencyStore<MessageResponse>({ client: fakeRedis(), enabled: true, ttlMs: 60_000 })
   const handle = buildRouter(Svc, new Svc(), "echo.run", "run", { idempotencyStore: store })
@@ -80,9 +80,15 @@ test("signal-router: concurrent same-key requests execute the handler exactly on
 test("signal-router: concurrent same-key requests dedup with only the in-process L1 (no distributed store)", async () => {
   let calls = 0
   let release!: () => void
-  const gate = new Promise<void>((r) => { release = r })
+  const gate = new Promise<void>((r) => {
+    release = r
+  })
   class Svc {
-    async run() { calls++; await gate; return { n: calls } }
+    async run() {
+      calls++
+      await gate
+      return { n: calls }
+    }
   }
   // No idempotencyStore — exactly-once relies on in-process leader election.
   const handle = buildRouter(Svc, new Svc(), "echo.run", "run")
@@ -102,7 +108,12 @@ test("signal-router: tenant kill-switch denies on the live path (before dispatch
   getTenantPolicyRegistry().setEnabled("router", "evicted", false, "non-payment")
   try {
     let calls = 0
-    class Svc { async run() { calls++; return "ok" } }
+    class Svc {
+      async run() {
+        calls++
+        return "ok"
+      }
+    }
     const handle = buildRouter(Svc, new Svc(), "echo.run", "run")
 
     const r = await handle({ method: "echo.run", params: {}, uuid: "t1", meta: { tenantId: "evicted" } })
@@ -123,7 +134,10 @@ test("signal-router: tenant kill-switch denies on the live path (before dispatch
 test("signal-router: wire-level idempotency key dedups across two simulated replicas", async () => {
   let calls = 0
   class Svc {
-    async run(p: any) { calls++; return { handledBy: p.replica, n: calls } }
+    async run(p: any) {
+      calls++
+      return { handledBy: p.replica, n: calls }
+    }
   }
   // Two routers with independent L1 caches + in-flight maps, sharing ONE Redis.
   const sharedRedis = fakeRedis()
@@ -144,7 +158,12 @@ test("signal-router: wire-level idempotency key dedups across two simulated repl
 
 test("signal-router: distinct idempotency keys do NOT dedup", async () => {
   let calls = 0
-  class Svc { async run() { calls++; return calls } }
+  class Svc {
+    async run() {
+      calls++
+      return calls
+    }
+  }
   const store = new RedisIdempotencyStore<MessageResponse>({ client: fakeRedis(), enabled: true, ttlMs: 60_000 })
   const handle = buildRouter(Svc, new Svc(), "echo.run", "run", { idempotencyStore: store })
   await handle({ method: "echo.run", params: {}, uuid: "a", meta: { idempotencyKey: "k-a" } })
@@ -155,7 +174,11 @@ test("signal-router: distinct idempotency keys do NOT dedup", async () => {
 test("signal-router: audit log records one redacted entry per request", async () => {
   const sink = new InMemoryAuditSink()
   const auditLog = new AuditLog({ enabled: true, sink })
-  class Svc { async run() { return "ok" } }
+  class Svc {
+    async run() {
+      return "ok"
+    }
+  }
   const handle = buildRouter(Svc, new Svc(), "echo.run", "run", { auditLog })
 
   await handle({ method: "echo.run", params: { a: 1 }, uuid: "a1", meta: { service: "caller" } })

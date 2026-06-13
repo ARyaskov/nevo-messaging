@@ -49,7 +49,7 @@ function escapeLabelValue(value: string): string {
   let out = ""
   for (const ch of value) {
     if (ch === "\\") out += "\\\\"
-    else if (ch === "\"") out += "\\\""
+    else if (ch === '"') out += '\\"'
     else if (ch === "\n") out += "\\n"
     else {
       const code = ch.charCodeAt(0)
@@ -101,7 +101,9 @@ export class InMemoryMetrics implements MetricsRegistry {
     this.bucketConfig = cfg
   }
 
-  isEnabled(): boolean { return this.enabled }
+  isEnabled(): boolean {
+    return this.enabled
+  }
 
   // Resolve the label-set key; new series past `maxSeries` funnel into the overflow bucket.
   private resolveKey(map: ReadonlyMap<string, unknown>, key: string): string {

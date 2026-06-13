@@ -82,7 +82,9 @@ function decodeJwtHeader(token: string): JwtHeader | null {
   try {
     const headerJson = base64UrlToBuffer(token.slice(0, dot)).toString("utf8")
     return JSON.parse(headerJson)
-  } catch { return null }
+  } catch {
+    return null
+  }
 }
 
 function decodeJwtPayloadRaw(token: string): { payload: VerifiedClaims | null; signedBytes: Buffer; signature: Buffer } | null {
@@ -94,7 +96,9 @@ function decodeJwtPayloadRaw(token: string): { payload: VerifiedClaims | null; s
     const signedBytes = Buffer.from(parts[0] + "." + parts[1], "utf8")
     const signature = base64UrlToBuffer(parts[2])
     return { payload, signedBytes, signature }
-  } catch { return null }
+  } catch {
+    return null
+  }
 }
 
 function jwkToPublicKey(jwk: JwksKey): import("node:crypto").KeyObject {
@@ -104,16 +108,26 @@ function jwkToPublicKey(jwk: JwksKey): import("node:crypto").KeyObject {
 // Maps a JWS `alg` to verify primitives; returns null for unsupported algs (incl. `none`/HS*).
 function algToSpec(alg: string): AlgSpec | null {
   switch (alg) {
-    case "RS256": return { hash: "sha256", family: "RSA", pss: false }
-    case "RS384": return { hash: "sha384", family: "RSA", pss: false }
-    case "RS512": return { hash: "sha512", family: "RSA", pss: false }
-    case "PS256": return { hash: "sha256", family: "RSA", pss: true }
-    case "PS384": return { hash: "sha384", family: "RSA", pss: true }
-    case "PS512": return { hash: "sha512", family: "RSA", pss: true }
-    case "ES256": return { hash: "sha256", family: "EC", pss: false }
-    case "ES384": return { hash: "sha384", family: "EC", pss: false }
-    case "ES512": return { hash: "sha512", family: "EC", pss: false }
-    default: return null
+    case "RS256":
+      return { hash: "sha256", family: "RSA", pss: false }
+    case "RS384":
+      return { hash: "sha384", family: "RSA", pss: false }
+    case "RS512":
+      return { hash: "sha512", family: "RSA", pss: false }
+    case "PS256":
+      return { hash: "sha256", family: "RSA", pss: true }
+    case "PS384":
+      return { hash: "sha384", family: "RSA", pss: true }
+    case "PS512":
+      return { hash: "sha512", family: "RSA", pss: true }
+    case "ES256":
+      return { hash: "sha256", family: "EC", pss: false }
+    case "ES384":
+      return { hash: "sha384", family: "EC", pss: false }
+    case "ES512":
+      return { hash: "sha512", family: "EC", pss: false }
+    default:
+      return null
   }
 }
 

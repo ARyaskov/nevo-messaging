@@ -17,13 +17,17 @@ export interface CacheableConfig {
 }
 
 function defineOnCtor(metaKey: string, ctor: any, propertyKey: string | symbol, value: unknown): void {
-  const map = (Reflect.getMetadata(metaKey, ctor) as Map<string, unknown> | undefined) ?? new Map<string, unknown>()
+  const own = Reflect.getOwnMetadata(metaKey, ctor) as Map<string, unknown> | undefined
+  const inherited = Reflect.getMetadata(metaKey, ctor) as Map<string, unknown> | undefined
+  const map = new Map<string, unknown>(own ?? inherited)
   map.set(propertyKey as string, value)
   Reflect.defineMetadata(metaKey, map, ctor)
 }
 
 // Detects the TC39 (stage-3) decorator context vs the legacy form.
-function isStandardDecoratorContext(maybeContext: any): maybeContext is { kind: string; name: string | symbol; addInitializer: (fn: () => void) => void } {
+function isStandardDecoratorContext(
+  maybeContext: any
+): maybeContext is { kind: string; name: string | symbol; addInitializer: (fn: () => void) => void } {
   return !!maybeContext && typeof maybeContext === "object" && typeof maybeContext.addInitializer === "function" && "kind" in maybeContext
 }
 

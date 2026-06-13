@@ -4,9 +4,7 @@ import type { IdempotencyOptions } from "./types"
 import { getDefaultLogger, type NevoLogger } from "./logger"
 
 /** Shared two-tier (L1 LRU + in-process leader election + distributed claim) idempotency runtime. */
-export type IdempotencyBegin<T> =
-  | { status: "hit"; value: T }
-  | { status: "execute" }
+export type IdempotencyBegin<T> = { status: "hit"; value: T } | { status: "execute" }
 
 export interface TwoTierIdempotencyOptions<T> {
   /** Provide an existing L1 cache (e.g. to share with a subclass field). */
@@ -41,7 +39,9 @@ export class TwoTierIdempotency<T> {
   }
 
   /** The L1 cache, for callers that want to keep a field pointing at it. */
-  get local(): LruIdempotencyCache<T> { return this.l1 }
+  get local(): LruIdempotencyCache<T> {
+    return this.l1
+  }
 
   isEnabled(): boolean {
     return this.l1.isEnabled() || (this.distributed?.isEnabled() ?? false)
@@ -139,7 +139,10 @@ export class TwoTierIdempotency<T> {
     if (this.inflight.has(key)) return false
     let resolve!: (value: T) => void
     let reject!: (err: unknown) => void
-    const p = new Promise<T>((res, rej) => { resolve = res; reject = rej })
+    const p = new Promise<T>((res, rej) => {
+      resolve = res
+      reject = rej
+    })
     // Pre-attach a no-op catch so a rejection (release) is never an unhandled one.
     p.catch(() => {})
     this.inflight.set(key, p)

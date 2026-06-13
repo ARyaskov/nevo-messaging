@@ -17,9 +17,15 @@ export class InMemoryInboxStore implements InboxStore {
   constructor(opts?: { maxEntries?: number; ttlMs?: number }) {
     this.cache = new LruIdempotencyCache<unknown>({ enabled: true, maxEntries: opts?.maxEntries ?? 50_000, ttlMs: opts?.ttlMs ?? 10 * 60_000 })
   }
-  async hasSeen(uuid: string): Promise<boolean> { return this.cache.has(uuid) }
-  async markSeen(uuid: string, result?: unknown): Promise<void> { this.cache.set(uuid, result) }
-  async getResult(uuid: string): Promise<unknown | undefined> { return this.cache.get(uuid) }
+  async hasSeen(uuid: string): Promise<boolean> {
+    return this.cache.has(uuid)
+  }
+  async markSeen(uuid: string, result?: unknown): Promise<void> {
+    this.cache.set(uuid, result)
+  }
+  async getResult(uuid: string): Promise<unknown | undefined> {
+    return this.cache.get(uuid)
+  }
 }
 
 export interface InboxOptions {
@@ -48,7 +54,9 @@ export class Inbox {
     this.awaitTimeoutMs = opts?.awaitTimeoutMs ?? 5_000
   }
 
-  isEnabled(): boolean { return this.enabled }
+  isEnabled(): boolean {
+    return this.enabled
+  }
 
   async dedupe<T>(uuid: string, handler: () => Promise<T>, opts?: { tx?: (commit: () => Promise<void>) => Promise<void> }): Promise<T> {
     if (!this.enabled) return handler()
@@ -90,7 +98,9 @@ export class Inbox {
 
       const result = await handler()
       if (opts?.tx) {
-        await opts.tx(async () => { await this.store.markSeen(uuid, result) })
+        await opts.tx(async () => {
+          await this.store.markSeen(uuid, result)
+        })
       } else {
         await this.store.markSeen(uuid, result)
       }
@@ -125,7 +135,10 @@ export class Inbox {
     if (this.inflight.has(uuid)) return false
     let resolve!: (value: unknown) => void
     let reject!: (err: unknown) => void
-    const p = new Promise<unknown>((res, rej) => { resolve = res; reject = rej })
+    const p = new Promise<unknown>((res, rej) => {
+      resolve = res
+      reject = rej
+    })
     p.catch(() => {})
     this.inflight.set(uuid, p)
     this.leaders.set(uuid, { resolve, reject })

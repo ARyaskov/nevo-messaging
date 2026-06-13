@@ -13,7 +13,10 @@ const NOOP_DETACH: CqrsDetach = () => {}
 
 export interface CqrsBridgeOptions {
   service: string
-  client: { query: (svc: string, method: string, params: unknown) => Promise<unknown>; emit: (svc: string, method: string, params: unknown) => Promise<void> }
+  client: {
+    query: (svc: string, method: string, params: unknown) => Promise<unknown>
+    emit: (svc: string, method: string, params: unknown) => Promise<void>
+  }
   remoteCommands?: string[]
   remoteEvents?: string[]
   commandKey?: (cmd: unknown) => string

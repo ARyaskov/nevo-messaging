@@ -7,8 +7,18 @@ import { Cacheable } from "../src/common/method-decorators"
 import { createJwksVerifier } from "../src/common/jwt-verifier"
 
 const SILENT_LOGGER: any = {
-  trace() {}, debug() {}, info() {}, warn() {}, error() {}, fatal() {},
-  child() { return SILENT_LOGGER }, isLevelEnabled() { return false }
+  trace() {},
+  debug() {},
+  info() {},
+  warn() {},
+  error() {},
+  fatal() {},
+  child() {
+    return SILENT_LOGGER
+  },
+  isLevelEnabled() {
+    return false
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -56,8 +66,7 @@ function makeRouter() {
   const controller = new Controller() as any
 
   let n = 0
-  const call = (params: any) =>
-    controller.handleSignalMessage({ method: "doThing", params, uuid: `u-${++n}`, meta: {} })
+  const call = (params: any) => controller.handleSignalMessage({ method: "doThing", params, uuid: `u-${++n}`, meta: {} })
   return { call, counter }
 }
 

@@ -1,7 +1,7 @@
 import { Type } from "@nestjs/common"
 import { createServer, Server as HttpServer } from "node:http"
 import { createSignalRouterDecorator, SignalRouterOptions } from "../../signal-router.utils"
-import { Codec, getCodec, getDefaultCodec, getDefaultLogger, DlqRouter } from "../../common"
+import { Codec, getCodec, getDefaultCodec, getDefaultLogger, DlqRouter, formatMethod, parseMethod, DEFAULT_METHOD_VERSION } from "../../common"
 import { getWsModule } from "./optional-ws"
 
 export interface WsSignalRouterOptions extends SignalRouterOptions {
@@ -9,12 +9,14 @@ export interface WsSignalRouterOptions extends SignalRouterOptions {
   host?: string
   path?: string
   codec?: Codec | string
-  perMessageDeflate?: boolean | {
-    threshold?: number
-    serverMaxWindowBits?: number
-    clientMaxWindowBits?: number
-    zlibDeflateOptions?: { level?: number; memLevel?: number }
-  }
+  perMessageDeflate?:
+    | boolean
+    | {
+        threshold?: number
+        serverMaxWindowBits?: number
+        clientMaxWindowBits?: number
+        zlibDeflateOptions?: { level?: number; memLevel?: number }
+      }
   maxPayload?: number
 }
 
@@ -38,13 +40,13 @@ export function WsSignalRouter(serviceType: Type<any> | Type<any>[], options?: W
     (target, eventPattern, handlerName) => {
       target.prototype.wsServer = null
       target.prototype.wsHttpServer = null
-      target.prototype.wsSubscribers = new Set()
+      target.prototype.wsSubscribers = null
 
       const originalOnModuleInit = target.prototype.onModuleInit || function () {}
       target.prototype.onModuleInit = async function () {
         await originalOnModuleInit.call(this)
 
-        const port = options?.port || 3200
+        const port = options?.port ?? 3200
         const host = options?.host || "0.0.0.0"
         const path = options?.path || "/"
         const httpServer: HttpServer = createServer()
@@ -55,6 +57,7 @@ export function WsSignalRouter(serviceType: Type<any> | Type<any>[], options?: W
         const wss = new WebSocketServer(wssOpts)
         this.wsServer = wss
         this.wsHttpServer = httpServer
+        this.wsSubscribers = new Set()
         const subscribers = this.wsSubscribers as Set<any>
 
         wss.on("connection", (socket: any) => {
@@ -69,10 +72,38 @@ export function WsSignalRouter(serviceType: Type<any> | Type<any>[], options?: W
               return
             }
 
-            if (envelope?.method === "__subscribe") {
-              (socket as any).__subscriptions ??= new Set()
+            const parsed = typeof envelope?.method === "string" ? parseMethod(envelope.method) : null
+
+            if (parsed?.name === "__subscribe") {
+              ;(socket as any).__subscriptions ??= new Set()
               const key = `${envelope.params?.serviceName?.toLowerCase?.()}:${envelope.params?.method}`
               ;(socket as any).__subscriptions.add(key)
+              return
+            }
+
+            const metaType = envelope?.meta?.type
+            if (metaType === "sub" || metaType === "broadcast") {
+              for (const subscriber of subscribers) {
+                if (subscriber.readyState !== 1) continue
+                const subscriptions: Set<string> | undefined = (subscriber as any).__subscriptions
+                if (!subscriptions || subscriptions.size === 0) continue
+                let matched = false
+                for (const subKey of subscriptions) {
+                  const subMethod = subKey.slice(subKey.indexOf(":") + 1)
+                  if (
+                    subMethod === envelope.method ||
+                    subMethod === parsed?.name ||
+                    formatMethod(subMethod, DEFAULT_METHOD_VERSION) === envelope.method
+                  ) {
+                    matched = true
+                    break
+                  }
+                }
+                if (!matched) continue
+                try {
+                  subscriber.send(raw)
+                } catch {}
+              }
               return
             }
 
@@ -101,8 +132,16 @@ export function WsSignalRouter(serviceType: Type<any> | Type<any>[], options?: W
       const originalOnModuleDestroy = target.prototype.onModuleDestroy || function () {}
       target.prototype.onModuleDestroy = async function () {
         await originalOnModuleDestroy.call(this)
-        if (this.wsServer) { try { this.wsServer.close() } catch {} }
-        if (this.wsHttpServer) { try { this.wsHttpServer.close() } catch {} }
+        if (this.wsServer) {
+          try {
+            this.wsServer.close()
+          } catch {}
+        }
+        if (this.wsHttpServer) {
+          try {
+            this.wsHttpServer.close()
+          } catch {}
+        }
       }
     }
   )

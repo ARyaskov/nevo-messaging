@@ -14,7 +14,9 @@ function getSqlite(): SqliteModule {
     sqliteCache = nodeRequire("node:sqlite") as SqliteModule
     return sqliteCache
   } catch (err: any) {
-    throw new Error(`node:sqlite is unavailable: ${err?.message ?? err}. Requires Node 23+ with --experimental-sqlite, or Node 24+ where it is stable.`)
+    throw new Error(
+      `node:sqlite is unavailable: ${err?.message ?? err}. Requires Node 23+ with --experimental-sqlite, or Node 24+ where it is stable.`
+    )
   }
 }
 
@@ -48,7 +50,9 @@ export class SqliteOutboxStore implements OutboxStore {
       this.db = new sqlite.DatabaseSync(opts.path ?? ":memory:")
       this.ownsDb = true
       for (const p of opts.pragma ?? ["journal_mode = WAL", "synchronous = NORMAL", "busy_timeout = 5000"]) {
-        try { this.db.exec(`PRAGMA ${p}`) } catch {}
+        try {
+          this.db.exec(`PRAGMA ${p}`)
+        } catch {}
       }
     }
 
@@ -68,13 +72,41 @@ export class SqliteOutboxStore implements OutboxStore {
       CREATE INDEX IF NOT EXISTS ${this.table}_status_idx ON ${this.table}(status, created_at);
     `)
     // Forward-migrate pre-partition_key tables; duplicate-column error is expected and ignored.
-    try { this.db.exec(`ALTER TABLE ${this.table} ADD COLUMN partition_key TEXT`) } catch {}
+    try {
+      this.db.exec(`ALTER TABLE ${this.table} ADD COLUMN partition_key TEXT`)
+    } catch {}
 
     this.stmts = {
-      save: this.db.prepare(`INSERT OR IGNORE INTO ${this.table} (id, service_name, method, params_json, partition_key, created_at, attempts, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`),
-      markPublished: this.db.prepare(`UPDATE ${this.table} SET status = 'published', published_at = ? WHERE id = ? AND status = 'pending' RETURNING status, attempts`),
-      markFailed: this.db.prepare(`UPDATE ${this.table} SET attempts = attempts + 1, last_error = ?, status = CASE WHEN attempts + 1 >= ? THEN 'failed' ELSE 'pending' END WHERE id = ? AND status = 'pending' RETURNING status, attempts`),
-      listPending: this.db.prepare(`SELECT id, service_name, method, params_json, partition_key, created_at, published_at, attempts, status, last_error FROM ${this.table} WHERE status = 'pending' ORDER BY created_at LIMIT ?`)
+      save: this.db.prepare(
+        `INSERT OR IGNORE INTO ${this.table} (id, service_name, method, params_json, partition_key, created_at, attempts, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ),
+      markPublished: this.db.prepare(
+        `UPDATE ${this.table} SET status = 'published', published_at = ? WHERE id = ? AND status = 'pending' RETURNING status, attempts`
+      ),
+      markFailed: this.db.prepare(
+        `UPDATE ${this.table} SET attempts = attempts + 1, last_error = ?, status = CASE WHEN attempts + 1 >= ? THEN 'failed' ELSE 'pending' END WHERE id = ? AND status = 'pending' RETURNING status, attempts`
+      ),
+      listPending: this.db.prepare(`
+        SELECT o.id, o.service_name, o.method, o.params_json, o.partition_key,
+               o.created_at, o.published_at, o.attempts, o.status, o.last_error
+          FROM ${this.table} o
+         WHERE o.status = 'pending'
+           AND (
+             o.partition_key IS NULL
+             OR NOT EXISTS (
+               SELECT 1
+                 FROM ${this.table} failed
+                WHERE failed.partition_key = o.partition_key
+                  AND failed.status = 'failed'
+                  AND (
+                    failed.created_at < o.created_at
+                    OR (failed.created_at = o.created_at AND failed.id < o.id)
+                  )
+             )
+           )
+         ORDER BY o.created_at, o.id
+         LIMIT ?
+      `)
     }
   }
 
@@ -83,10 +115,28 @@ export class SqliteOutboxStore implements OutboxStore {
     if (tx && tx !== this.db && typeof tx.prepare === "function") {
       tx.prepare(
         `INSERT OR IGNORE INTO ${this.table} (id, service_name, method, params_json, partition_key, created_at, attempts, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(record.id, record.serviceName, record.method, stringifyWithBigInt(record.params), record.partitionKey ?? null, record.createdAt, record.attempts, record.status)
+      ).run(
+        record.id,
+        record.serviceName,
+        record.method,
+        stringifyWithBigInt(record.params),
+        record.partitionKey ?? null,
+        record.createdAt,
+        record.attempts,
+        record.status
+      )
       return
     }
-    this.stmts.save.run(record.id, record.serviceName, record.method, stringifyWithBigInt(record.params), record.partitionKey ?? null, record.createdAt, record.attempts, record.status)
+    this.stmts.save.run(
+      record.id,
+      record.serviceName,
+      record.method,
+      stringifyWithBigInt(record.params),
+      record.partitionKey ?? null,
+      record.createdAt,
+      record.attempts,
+      record.status
+    )
   }
 
   async markPublished(id: string): Promise<OutboxMarkResult> {
@@ -120,6 +170,8 @@ export class SqliteOutboxStore implements OutboxStore {
   close(): void {
     // Never close a borrowed connection.
     if (!this.ownsDb) return
-    try { this.db.close() } catch {}
+    try {
+      this.db.close()
+    } catch {}
   }
 }

@@ -39,7 +39,6 @@ interface PendingJob {
 
 interface PooledWorker {
   worker: Worker
-  busy: boolean
 }
 
 let pool: PooledWorker[] | null = null
@@ -47,11 +46,10 @@ const pendingByWorker = new Map<Worker, Map<number, PendingJob>>()
 let jobCounter = 0
 
 function getPool(size: number): PooledWorker[] {
-  if (pool) return pool
-  pool = []
-  for (let i = 0; i < size; i++) {
+  if (!pool) pool = []
+  while (pool.length < size) {
     const w = new Worker(WORKER_INLINE_SOURCE, { eval: true })
-    pool.push({ worker: w, busy: false })
+    pool.push({ worker: w })
     const pending = new Map<number, PendingJob>()
     pendingByWorker.set(w, pending)
     w.on("message", (msg: any) => {
@@ -65,15 +63,42 @@ function getPool(size: number): PooledWorker[] {
         job.reject(err)
       }
     })
+    const rejectPending = (err: Error) => {
+      const jobs = pendingByWorker.get(w)
+      if (jobs) {
+        for (const job of jobs.values()) job.reject(err)
+        jobs.clear()
+      }
+      pendingByWorker.delete(w)
+      if (pool) pool = pool.filter((entry) => entry.worker !== w)
+      cfg.logger?.warn({ event: "compression.worker.failed", err: err.message }, "Compression worker exited with pending jobs")
+    }
+    w.on("error", (err) => rejectPending(err instanceof Error ? err : new Error(String(err))))
+    w.on("exit", (code) => {
+      if (pendingByWorker.has(w)) {
+        rejectPending(new Error(`Compression worker exited with code ${code}`))
+      }
+    })
     w.unref()
   }
   return pool
 }
 
 function pickWorker(): PooledWorker | null {
-  if (!pool) return null
-  for (const w of pool) if (!w.busy) return w
-  return pool[Math.floor(Math.random() * pool.length)]
+  if ((!pool || pool.length === 0) && cfg.enabled) {
+    getPool(cfg.poolSize ?? Math.max(1, Math.min(4, os.cpus().length - 1)))
+  }
+  if (!pool || pool.length === 0) return null
+  let selected = pool[0]
+  let selectedJobs = pendingByWorker.get(selected.worker)?.size ?? 0
+  for (let i = 1; i < pool.length; i++) {
+    const count = pendingByWorker.get(pool[i].worker)?.size ?? 0
+    if (count < selectedJobs) {
+      selected = pool[i]
+      selectedJobs = count
+    }
+  }
+  return selected
 }
 
 export interface CompressionWorkerOptions {
@@ -98,6 +123,12 @@ export function compressionWorkerThreshold(): number {
   return cfg.threshold ?? 64 * 1024
 }
 
+function transferableCopy(data: Uint8Array): Uint8Array {
+  const copy = new Uint8Array(data.byteLength)
+  copy.set(data)
+  return copy
+}
+
 export async function workerCompress(data: Uint8Array, encoding: "gzip" | "deflate" | "zstd", level?: number): Promise<Uint8Array> {
   const pooled = pickWorker()
   if (!pooled) throw new Error("Compression worker pool not initialized; call configureCompressionWorker first")
@@ -105,18 +136,14 @@ export async function workerCompress(data: Uint8Array, encoding: "gzip" | "defla
   const pending = pendingByWorker.get(pooled.worker)!
   const { promise, resolve, reject } = Promise.withResolvers<Uint8Array>()
   pending.set(id, { resolve, reject })
-  pooled.busy = true
+  const transferable = transferableCopy(data)
   try {
-    pooled.worker.postMessage({ id, op: "compress", data, encoding, level }, [data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer])
+    pooled.worker.postMessage({ id, op: "compress", data: transferable, encoding, level }, [transferable.buffer as ArrayBuffer])
   } catch (err) {
     pending.delete(id)
-    pooled.busy = false
     throw err
   }
-  // Return the chained promise so the caller's await/catch also covers the busy
-  // reset — a bare `promise.finally(...)` would orphan its rejection and surface
-  // as an unhandledRejection when a job rejects (e.g. a decompression-bomb cap).
-  return promise.finally(() => { pooled.busy = false })
+  return promise
 }
 
 export async function workerDecompress(data: Uint8Array, encoding: "gzip" | "deflate" | "zstd", maxOutputBytes?: number): Promise<Uint8Array> {
@@ -126,22 +153,31 @@ export async function workerDecompress(data: Uint8Array, encoding: "gzip" | "def
   const pending = pendingByWorker.get(pooled.worker)!
   const { promise, resolve, reject } = Promise.withResolvers<Uint8Array>()
   pending.set(id, { resolve, reject })
-  pooled.busy = true
+  const transferable = transferableCopy(data)
   try {
-    pooled.worker.postMessage({ id, op: "decompress", data, encoding, maxOutputBytes }, [data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer])
+    pooled.worker.postMessage({ id, op: "decompress", data: transferable, encoding, maxOutputBytes }, [transferable.buffer as ArrayBuffer])
   } catch (err) {
     pending.delete(id)
-    pooled.busy = false
     throw err
   }
-  return promise.finally(() => { pooled.busy = false })
+  return promise
 }
 
 export async function shutdownCompressionWorker(): Promise<void> {
   if (!pool) return
-  for (const w of pool) {
-    try { await w.worker.terminate() } catch {}
-  }
+  const workers = pool
   pool = null
+  for (const entry of workers) {
+    const pending = pendingByWorker.get(entry.worker)
+    if (pending) {
+      const err = new Error("Compression worker pool is shutting down")
+      for (const job of pending.values()) job.reject(err)
+      pending.clear()
+      pendingByWorker.delete(entry.worker)
+    }
+    try {
+      await entry.worker.terminate()
+    } catch {}
+  }
   pendingByWorker.clear()
 }

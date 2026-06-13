@@ -53,10 +53,10 @@ export class JetStreamHelper {
       subjects: setup.subjects,
       retention:
         setup.retention === "interest"
-          ? RetentionPolicy?.Interest ?? "interest"
+          ? (RetentionPolicy?.Interest ?? "interest")
           : setup.retention === "workqueue"
-            ? RetentionPolicy?.Workqueue ?? "workqueue"
-            : RetentionPolicy?.Limits ?? "limits",
+            ? (RetentionPolicy?.Workqueue ?? "workqueue")
+            : (RetentionPolicy?.Limits ?? "limits"),
       max_age: setup.maxAge,
       max_bytes: setup.maxBytes,
       duplicate_window: setup.duplicateWindow
@@ -69,7 +69,11 @@ export class JetStreamHelper {
     }
   }
 
-  async publish(subject: string, value: unknown, opts?: { msgId?: string; expectedStream?: string; expectedLastSeq?: number }): Promise<{ seq: number; stream: string; duplicate: boolean }> {
+  async publish(
+    subject: string,
+    value: unknown,
+    opts?: { msgId?: string; expectedStream?: string; expectedLastSeq?: number }
+  ): Promise<{ seq: number; stream: string; duplicate: boolean }> {
     const js = getJetStreamModule() as any
     const client = js.jetstream(this.nc)
     const data = this.codec.encode(value)
@@ -109,6 +113,7 @@ export class JetStreamHelper {
     await this.ensureConsumer(opts)
     const consumer = await client.consumers.get(opts.streamName, opts.durableName)
     let stopped = false
+    let activeMsgs: { stop(): void } | null = null
 
     const pump = async () => {
       while (!stopped) {
@@ -118,6 +123,13 @@ export class JetStreamHelper {
             expires: opts.expires ?? 5000,
             idle_heartbeat: opts.idleHeartbeat ?? 1000
           })
+          activeMsgs = msgs
+          if (stopped) {
+            try {
+              msgs.stop()
+            } catch {}
+            return
+          }
           for await (const m of msgs) {
             if (stopped) break
             let value: T
@@ -153,7 +165,14 @@ export class JetStreamHelper {
     }
 
     void pump()
-    return { unsubscribe: async () => { stopped = true } }
+    return {
+      unsubscribe: async () => {
+        stopped = true
+        try {
+          activeMsgs?.stop()
+        } catch {}
+      }
+    }
   }
 }
 

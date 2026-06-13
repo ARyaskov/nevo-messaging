@@ -27,7 +27,11 @@ export function createNevoHttpGateway(opts: NevoHttpGatewayOptions = {}): (req: 
       if (opts.cors.exposeHeaders?.length) res.setHeader("access-control-expose-headers", opts.cors.exposeHeaders.join(","))
       if (opts.cors.credentials) res.setHeader("access-control-allow-credentials", "true")
       if (opts.cors.maxAge !== undefined) res.setHeader("access-control-max-age", String(opts.cors.maxAge))
-      if (req.method === "OPTIONS") { res.statusCode = 204; res.end(); return }
+      if (req.method === "OPTIONS") {
+        res.statusCode = 204
+        res.end()
+        return
+      }
     }
 
     if (opts.requestIdHeader) {

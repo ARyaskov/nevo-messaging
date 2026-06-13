@@ -46,6 +46,10 @@ export class BackpressureLimiter {
     }
   }
 
-  getInflight(): number { return this.inflight }
-  isPaused(): boolean { return this.paused }
+  getInflight(): number {
+    return this.inflight
+  }
+  isPaused(): boolean {
+    return this.paused
+  }
 }

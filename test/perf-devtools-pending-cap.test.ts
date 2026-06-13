@@ -20,7 +20,16 @@ test("drop-oldest caps pendingEmissions at maxPending under flush suppression", 
   bus.on((e) => received.push(e.ts))
   bus.drain()
   assert.equal(received.length, cap)
-  assert.deepEqual(received, [cap * 50 - cap, cap * 50 - cap + 1, cap * 50 - cap + 2, cap * 50 - cap + 3, cap * 50 - cap + 4, cap * 50 - cap + 5, cap * 50 - cap + 6, cap * 50 - cap + 7])
+  assert.deepEqual(received, [
+    cap * 50 - cap,
+    cap * 50 - cap + 1,
+    cap * 50 - cap + 2,
+    cap * 50 - cap + 3,
+    cap * 50 - cap + 4,
+    cap * 50 - cap + 5,
+    cap * 50 - cap + 6,
+    cap * 50 - cap + 7
+  ])
 })
 
 test("maxPending defaults to capacity", () => {

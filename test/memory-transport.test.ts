@@ -10,8 +10,12 @@ test("query routes to a registered handler and returns its value", async () => {
     return { id: params.id, name: "Eddie" }
   })
   class Caller extends MemoryClientBase {
-    constructor() { super(t, { serviceName: "frontend" }) }
-    fetch(id: bigint) { return this.query<{ id: bigint; name: string }>("user", "user.getById", { id }) }
+    constructor() {
+      super(t, { serviceName: "frontend" })
+    }
+    fetch(id: bigint) {
+      return this.query<{ id: bigint; name: string }>("user", "user.getById", { id })
+    }
   }
   const c = new Caller()
   const u = await c.fetch(42n)
@@ -23,14 +27,21 @@ test("query routes to a registered handler and returns its value", async () => {
 test("query without handler throws METHOD_NOT_FOUND", async () => {
   const t = createMemoryTransport()
   class C extends MemoryClientBase {
-    constructor() { super(t, { serviceName: "f" }) }
-    p() { return this.query("nope", "x", {}) }
+    constructor() {
+      super(t, { serviceName: "f" })
+    }
+    p() {
+      return this.query("nope", "x", {})
+    }
   }
-  await assert.rejects(() => new C().p(), (err) => {
-    assert.ok(err instanceof MessagingError)
-    assert.equal((err as MessagingError).code, ErrorCode.METHOD_NOT_FOUND)
-    return true
-  })
+  await assert.rejects(
+    () => new C().p(),
+    (err) => {
+      assert.ok(err instanceof MessagingError)
+      assert.equal((err as MessagingError).code, ErrorCode.METHOD_NOT_FOUND)
+      return true
+    }
+  )
 })
 
 test("emit is fire-and-forget — handler runs asynchronously", async () => {
@@ -44,8 +55,12 @@ test("emit is fire-and-forget — handler runs asynchronously", async () => {
   })
   let emitCompleted = false
   class C extends MemoryClientBase {
-    constructor() { super(t, { serviceName: "user" }) }
-    send() { return this.emit("audit", "user.created", { id: 1n }) }
+    constructor() {
+      super(t, { serviceName: "user" })
+    }
+    send() {
+      return this.emit("audit", "user.created", { id: 1n })
+    }
   }
   await new C().send()
   emitCompleted = true
@@ -58,25 +73,44 @@ test("emit is fire-and-forget — handler runs asynchronously", async () => {
 test("publish fans out to subscribers", async () => {
   const t = createMemoryTransport()
   const received: number[] = []
-  t.subscribe<{ n: number }>("metrics", "ping", undefined, async (msg) => { received.push(msg.n) })
-  t.subscribe<{ n: number }>("metrics", "ping", undefined, async (msg) => { received.push(msg.n * 10) })
+  t.subscribe<{ n: number }>("metrics", "ping", undefined, async (msg) => {
+    received.push(msg.n)
+  })
+  t.subscribe<{ n: number }>("metrics", "ping", undefined, async (msg) => {
+    received.push(msg.n * 10)
+  })
   class P extends MemoryClientBase {
-    constructor() { super(t, { serviceName: "src" }) }
-    fire(n: number) { return this.publish("metrics", "ping", { n }) }
+    constructor() {
+      super(t, { serviceName: "src" })
+    }
+    fire(n: number) {
+      return this.publish("metrics", "ping", { n })
+    }
   }
   await new P().fire(7)
-  assert.deepEqual(received.sort((a, b) => a - b), [7, 70])
+  assert.deepEqual(
+    received.sort((a, b) => a - b),
+    [7, 70]
+  )
 })
 
 test("broadcast reaches broadcast listeners + matching subscribers", async () => {
   const t = createMemoryTransport()
   let bcasts = 0
   let pubs = 0
-  t.subscribeBroadcast(async () => { bcasts++ })
-  t.subscribe("anything", "system.status", undefined, async () => { pubs++ })
+  t.subscribeBroadcast(async () => {
+    bcasts++
+  })
+  t.subscribe("anything", "system.status", undefined, async () => {
+    pubs++
+  })
   class C extends MemoryClientBase {
-    constructor() { super(t, { serviceName: "x" }) }
-    go() { return this.broadcast("system.status", { ok: true }) }
+    constructor() {
+      super(t, { serviceName: "x" })
+    }
+    go() {
+      return this.broadcast("system.status", { ok: true })
+    }
   }
   await new C().go()
   assert.equal(bcasts, 1)
@@ -92,12 +126,16 @@ test("wildcard subscriptions match dotted method names", async () => {
     received.push("hit")
   })
   class P extends MemoryClientBase {
-    constructor() { super(t, { serviceName: "x" }) }
-    fire(m: string) { return this.publish("user", m, {}) }
+    constructor() {
+      super(t, { serviceName: "x" })
+    }
+    fire(m: string) {
+      return this.publish("user", m, {})
+    }
   }
   await new P().fire("user.event.created")
   await new P().fire("user.event.deleted")
-  await new P().fire("user.changed")           // does NOT match `user.event.>`
+  await new P().fire("user.changed") // does NOT match `user.event.>`
   assert.equal(received.length, 2)
 })
 
@@ -106,8 +144,12 @@ test("MemoryHarness.failNext injects a single error", async () => {
   t.registerHandler("svc", "fail", async () => "ok")
   t.harness.failNext("svc", "fail", new Error("simulated"))
   class C extends MemoryClientBase {
-    constructor() { super(t, { serviceName: "x" }) }
-    call() { return this.query("svc", "fail", {}) }
+    constructor() {
+      super(t, { serviceName: "x" })
+    }
+    call() {
+      return this.query("svc", "fail", {})
+    }
   }
   await assert.rejects(() => new C().call(), /simulated/)
   // The injection is consumed — the next call succeeds.
@@ -120,8 +162,12 @@ test("MemoryHarness.delayBy applies latency", async () => {
   t.registerHandler("svc", "slow", async () => "ok")
   t.harness.delayBy("svc", "slow", 30)
   class C extends MemoryClientBase {
-    constructor() { super(t, { serviceName: "x" }) }
-    call() { return this.query("svc", "slow", {}) }
+    constructor() {
+      super(t, { serviceName: "x" })
+    }
+    call() {
+      return this.query("svc", "slow", {})
+    }
   }
   const t0 = Date.now()
   await new C().call()
@@ -132,8 +178,12 @@ test("harness records call kind, service, method, uuid", async () => {
   const t = new MemoryTransport()
   t.registerHandler("a", "m", async () => 1)
   class C extends MemoryClientBase {
-    constructor() { super(t, { serviceName: "x" }) }
-    q() { return this.query("a", "m", { hello: "world" }) }
+    constructor() {
+      super(t, { serviceName: "x" })
+    }
+    q() {
+      return this.query("a", "m", { hello: "world" })
+    }
   }
   await new C().q()
   const [call] = t.harness.calls
@@ -149,8 +199,12 @@ test("reset() wipes handlers and history", async () => {
     handlers: { svc: { m: async () => "first" } }
   })
   class C extends MemoryClientBase {
-    constructor() { super(t, { serviceName: "x" }) }
-    q() { return this.query("svc", "m", {}) }
+    constructor() {
+      super(t, { serviceName: "x" })
+    }
+    q() {
+      return this.query("svc", "m", {})
+    }
   }
   assert.equal(await new C().q(), "first")
   assert.equal(t.harness.calls.length, 1)

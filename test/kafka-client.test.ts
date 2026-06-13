@@ -29,10 +29,18 @@ function makeFakeConsumer(): FakeConsumer {
     _committed: [],
     async connect() {},
     async disconnect() {},
-    async subscribe({ topic }) { consumer._subscribedTopics.push(topic) },
-    async run({ eachMessage }) { consumer._eachMessage = eachMessage },
-    async commitOffsets(offsets) { consumer._committed.push(...offsets) },
-    pause() { return () => {} },
+    async subscribe({ topic }) {
+      consumer._subscribedTopics.push(topic)
+    },
+    async run({ eachMessage }) {
+      consumer._eachMessage = eachMessage
+    },
+    async commitOffsets(offsets) {
+      consumer._committed.push(...offsets)
+    },
+    pause() {
+      return () => {}
+    },
     resume() {}
   }
   return consumer
@@ -42,7 +50,11 @@ function makeFakeKafka() {
   const consumers: FakeConsumer[] = []
   return {
     consumers,
-    consumer() { const c = makeFakeConsumer(); consumers.push(c); return c },
+    consumer() {
+      const c = makeFakeConsumer()
+      consumers.push(c)
+      return c
+    },
     producer() {
       return { async connect() {}, async disconnect() {}, async send() {}, async sendBatch() {} }
     }
@@ -50,8 +62,15 @@ function makeFakeKafka() {
 }
 
 const SILENT_LOGGER: any = {
-  trace() {}, debug() {}, info() {}, warn() {}, error() {}, fatal() {},
-  child() { return SILENT_LOGGER }
+  trace() {},
+  debug() {},
+  info() {},
+  warn() {},
+  error() {},
+  fatal() {},
+  child() {
+    return SILENT_LOGGER
+  }
 }
 
 function makeClient(fakeKafka: ReturnType<typeof makeFakeKafka>, codec: JsonCodec): NevoKafkaClient {
@@ -89,7 +108,12 @@ test("plain subscribe: a manual-ack handler error schedules a resume instead of 
 
     let pauseCalls = 0
     let resumeCalls = 0
-    const pause = () => { pauseCalls++; return () => { resumeCalls++ } }
+    const pause = () => {
+      pauseCalls++
+      return () => {
+        resumeCalls++
+      }
+    }
 
     mock.timers.enable({ apis: ["setTimeout"] })
     try {
@@ -155,7 +179,12 @@ test("sticky subscribe: a manual-ack handler error schedules a resume and retain
 
     let pauseCalls = 0
     let resumeCalls = 0
-    const pause = () => { pauseCalls++; return () => { resumeCalls++ } }
+    const pause = () => {
+      pauseCalls++
+      return () => {
+        resumeCalls++
+      }
+    }
 
     mock.timers.enable({ apis: ["setTimeout"] })
     try {

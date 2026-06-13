@@ -9,9 +9,17 @@ function fakeSub(): PausableSubscription & { paused: number; resumed: number } {
   const state = {
     paused: 0,
     resumed: 0,
-    pause() { paused = true; state.paused++ },
-    resume() { paused = false; state.resumed++ },
-    isPaused() { return paused },
+    pause() {
+      paused = true
+      state.paused++
+    },
+    resume() {
+      paused = false
+      state.resumed++
+    },
+    isPaused() {
+      return paused
+    },
     async unsubscribe() {}
   }
   return state as any
@@ -25,11 +33,7 @@ test("wrapSubscriptionHandler pauses on high water, resumes on low water", async
   const sub = fakeSub()
   let resolveOne!: () => void
   const block = new Promise<void>((r) => (resolveOne = r))
-  const handler = wrapSubscriptionHandler<number>(
-    async () => block,
-    sub,
-    { maxInflight: 4, highWatermark: 2, lowWatermark: 1 }
-  )
+  const handler = wrapSubscriptionHandler<number>(async () => block, sub, { maxInflight: 4, highWatermark: 2, lowWatermark: 1 })
   void handler(1, fakeCtx())
   void handler(2, fakeCtx())
   await new Promise((r) => setTimeout(r, 5))
@@ -42,13 +46,13 @@ test("wrapSubscriptionHandler pauses on high water, resumes on low water", async
 
 test("installBackpressureFromDecorator wraps based on @Backpressure metadata", async () => {
   class Svc {
-    async ingest(_msg: number) { await new Promise((r) => setTimeout(r, 20)) }
+    async ingest(_msg: number) {
+      await new Promise((r) => setTimeout(r, 20))
+    }
   }
-  Backpressure({ maxInflight: 1, highWatermark: 1, lowWatermark: 0, onOverflow: "reject" } as any)(
-    Svc.prototype,
-    "ingest",
-    { value: Svc.prototype.ingest }
-  )
+  Backpressure({ maxInflight: 1, highWatermark: 1, lowWatermark: 0, onOverflow: "reject" } as any)(Svc.prototype, "ingest", {
+    value: Svc.prototype.ingest
+  })
   const s = new Svc()
   const sub = fakeSub()
   const wrapped = installBackpressureFromDecorator<number>(s, "ingest", (m, _c) => s.ingest(m), sub)
@@ -60,16 +64,19 @@ test("installBackpressureFromDecorator wraps based on @Backpressure metadata", a
 
 test("nack-mode dispatches ctx.nack instead of throwing", async () => {
   const sub = fakeSub()
-  const wrapped = wrapSubscriptionHandler<number>(
-    async () => new Promise<void>(() => {}),
-    sub,
-    { maxInflight: 1, highWatermark: 1, lowWatermark: 0, onOverflow: "nack" }
-  )
+  const wrapped = wrapSubscriptionHandler<number>(async () => new Promise<void>(() => {}), sub, {
+    maxInflight: 1,
+    highWatermark: 1,
+    lowWatermark: 0,
+    onOverflow: "nack"
+  })
   let nacks = 0
   const ctx: SubscriptionContext = {
     meta: {},
     async ack() {},
-    async nack() { nacks++ }
+    async nack() {
+      nacks++
+    }
   }
   void wrapped(1, ctx)
   await new Promise((r) => setTimeout(r, 5))

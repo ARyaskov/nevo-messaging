@@ -8,13 +8,17 @@ function fakeRedis(): IdempotencyRedisLike & { storage: Map<string, string> } {
   const storage = new Map<string, string>()
   return {
     storage,
-    async get(key) { return storage.get(key) ?? null },
+    async get(key) {
+      return storage.get(key) ?? null
+    },
     async set(key, value, opts) {
       if (opts.ifNotExists && storage.has(key)) return null
       storage.set(key, value)
       return "OK"
     },
-    async del(key) { return storage.delete(key) ? 1 : 0 }
+    async del(key) {
+      return storage.delete(key) ? 1 : 0
+    }
   } as IdempotencyRedisLike & { storage: Map<string, string> }
 }
 
@@ -40,7 +44,10 @@ class TestController extends BaseMessageController {
 test("BaseMessageController dedups across two replicas via the shared two-tier runtime (awaited write)", async () => {
   let calls = 0
   class Svc {
-    async run(p: any) { calls++; return { handledBy: p.replica, n: calls } }
+    async run(p: any) {
+      calls++
+      return { handledBy: p.replica, n: calls }
+    }
   }
   const shared = fakeRedis()
   const a = new TestController(new Svc(), new RedisIdempotencyStore<MessageResponse>({ client: shared, enabled: true, ttlMs: 60_000 }))
@@ -60,9 +67,15 @@ test("BaseMessageController dedups across two replicas via the shared two-tier r
 test("BaseMessageController concurrent same-key requests execute the handler exactly once", async () => {
   let calls = 0
   let release!: () => void
-  const gate = new Promise<void>((r) => { release = r })
+  const gate = new Promise<void>((r) => {
+    release = r
+  })
   class Svc {
-    async run() { calls++; await gate; return { n: calls } }
+    async run() {
+      calls++
+      await gate
+      return { n: calls }
+    }
   }
   const ctrl = new TestController(new Svc(), new RedisIdempotencyStore<MessageResponse>({ client: fakeRedis(), enabled: true, ttlMs: 60_000 }))
   const msg = (uuid: string) => ({ method: "echo.run", uuid, params: {}, meta: { idempotencyKey: "k" } })

@@ -2,6 +2,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { gzipSync, deflateSync } from "node:zlib"
 import { maybeCompress, maybeDecompress, maybeDecompressAsync, resolveCompressionOptions } from "../src/common/compression"
+import { configureCompressionWorker, shutdownCompressionWorker, workerCompress, workerDecompress } from "../src/common/compression-worker"
 import { PayloadTooLargeError } from "../src/common/errors"
 import { ErrorCode } from "../src/common/error-code"
 
@@ -65,4 +66,18 @@ test("async round trip works under the output cap", async () => {
   const { data, encoding } = maybeCompress(original, opts)
   const decoded = await maybeDecompressAsync(data, encoding, 1024 * 1024)
   assert.equal(Buffer.from(decoded).toString(), original.toString())
+})
+
+test("worker round trip transfers the posted copy without detaching input", async () => {
+  configureCompressionWorker({ enabled: true, poolSize: 1, threshold: 1 })
+  const original = Buffer.from("worker payload ".repeat(10_000))
+  const originalLength = original.byteLength
+  try {
+    const compressed = await workerCompress(original, "gzip")
+    assert.equal(original.byteLength, originalLength)
+    const decoded = await workerDecompress(compressed, "gzip", 1024 * 1024)
+    assert.equal(Buffer.from(decoded).toString(), original.toString())
+  } finally {
+    await shutdownCompressionWorker()
+  }
 })

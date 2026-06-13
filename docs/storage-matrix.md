@@ -6,23 +6,24 @@ This page is the cheat sheet.
 
 ## At a glance
 
-| Primitive | In-memory | SQLite | Redis | Postgres | Right choice for prod |
-|---|---|---|---|---|---|
-| **Idempotency** | ✅ | — | ✅ `RedisIdempotencyStore` | — | Redis (with in-proc L1) |
-| **Inbox** | ✅ | — | ✅ `RedisInboxStore` | ✅ `PgInboxStore` | Postgres if you already have it; Redis otherwise |
-| **Outbox** | ✅ | ✅ `SqliteOutboxStore` | — | ✅ `PgOutboxStore` | Postgres (`FOR UPDATE SKIP LOCKED`) |
-| **Saga** | ✅ | — | — | ✅ `PgSagaStore` | Postgres |
-| **EventStore** | ✅ | — | — | ✅ `PgEventStore` | Postgres |
-| **DLQ** | ✅ | — | — | ✅ `PgDlqStore` | Postgres (queryable JSONB) |
-| **Rate-limit** | ✅ | — | ✅ `RedisRateLimiter` | — | Redis if you scale horizontally |
-| **Audit log** | ✅ | — | — | ✅ `PgAuditSink` + `FileAuditSink` | Postgres + file tee for compliance |
+| Primitive | In-memory | SQLite | Redis | etcd | Postgres | Right choice for prod |
+|---|---|---|---|---|---|---|
+| **Idempotency** | ✅ | — | ✅ `RedisIdempotencyStore` | ✅ `EtcdIdempotencyStore` | — | Redis for the data hot path; etcd when it is already your HA coordination plane |
+| **Inbox** | ✅ | — | ✅ `RedisInboxStore` | — | ✅ `PgInboxStore` | Postgres if you already have it; Redis otherwise |
+| **Outbox** | ✅ | ✅ `SqliteOutboxStore` | — | — | ✅ `PgOutboxStore` | Postgres (`FOR UPDATE SKIP LOCKED`) |
+| **Saga** | ✅ | — | — | — | ✅ `PgSagaStore` | Postgres |
+| **EventStore** | ✅ | — | — | — | ✅ `PgEventStore` | Postgres |
+| **DLQ** | ✅ | — | — | — | ✅ `PgDlqStore` | Postgres (queryable JSONB) |
+| **Rate-limit** | ✅ | — | ✅ `RedisRateLimiter` | — | — | Redis if you scale horizontally |
+| **Audit log** | ✅ | — | — | — | ✅ `PgAuditSink` + `FileAuditSink` | Postgres + file tee for compliance |
 
 ## Decision rules
 
 ### Idempotency
 
 - **Single replica** → `LruIdempotencyCache` (default). Process-local, sub-µs.
-- **Multi-replica** → `RedisIdempotencyStore`. The store keeps an in-proc L1 LRU automatically, so repeated hits on the same replica never round-trip to Redis.
+- **Multi-replica, latency-first** → `RedisIdempotencyStore`.
+- **Multi-replica with an existing etcd 3.6 control plane** → `EtcdIdempotencyStore`. Atomic create-revision transactions elect one executor, and server-side leases expire claims without relying on pod clocks.
 - **Why no Postgres** → idempotency hits are on the hot path. Redis hash ops are an order of magnitude faster than even a hot Postgres TCP connection.
 
 ### Inbox
@@ -98,6 +99,10 @@ Each takes a minimal client shape (a handful of lines over `ioredis` / `node-red
 
 The two claim-based stores share an `IdempotencyClaim` contract: the unique `claim` winner runs the handler then overwrites its in-progress sentinel with the real result; everyone else gets the finished result or waits for it. A NUL-wrapped sentinel guarantees it can never collide with an encoded payload.
 
+### etcd stores
+
+`EtcdIdempotencyStore` implements the same claim-before-execute contract through the etcd v3 KV transaction and lease APIs. It is compatible with etcd 3.6.12, uses a `CreateRevision == 0` transaction for the claim, and attaches both claims and results to non-renewing server leases. Install the optional `etcd3` peer dependency and pass an `Etcd3` client or another client matching `IdempotencyEtcdClient`.
+
 ### SQLite & in-memory
 
 - `SqliteOutboxStore` (`sqlite-outbox.ts`) — durable single-process outbox using the built-in `node:sqlite` module (Node 23+ with `--experimental-sqlite`, or Node 24+ where it is stable). Good for single-pod CLIs and tests; not for multi-replica.
@@ -105,7 +110,7 @@ The two claim-based stores share an `IdempotencyClaim` contract: the unique `cla
 
 ### BigInt in stores
 
-Postgres `JSONB` and Redis strings are **text** formats with no native BigInt. The framework's wire codec encodes `bigint` values with a sentinel string (`@@nevo:bigint:<digits>`; the legacy `"<digits>n"` form is still decoded) so they survive a JSON round-trip — see [bigint.md](./bigint.md).
+Postgres `JSONB`, Redis strings, and etcd values are **text** formats with no native BigInt. The framework's wire codec encodes `bigint` values with a sentinel string (`@@nevo:bigint:<digits>`). The legacy `"<digits>n"` form is decoded only when `acceptLegacy: true` is requested explicitly — see [bigint.md](./bigint.md).
 
 What this means for the stores:
 

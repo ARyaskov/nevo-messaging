@@ -38,9 +38,15 @@ export interface OutboxStore {
 export class InMemoryOutboxTx {
   readonly staged: OutboxRecord[] = []
   constructor(private readonly onCommit: (records: OutboxRecord[]) => void) {}
-  stage(record: OutboxRecord): void { this.staged.push(record) }
-  commit(): void { this.onCommit(this.staged.splice(0)) }
-  rollback(): void { this.staged.length = 0 }
+  stage(record: OutboxRecord): void {
+    this.staged.push(record)
+  }
+  commit(): void {
+    this.onCommit(this.staged.splice(0))
+  }
+  rollback(): void {
+    this.staged.length = 0
+  }
 }
 
 export class InMemoryOutboxStore implements OutboxStore {
@@ -54,7 +60,10 @@ export class InMemoryOutboxStore implements OutboxStore {
   }
 
   async save(record: OutboxRecord, tx?: unknown): Promise<void> {
-    if (tx instanceof InMemoryOutboxTx) { tx.stage(record); return }
+    if (tx instanceof InMemoryOutboxTx) {
+      tx.stage(record)
+      return
+    }
     this.records.set(record.id, record)
   }
 
@@ -76,7 +85,22 @@ export class InMemoryOutboxStore implements OutboxStore {
   }
 
   async listPending(limit: number): Promise<OutboxRecord[]> {
-    return this.records.values().filter((r) => r.status === "pending").take(limit).toArray()
+    const all = [...this.records.values()].sort((a, b) => a.createdAt - b.createdAt)
+    const blockedPartitions = new Set<string>()
+    const out: OutboxRecord[] = []
+    for (const r of all) {
+      if (r.partitionKey !== undefined && r.partitionKey !== null) {
+        if (blockedPartitions.has(r.partitionKey)) continue
+        if (r.status === "failed") {
+          blockedPartitions.add(r.partitionKey)
+          continue
+        }
+      }
+      if (r.status !== "pending") continue
+      out.push(r)
+      if (out.length >= limit) break
+    }
+    return out
   }
 }
 
@@ -111,23 +135,21 @@ export class Outbox {
   ) {}
 
   /** Append an event to the outbox. Pass `opts.tx` to enlist the write in your business transaction; see {@link withOutboxTransaction}. */
-  async enqueue(
-    serviceName: string,
-    method: string,
-    params: unknown,
-    opts: { tx?: unknown; partitionKey?: string } = {}
-  ): Promise<string> {
+  async enqueue(serviceName: string, method: string, params: unknown, opts: { tx?: unknown; partitionKey?: string } = {}): Promise<string> {
     const id = uuidv7()
-    await this.store.save({
-      id,
-      serviceName,
-      method,
-      params,
-      partitionKey: opts.partitionKey,
-      createdAt: Date.now(),
-      attempts: 0,
-      status: "pending"
-    }, opts.tx)
+    await this.store.save(
+      {
+        id,
+        serviceName,
+        method,
+        params,
+        partitionKey: opts.partitionKey,
+        createdAt: Date.now(),
+        attempts: 0,
+        status: "pending"
+      },
+      opts.tx
+    )
     return id
   }
 
@@ -257,22 +279,47 @@ function partitionRecords(records: OutboxRecord[]): { ordered: OutboxRecord[][];
       independent.push(r)
     } else {
       let arr = byKey.get(r.partitionKey)
-      if (!arr) { arr = []; byKey.set(r.partitionKey, arr) }
+      if (!arr) {
+        arr = []
+        byKey.set(r.partitionKey, arr)
+      }
       arr.push(r)
     }
   }
   return { ordered: [...byKey.values()], independent }
 }
 
-/** Run `fn` inside a single transaction so the outbox row and business state commit or roll back together. `client` may expose `query(sql)`, `exec(sql)`, or `beginTx()`. */
-export async function withOutboxTransaction<T>(
-  client: unknown,
-  fn: (tx: unknown) => Promise<T> | T
-): Promise<T> {
+/** Run `fn` inside a single transaction so the outbox row and business state commit or roll back together. `client` may be a pg `Pool` (detected by `connect()`; a dedicated connection is checked out for the transaction), or expose `query(sql)`, `exec(sql)`, or `beginTx()`. */
+export async function withOutboxTransaction<T>(client: unknown, fn: (tx: unknown) => Promise<T> | T): Promise<T> {
   const c = client as {
     query?: (sql: string) => Promise<unknown>
     exec?: (sql: string) => unknown
     beginTx?: () => { commit(): void | Promise<void>; rollback(): void | Promise<void> }
+    connect?: () => Promise<unknown>
+    release?: unknown
+  }
+
+  if (typeof c.connect === "function" && typeof c.release !== "function" && typeof c.query === "function") {
+    const acquired = (await c.connect()) as { query?: (sql: string) => Promise<unknown>; release?: (err?: unknown) => void } | null | undefined
+    const conn =
+      acquired && typeof acquired.query === "function"
+        ? (acquired as { query: (sql: string) => Promise<unknown> })
+        : (c as { query: (sql: string) => Promise<unknown> })
+    try {
+      await conn.query("BEGIN")
+      try {
+        const result = await fn(conn)
+        await conn.query("COMMIT")
+        return result
+      } catch (err) {
+        try {
+          await conn.query("ROLLBACK")
+        } catch {}
+        throw err
+      }
+    } finally {
+      if (acquired && typeof acquired.release === "function") acquired.release()
+    }
   }
 
   if (typeof c.query === "function") {
@@ -282,7 +329,9 @@ export async function withOutboxTransaction<T>(
       await c.query("COMMIT")
       return result
     } catch (err) {
-      try { await c.query("ROLLBACK") } catch {}
+      try {
+        await c.query("ROLLBACK")
+      } catch {}
       throw err
     }
   }
@@ -294,7 +343,9 @@ export async function withOutboxTransaction<T>(
       c.exec("COMMIT")
       return result
     } catch (err) {
-      try { c.exec("ROLLBACK") } catch {}
+      try {
+        c.exec("ROLLBACK")
+      } catch {}
       throw err
     }
   }

@@ -11,7 +11,7 @@ function fnv1aHash64(str: string): string {
   }
   return h.toString(36)
 }
-import { Type, Inject } from "@nestjs/common"
+import { Type, Inject, Optional } from "@nestjs/common"
 import type { NatsConnection, Subscription } from "@nats-io/nats-core"
 import { createSignalRouterDecorator, SignalRouterOptions } from "../../signal-router.utils"
 import {
@@ -19,6 +19,7 @@ import {
   getCodec,
   getDefaultCodec,
   maybeCompress,
+  maybeCompressAsync,
   maybeDecompress,
   maybeDecompressAsync,
   shouldDecompressAsync,
@@ -69,7 +70,7 @@ export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?:
     : null
 
   function hashResult(value: unknown): string {
-    const json = typeof value === "string" ? value : JSON.stringify(value, (_k, v) => typeof v === "bigint" ? v.toString() + "n" : v)
+    const json = typeof value === "string" ? value : JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? v.toString() + "n" : v))
     return fnv1aHash64(json)
   }
 
@@ -94,23 +95,21 @@ export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?:
       const clientToken: any = options?.clientToken || DEFAULT_NATS_CLIENT_TOKEN
 
       if (reuseClient) {
-        const existing = (Reflect.getMetadata("self:paramtypes", target) as any[]) || []
-        const idx = (Reflect.getMetadata("design:paramtypes", target) as any[])?.length || 0
-        existing.push({ index: idx, param: clientToken })
-        Reflect.defineMetadata("self:paramtypes", existing, target)
+        Optional()(target.prototype, "__nevoNatsUniversalClient")
+        Inject(clientToken)(target.prototype, "__nevoNatsUniversalClient")
+      }
 
-        const originalCtor = target as any
-        const wrapped: any = function (...args: any[]) {
-          const inst = new originalCtor(...args.slice(0, args.length - 1))
-          inst.__nevoNatsUniversalClient = args[args.length - 1]
-          return inst
-        }
-        wrapped.prototype = originalCtor.prototype
-        Reflect.defineMetadata("design:paramtypes", [
-          ...((Reflect.getMetadata("design:paramtypes", originalCtor) as any[]) || []),
-          NevoNatsClient
-        ], originalCtor)
-        Inject(clientToken)(originalCtor, undefined as any, idx)
+      target.prototype.__buildReplyHeaders = function (encoding: string) {
+        if (!encoding || encoding === "identity") return undefined
+        try {
+          const { headers: createHeaders } = getNatsModule() as any
+          if (typeof createHeaders === "function") {
+            const h = createHeaders()
+            h.set("content-encoding", encoding)
+            return h
+          }
+        } catch {}
+        return undefined
       }
 
       const originalOnModuleInit = target.prototype.onModuleInit || function () {}
@@ -170,14 +169,14 @@ export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?:
                     outEncoding = cached.encoding
                   } else {
                     const outBuf = codec.encode(result)
-                    const out = maybeCompress(outBuf, compression)
+                    const out = compression.async ? await maybeCompressAsync(outBuf, compression) : maybeCompress(outBuf, compression)
                     outData = out.data
                     outEncoding = out.encoding
                     responseCache.set(cacheKey, { data: outData, encoding: outEncoding })
                   }
                 } else {
                   const outBuf = codec.encode(result)
-                  const out = maybeCompress(outBuf, compression)
+                  const out = compression.async ? await maybeCompressAsync(outBuf, compression) : maybeCompress(outBuf, compression)
                   outData = out.data
                   outEncoding = out.encoding
                 }
@@ -214,10 +213,14 @@ export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?:
       target.prototype.onModuleDestroy = async function () {
         await originalOnModuleDestroy.call(this)
         if (this.natsSubscription) {
-          try { this.natsSubscription.unsubscribe() } catch {}
+          try {
+            this.natsSubscription.unsubscribe()
+          } catch {}
         }
         if (this.natsConnection && this.__natsRouterOwnsConnection) {
-          try { await this.natsConnection.close() } catch {}
+          try {
+            await this.natsConnection.close()
+          } catch {}
         }
       }
     }

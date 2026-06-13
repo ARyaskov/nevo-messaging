@@ -24,7 +24,7 @@ import { ReplayGuard } from "./common/replay-protection"
 import { getSchemaFor, toValidator } from "./common/schema"
 import { parseMethod, isVersionCompatible, DEFAULT_METHOD_VERSION } from "./common/version"
 import { getDefaultMetrics, NEVO_METRIC_NAMES, methodLabel } from "./common/metrics"
-import { getDefaultTracer } from "./common/tracing"
+import { getDefaultTracer, runWithSpan, SpanLike } from "./common/tracing"
 import { matchesFilter } from "./common/subscription-filters"
 import { DlqRouter } from "./common/dlq"
 import { MessagingError } from "./common/errors"
@@ -62,6 +62,7 @@ export interface SignalRouterOptions {
   capabilities?: string[]
   instanceId?: string
   devtools?: DevToolsBus | boolean
+  disableBuiltinHandlers?: boolean
 }
 
 export interface MessageData {
@@ -170,7 +171,9 @@ export function createSignalRouterDecorator(
     const dlq = options.dlq instanceof DlqRouter ? options.dlq : new DlqRouter({ enabled: (options.dlq as any)?.enabled === true })
     const defaultVersion = options.defaultVersion || DEFAULT_METHOD_VERSION
     const rateLimiter = options.rateLimit !== undefined ? resolveRateLimiter(options.rateLimit) : new RateLimiter()
-    const devtoolsBus: DevToolsBus | null = options.devtools === false ? null : (options.devtools instanceof Object ? (options.devtools as DevToolsBus) : getDevToolsBus())
+    const ownsRateLimiter = !(options.rateLimit instanceof RateLimiter)
+    const devtoolsBus: DevToolsBus | null =
+      options.devtools === false ? null : options.devtools instanceof Object ? (options.devtools as DevToolsBus) : getDevToolsBus()
     const methodLimiters = new Map<string, RateLimiter>()
     const methodCaches = new Map<string, LruCache<unknown>>()
 
@@ -180,7 +183,10 @@ export function createSignalRouterDecorator(
     const signalNames: string[] = []
     for (const s of allSignals) {
       let arr = signalsByName.get(s.signalName)
-      if (!arr) { arr = []; signalsByName.set(s.signalName, arr) }
+      if (!arr) {
+        arr = []
+        signalsByName.set(s.signalName, arr)
+      }
       arr.push(s)
       if (!s.signalName.startsWith("nevo.")) {
         contractDescriptors.push({ signalName: s.signalName, version: s.version || DEFAULT_METHOD_VERSION })
@@ -222,368 +228,410 @@ export function createSignalRouterDecorator(
       const chainId = resolveInboundChainId(peekedMeta?.nevoChainId)
 
       return runInChain({ chainId, parentUuid: peekedUuid }, async () => {
-      const startMs = Date.now()
-      const nowMs = Date.now()
-      let response: MessageResponse | undefined
-      let finalResponse: MessageResponse | undefined
-      let messageData: MessageData | undefined
-      let auditCaller: string | null = null
-      let idemKey: string | undefined
-      let idemBegan = false
-      let idemCommitted = false
-
-      try {
-        if (debugEnabled) {
-          logger.debug({ event: "signal.received", topic: eventPattern })
-        }
-
-        messageData = messageExtractor(data)
-        const { method, params, uuid, meta } = messageData
-
-        if (!method) {
-          logger.error({ event: "signal.invalid", topic: eventPattern }, "Missing 'method' field in message")
-          return createErrorResponse("Invalid message format", undefined, undefined, ErrorCode.BAD_REQUEST)
-        }
-
-        const parsed = parseMethod(method)
-        const requestedVersion = parsed.version
-
-        if (parsed.name === NEVO_CONTRACT_METHOD) {
-          const contract = {
-            protocol: "1",
-            serviceName: serviceNameFromMeta,
-            serviceVersion: options.serviceVersion,
-            instanceId: options.instanceId,
-            capabilities: options.capabilities,
-            generatedAt: nowMs,
-            methods: contractDescriptors
-          }
-          return { uuid, method, params: { result: contract as any }, meta }
-        }
-        if (options.health) {
-          if (parsed.name === NEVO_HEALTH_METHOD) {
-            const report = await options.health.report()
-            return { uuid, method, params: { result: report as any }, meta }
-          }
-          if (parsed.name === NEVO_LIVENESS_METHOD) {
-            const report = await options.health.liveness()
-            return { uuid, method, params: { result: report as any }, meta }
-          }
-          if (parsed.name === NEVO_READINESS_METHOD) {
-            const report = await options.health.readiness()
-            return { uuid, method, params: { result: report as any }, meta }
-          }
-        }
+        const startMs = Date.now()
+        const nowMs = Date.now()
+        let response: MessageResponse | undefined
+        let finalResponse: MessageResponse | undefined
+        let messageData: MessageData | undefined
+        let auditCaller: string | null = null
+        let idemKey: string | undefined
+        let idemBegan = false
+        let idemCommitted = false
 
         try {
-          replayGuard.check(uuid, meta?.ts)
-        } catch (err: any) {
-          await dlq.route({
-            topic: eventPattern,
-            reason: "replay",
-            error: err instanceof MessagingError ? { code: err.code, message: err.message } : { message: String(err) },
-            meta,
-            rawPayload: data,
-            ts: nowMs
-          })
-          return createErrorResponse(err.message, uuid, method, ErrorCode.REPLAY_DETECTED, meta)
-        }
+          if (debugEnabled) {
+            logger.debug({ event: "signal.received", topic: eventPattern })
+          }
 
-        // Idempotency (claim-before-execute): dedup on idempotencyKey, else uuid.
-        idemKey = meta?.idempotencyKey || uuid
-        if (idemKey && idem.isEnabled()) {
-          const began = await idem.begin(idemKey)
-          if (began.status === "hit") return began.value
-          idemBegan = true
-        }
+          messageData = messageExtractor(data)
+          const { method, params, uuid, meta } = messageData
 
-        if (debugEnabled) {
-          logger.debug({ event: "signal.invoke", topic: eventPattern, method })
-        }
+          if (!method) {
+            logger.error({ event: "signal.invalid", topic: eventPattern }, "Missing 'method' field in message")
+            return createErrorResponse("Invalid message format", undefined, undefined, ErrorCode.BAD_REQUEST)
+          }
 
-        const serviceInstances = findServiceInstances(this, serviceType)
-        if (serviceInstances.length === 0) {
-          logger.error({ event: "signal.no_service", topic: eventPattern, serviceType: String(serviceType) }, "No service instances found")
-          return createErrorResponse("Service not found", uuid, method, ErrorCode.SERVICE_NOT_FOUND, meta)
-        }
+          const parsed = parseMethod(method)
+          const requestedVersion = parsed.version
 
-        const callerService = await extractCallerService(meta, options.accessControl?.jwtVerifier)
-        auditCaller = callerService ?? null
-        const topic = eventPattern
-
-        if (rateLimiter.isEnabled()) {
           try {
-            rateLimiter.check({ topic, method: parsed.name, callerService, tenantId: meta?.tenantId, meta })
+            replayGuard.check(uuid, meta?.ts)
           } catch (err: any) {
+            await dlq.route({
+              topic: eventPattern,
+              reason: "replay",
+              error: err instanceof MessagingError ? { code: err.code, message: err.message } : { message: String(err) },
+              meta,
+              rawPayload: data,
+              ts: nowMs
+            })
+            return createErrorResponse(err.message, uuid, method, ErrorCode.REPLAY_DETECTED, meta)
+          }
+
+          if (debugEnabled) {
+            logger.debug({ event: "signal.invoke", topic: eventPattern, method })
+          }
+
+          const callerService = await extractCallerService(meta, options.accessControl?.jwtVerifier)
+          auditCaller = callerService ?? null
+          const topic = eventPattern
+
+          if (rateLimiter.isEnabled()) {
+            try {
+              rateLimiter.check({ topic, method: parsed.name, callerService, tenantId: meta?.tenantId, meta })
+            } catch (err: any) {
+              if (err instanceof MessagingError && err.code === ErrorCode.RATE_LIMITED) {
+                return { uuid, method, params: { result: "error", error: err.toJSON() }, meta }
+              }
+              throw err
+            }
+          }
+
+          // Tenant kill-switch — checked after rate-limit, before dispatch.
+          assertTenantAllowed(serviceNameFromMeta, meta?.tenantId)
+
+          if (!isAccessAllowed(options.accessControl, topic, parsed.name, callerService)) {
+            logAccessDenied(options.accessControl, { topic, method, serviceName: serviceNameFromMeta, callerService })
+            response = {
+              uuid,
+              method,
+              params: {
+                result: "error",
+                error: createAccessDeniedError(method, serviceNameFromMeta, callerService)
+              },
+              meta
+            }
+            return response
+          }
+
+          if (!options.disableBuiltinHandlers) {
+            if (parsed.name === NEVO_CONTRACT_METHOD) {
+              const contract = {
+                protocol: "1",
+                serviceName: serviceNameFromMeta,
+                serviceVersion: options.serviceVersion,
+                instanceId: options.instanceId,
+                capabilities: options.capabilities,
+                generatedAt: nowMs,
+                methods: contractDescriptors
+              }
+              response = { uuid, method, params: { result: contract as any }, meta }
+              return response
+            }
+            if (options.health) {
+              if (parsed.name === NEVO_HEALTH_METHOD) {
+                const report = await options.health.report()
+                response = { uuid, method, params: { result: report as any }, meta }
+                return response
+              }
+              if (parsed.name === NEVO_LIVENESS_METHOD) {
+                const report = await options.health.liveness()
+                response = { uuid, method, params: { result: report as any }, meta }
+                return response
+              }
+              if (parsed.name === NEVO_READINESS_METHOD) {
+                const report = await options.health.readiness()
+                response = { uuid, method, params: { result: report as any }, meta }
+                return response
+              }
+            }
+          }
+
+          const serviceInstances = findServiceInstances(this, serviceType)
+          if (serviceInstances.length === 0) {
+            logger.error({ event: "signal.no_service", topic: eventPattern, serviceType: String(serviceType) }, "No service instances found")
+            return createErrorResponse("Service not found", uuid, method, ErrorCode.SERVICE_NOT_FOUND, meta)
+          }
+
+          // Idempotency (claim-before-execute): dedup on idempotencyKey, else uuid,
+          // scoped by caller identity so one caller's key never serves another's cache.
+          const baseIdemKey = meta?.idempotencyKey || uuid
+          idemKey = baseIdemKey ? `${callerService ?? "anon"}::${meta?.tenantId ?? ""}::${baseIdemKey}` : undefined
+          if (idemKey && idem.isEnabled()) {
+            const began = await idem.begin(idemKey)
+            if (began.status === "hit") return { ...began.value, uuid, meta }
+            idemBegan = true
+          }
+
+          let processedParams = params
+          if (options.before) {
+            const baseContext = {
+              method,
+              serviceName: serviceNameFromMeta,
+              uuid,
+              rawData: data,
+              params,
+              meta
+            }
+            const hookResult = await options.before(baseContext)
+            if (hookResult !== undefined) processedParams = hookResult
+          }
+
+          const candidates = signalsByName.get(parsed.name)
+          let signalHandler: SignalMetadata | undefined
+
+          if (!candidates || candidates.length === 0) {
+            const suggestion = suggestClosestMethod(parsed.name, signalNames)
+            const message = suggestion ? `Invalid method name '${parsed.name}', did you mean '${suggestion}'?` : `Method ${parsed.name} not found`
+            return createErrorResponse(message, uuid, method, ErrorCode.METHOD_NOT_FOUND, meta)
+          } else {
+            if (requestedVersion) {
+              signalHandler = candidates.find((c) => (c.version || defaultVersion) === requestedVersion)
+            } else {
+              signalHandler = candidates.find((c) => (c.version || defaultVersion) === defaultVersion) || candidates[0]
+            }
+            if (!signalHandler) {
+              return createErrorResponse(
+                `No handler matching version ${requestedVersion} for ${parsed.name}`,
+                uuid,
+                method,
+                ErrorCode.UNSUPPORTED_VERSION,
+                meta
+              )
+            }
+            if (!isVersionCompatible(requestedVersion, signalHandler.version || defaultVersion)) {
+              return createErrorResponse(
+                `Method ${parsed.name} version mismatch (requested ${requestedVersion}, available ${signalHandler.version || defaultVersion})`,
+                uuid,
+                method,
+                ErrorCode.UNSUPPORTED_VERSION,
+                meta
+              )
+            }
+          }
+
+          const serviceMethod = signalHandler.methodName
+          let serviceInstance: any = null
+          for (const s of serviceInstances) {
+            if (s && typeof s[serviceMethod] === "function") {
+              serviceInstance = s
+              break
+            }
+          }
+          if (!serviceInstance) {
+            logger.error({ event: "signal.method_not_found", serviceMethod }, "Method not found on any service instance")
+            return createErrorResponse(`Method ${serviceMethod} does not exist`, uuid, method, ErrorCode.METHOD_NOT_FOUND, meta)
+          }
+
+          const methodRateLimit = getMethodRateLimit(serviceInstance, serviceMethod)
+          if (methodRateLimit) {
+            let mLimiter = methodLimiters.get(serviceMethod)
+            if (!mLimiter) {
+              mLimiter = new RateLimiter(rateLimitToOptions(methodRateLimit))
+              methodLimiters.set(serviceMethod, mLimiter)
+            }
+            try {
+              mLimiter.check({ topic: eventPattern, method: parsed.name, callerService, tenantId: meta?.tenantId, meta })
+            } catch (err: any) {
+              if (err instanceof MessagingError && err.code === ErrorCode.RATE_LIMITED) {
+                return { uuid, method, params: { result: "error", error: err.toJSON() }, meta }
+              }
+              throw err
+            }
+          }
+
+          const cacheable = getMethodCacheable(serviceInstance, serviceMethod)
+          let cacheKey: string | null = null
+          let methodCache: LruCache<unknown> | undefined
+          if (cacheable) {
+            methodCache = methodCaches.get(serviceMethod)
+            if (!methodCache) {
+              methodCache = new LruCache<unknown>({ enabled: true, ttlMs: cacheable.ttlMs ?? 60_000, maxEntries: cacheable.maxEntries ?? 1024 })
+              methodCaches.set(serviceMethod, methodCache)
+            }
+            cacheKey = cacheable.keyBy ? cacheable.keyBy(processedParams) : buildDefaultCacheKey(parsed.name, processedParams)
+            if (methodCache.has(cacheKey)) {
+              const cached = methodCache.get(cacheKey)
+              return { uuid, method, params: { result: cached as any }, meta }
+            }
+          }
+
+          const schema = signalHandler.options?.schema ?? getSchemaFor(serviceInstance, serviceMethod)
+          if (schema) {
+            const validator = toValidator(schema)
+            if (validator) {
+              try {
+                processedParams = validator.parse(processedParams)
+              } catch (err: any) {
+                const errPayload =
+                  err instanceof MessagingError ? err.toJSON() : { code: ErrorCode.VALIDATION_FAILED, message: err?.message || "validation failed" }
+                return { uuid, method, params: { result: "error", error: errPayload }, meta }
+              }
+            }
+          }
+
+          const args = signalHandler.paramTransformer ? signalHandler.paramTransformer(processedParams) : [processedParams]
+
+          if (debugEnabled) {
+            logger.debug({ event: "signal.call", topic: eventPattern, serviceMethod })
+          }
+
+          // Resilience decorators (@Hedge/@CircuitBreaker/@Adaptive/@Backpressure), if any.
+          const resilience = readMethodResilience(serviceInstance, serviceMethod)
+
+          const invokeWithSpan = async (span: SpanLike | null): Promise<unknown> => {
+            try {
+              const invoke = () => serviceInstance[serviceMethod](...args)
+              const value = resilience
+                ? await applyResilience({ config: resilience, ctx: { key: `${serviceNameFromMeta}:${parsed.name}` }, invoke })
+                : await invoke()
+              span?.setStatus({ code: 1 })
+              return value
+            } catch (err) {
+              span?.recordException(err)
+              span?.setStatus({ code: 2, message: (err as Error)?.message })
+              throw err
+            }
+          }
+
+          let result: unknown
+          try {
+            result = tracer
+              ? await runWithSpan(
+                  tracer,
+                  `nevo.serve ${eventPattern}.${method}`,
+                  {
+                    "nevo.method": method,
+                    "nevo.service": serviceNameFromMeta,
+                    "nevo.uuid": uuid ?? "",
+                    "nevo.caller": callerService ?? ""
+                  },
+                  meta,
+                  invokeWithSpan
+                )
+              : await invokeWithSpan(null)
+          } catch (err) {
+            // @Backpressure admission failure (RATE_LIMITED) is load-shedding, not a crash.
             if (err instanceof MessagingError && err.code === ErrorCode.RATE_LIMITED) {
-              return { uuid, method, params: { result: "error", error: err.toJSON() }, meta }
+              response = { uuid, method, params: { result: "error", error: err.toJSON() }, meta }
+              return response
             }
             throw err
           }
-        }
 
-        // Tenant kill-switch — checked after rate-limit, before dispatch.
-        assertTenantAllowed(serviceNameFromMeta, meta?.tenantId)
+          const transformedResult = signalHandler.resultTransformer ? signalHandler.resultTransformer(result) : result
+          if (debugEnabled) {
+            logger.debug({ event: "signal.result", topic: eventPattern })
+          }
 
-        if (!isAccessAllowed(options.accessControl, topic, parsed.name, callerService)) {
-          logAccessDenied(options.accessControl, { topic, method, serviceName: serviceNameFromMeta, callerService })
           response = {
             uuid,
             method,
-            params: {
-              result: "error",
-              error: createAccessDeniedError(method, serviceNameFromMeta, callerService)
-            },
+            params: { result: transformedResult },
             meta
           }
-          return response
-        }
 
-        let processedParams = params
-        if (options.before) {
-          const baseContext = {
-            method,
-            serviceName: serviceNameFromMeta,
-            uuid,
-            rawData: data,
-            params,
-            meta
-          }
-          const hookResult = await options.before(baseContext)
-          if (hookResult !== undefined) processedParams = hookResult
-        }
-
-        const candidates = signalsByName.get(parsed.name)
-        let signalHandler: SignalMetadata | undefined
-
-        if (!candidates || candidates.length === 0) {
-          const suggestion = suggestClosestMethod(parsed.name, signalNames)
-          const message = suggestion ? `Invalid method name '${parsed.name}', did you mean '${suggestion}'?` : `Method ${parsed.name} not found`
-          return createErrorResponse(message, uuid, method, ErrorCode.METHOD_NOT_FOUND, meta)
-        } else {
-          if (requestedVersion) {
-            signalHandler = candidates.find((c) => (c.version || defaultVersion) === requestedVersion)
-          } else {
-            signalHandler = candidates.find((c) => (c.version || defaultVersion) === defaultVersion) || candidates[0]
-          }
-          if (!signalHandler) {
-            return createErrorResponse(`No handler matching version ${requestedVersion} for ${parsed.name}`, uuid, method, ErrorCode.UNSUPPORTED_VERSION, meta)
-          }
-          if (!isVersionCompatible(requestedVersion, signalHandler.version || defaultVersion)) {
-            return createErrorResponse(
-              `Method ${parsed.name} version mismatch (requested ${requestedVersion}, available ${signalHandler.version || defaultVersion})`,
-              uuid,
+          if (options.after) {
+            const responseContext = {
               method,
-              ErrorCode.UNSUPPORTED_VERSION,
+              serviceName: serviceNameFromMeta,
+              uuid,
+              rawData: data,
+              params: processedParams,
+              result: transformedResult,
+              response,
               meta
-            )
-          }
-        }
-
-        const serviceMethod = signalHandler.methodName
-        let serviceInstance: any = null
-        for (const s of serviceInstances) {
-          if (s && typeof s[serviceMethod] === "function") {
-            serviceInstance = s
-            break
-          }
-        }
-        if (!serviceInstance) {
-          logger.error({ event: "signal.method_not_found", serviceMethod }, "Method not found on any service instance")
-          return createErrorResponse(`Method ${serviceMethod} does not exist`, uuid, method, ErrorCode.METHOD_NOT_FOUND, meta)
-        }
-
-        const methodRateLimit = getMethodRateLimit(serviceInstance, serviceMethod)
-        if (methodRateLimit) {
-          let mLimiter = methodLimiters.get(serviceMethod)
-          if (!mLimiter) {
-            mLimiter = new RateLimiter(rateLimitToOptions(methodRateLimit))
-            methodLimiters.set(serviceMethod, mLimiter)
-          }
-          try {
-            mLimiter.check({ topic: eventPattern, method: parsed.name, callerService, tenantId: meta?.tenantId, meta })
-          } catch (err: any) {
-            if (err instanceof MessagingError && err.code === ErrorCode.RATE_LIMITED) {
-              return { uuid, method, params: { result: "error", error: err.toJSON() }, meta }
             }
-            throw err
+            const hookResponse = await options.after(responseContext)
+            if (hookResponse !== undefined) response = hookResponse
           }
-        }
 
-        const cacheable = getMethodCacheable(serviceInstance, serviceMethod)
-        let cacheKey: string | null = null
-        let methodCache: LruCache<unknown> | undefined
-        if (cacheable) {
-          methodCache = methodCaches.get(serviceMethod)
-          if (!methodCache) {
-            methodCache = new LruCache<unknown>({ enabled: true, ttlMs: cacheable.ttlMs ?? 60_000, maxEntries: cacheable.maxEntries ?? 1024 })
-            methodCaches.set(serviceMethod, methodCache)
+          // Commit the idempotency result (errors are not cached).
+          if (idemKey && idemBegan && response.params.result !== "error") {
+            await idem.commit(idemKey, response)
+            idemCommitted = true
           }
-          cacheKey = cacheable.keyBy ? cacheable.keyBy(processedParams) : buildDefaultCacheKey(parsed.name, processedParams)
-          if (methodCache.has(cacheKey)) {
-            const cached = methodCache.get(cacheKey)
-            return { uuid, method, params: { result: cached as any }, meta }
+          if (methodCache && cacheKey && response.params.result !== "error") {
+            methodCache.set(cacheKey, response.params.result)
           }
-        }
-
-        const schema = signalHandler.options?.schema ?? getSchemaFor(serviceInstance, serviceMethod)
-        if (schema) {
-          const validator = toValidator(schema)
-          if (validator) {
-            try {
-              processedParams = validator.parse(processedParams)
-            } catch (err: any) {
-              const errPayload = err instanceof MessagingError
-                ? err.toJSON()
-                : { code: ErrorCode.VALIDATION_FAILED, message: err?.message || "validation failed" }
-              return { uuid, method, params: { result: "error", error: errPayload }, meta }
-            }
-          }
-        }
-
-        const args = signalHandler.paramTransformer ? signalHandler.paramTransformer(processedParams) : [processedParams]
-
-        if (debugEnabled) {
-          logger.debug({ event: "signal.call", topic: eventPattern, serviceMethod })
-        }
-
-        const span = tracer?.startSpan(`nevo.serve ${eventPattern}.${method}`, {
-          "nevo.method": method,
-          "nevo.service": serviceNameFromMeta,
-          "nevo.uuid": uuid ?? "",
-          "nevo.caller": callerService ?? ""
-        })
-
-        // Resilience decorators (@Hedge/@CircuitBreaker/@Adaptive/@Backpressure), if any.
-        const resilience = readMethodResilience(serviceInstance, serviceMethod)
-
-        let result: unknown
-        try {
-          const invoke = () => serviceInstance[serviceMethod](...args)
-          result = resilience
-            ? await applyResilience({ config: resilience, ctx: { key: `${serviceNameFromMeta}:${parsed.name}` }, invoke })
-            : await invoke()
-          span?.setStatus({ code: 1 })
-        } catch (err) {
-          span?.recordException(err)
-          span?.setStatus({ code: 2, message: (err as Error)?.message })
-          // @Backpressure admission failure (RATE_LIMITED) is load-shedding, not a crash.
-          if (err instanceof MessagingError && err.code === ErrorCode.RATE_LIMITED) {
-            response = { uuid, method, params: { result: "error", error: err.toJSON() }, meta }
-            return response
-          }
-          throw err
-        } finally {
-          span?.end()
-        }
-
-        const transformedResult = signalHandler.resultTransformer ? signalHandler.resultTransformer(result) : result
-        if (debugEnabled) {
-          logger.debug({ event: "signal.result", topic: eventPattern })
-        }
-
-        response = {
-          uuid,
-          method,
-          params: { result: transformedResult },
-          meta
-        }
-
-        if (options.after) {
-          const responseContext = {
-            method,
-            serviceName: serviceNameFromMeta,
-            uuid,
-            rawData: data,
-            params: processedParams,
-            result: transformedResult,
-            response,
-            meta
-          }
-          const hookResponse = await options.after(responseContext)
-          if (hookResponse !== undefined) response = hookResponse
-        }
-
-        // Commit the idempotency result (errors are not cached).
-        if (idemKey && idemBegan && response.params.result !== "error") {
-          await idem.commit(idemKey, response)
-          idemCommitted = true
-        }
-        if (methodCache && cacheKey && response.params.result !== "error") {
-          methodCache.set(cacheKey, response.params.result)
-        }
-        finalResponse = response
-        return response
-      } catch (error: any) {
-        const errorMessage = error instanceof Error ? error.message : "Unknown error"
-        const code = error instanceof MessagingError ? error.code : error?.code ?? ErrorCode.UNKNOWN
-        logger.error({ event: "signal.error", topic: eventPattern, method: messageData?.method, code, err: errorMessage }, "Processing error")
-        try {
-          await dlq.route({
-            topic: eventPattern,
-            reason: "handler-error",
-            error: error instanceof MessagingError ? error.toJSON() : { message: errorMessage },
-            meta: messageData?.meta,
-            rawPayload: data,
-            ts: nowMs
-          })
-        } catch {}
-        finalResponse = createErrorResponse(errorMessage, messageData?.uuid ?? (data as any)?.uuid, messageData?.method ?? (data as any)?.method, code, messageData?.meta) as MessageResponse
-        return finalResponse
-      } finally {
-        const durationMs = Date.now() - startMs
-        const success = (finalResponse ?? response)?.params?.result !== "error"
-        const labels = {
-          service: serviceNameFromMeta,
-          method: methodLabel(messageData?.method, (name) => knownMethodNames.has(name)),
-          status: success ? "ok" : "error"
-        }
-        metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, labels)
-        if (!success) metrics.incCounter(NEVO_METRIC_NAMES.requestErrors, labels)
-        metrics.observeHistogram(NEVO_METRIC_NAMES.requestDuration, labels, durationMs / 1000)
-        if (devtoolsBus) {
+          finalResponse = response
+          return response
+        } catch (error: any) {
+          const errorMessage = error instanceof Error ? error.message : "Unknown error"
+          const code = error instanceof MessagingError ? error.code : (error?.code ?? ErrorCode.UNKNOWN)
+          logger.error({ event: "signal.error", topic: eventPattern, method: messageData?.method, code, err: errorMessage }, "Processing error")
           try {
-            const errPayload = (response as any)?.params?.error as any
-            devtoolsBus.publish({
-              ts: nowMs,
-              type: success ? "response" : "error",
-              service: serviceNameFromMeta,
-              method: messageData?.method,
-              uuid: messageData?.uuid,
-              chainId: messageData?.meta?.nevoChainId ?? chainId,
-              parentUuid: (messageData?.meta?.nevoParentUuid as string | undefined) ?? undefined,
-              durationMs,
-              status: success ? "ok" : "error",
-              error: errPayload ? { code: errPayload.code, message: errPayload.message } : undefined
+            await dlq.route({
+              topic: eventPattern,
+              reason: "handler-error",
+              error: error instanceof MessagingError ? error.toJSON() : { message: errorMessage },
+              meta: messageData?.meta,
+              rawPayload: data,
+              ts: nowMs
             })
           } catch {}
-        }
-
-        // Release a still-held claim when no result was committed.
-        if (idemKey && idemBegan && !idemCommitted) {
-          try { await idem.release(idemKey) } catch {}
-        }
-
-        // Append-only audit — fire-and-forget.
-        if (auditLog?.isEnabled()) {
-          const auditResponse = finalResponse ?? response
-          if (auditResponse) {
-            Promise.resolve(
-              auditLog.recordFromResponse({
+          finalResponse = createErrorResponse(
+            errorMessage,
+            messageData?.uuid ?? (data as any)?.uuid,
+            messageData?.method ?? (data as any)?.method,
+            code,
+            messageData?.meta
+          ) as MessageResponse
+          return finalResponse
+        } finally {
+          const durationMs = Date.now() - startMs
+          const success = (finalResponse ?? response)?.params?.result !== "error"
+          const labels = {
+            service: serviceNameFromMeta,
+            method: methodLabel(messageData?.method, (name) => knownMethodNames.has(name)),
+            status: success ? "ok" : "error"
+          }
+          metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, labels)
+          if (!success) metrics.incCounter(NEVO_METRIC_NAMES.requestErrors, labels)
+          metrics.observeHistogram(NEVO_METRIC_NAMES.requestDuration, labels, durationMs / 1000)
+          if (devtoolsBus) {
+            try {
+              const errPayload = (response as any)?.params?.error as any
+              devtoolsBus.publish({
+                ts: nowMs,
+                type: success ? "response" : "error",
                 service: serviceNameFromMeta,
-                method: messageData?.method ?? "unknown",
-                uuid: messageData?.uuid ?? "",
-                startedAt: startMs,
-                params: messageData?.params,
-                response: auditResponse,
-                meta: messageData?.meta,
-                caller: auditCaller
+                method: messageData?.method,
+                uuid: messageData?.uuid,
+                chainId: messageData?.meta?.nevoChainId ?? chainId,
+                parentUuid: (messageData?.meta?.nevoParentUuid as string | undefined) ?? undefined,
+                durationMs,
+                status: success ? "ok" : "error",
+                error: errPayload ? { code: errPayload.code, message: errPayload.message } : undefined
               })
-            ).catch(() => {})
+            } catch {}
+          }
+
+          // Release a still-held claim when no result was committed.
+          if (idemKey && idemBegan && !idemCommitted) {
+            try {
+              await idem.release(idemKey)
+            } catch {}
+          }
+
+          // Append-only audit — fire-and-forget.
+          if (auditLog?.isEnabled()) {
+            const auditResponse = finalResponse ?? response
+            if (auditResponse) {
+              Promise.resolve(
+                auditLog.recordFromResponse({
+                  service: serviceNameFromMeta,
+                  method: messageData?.method ?? "unknown",
+                  uuid: messageData?.uuid ?? "",
+                  startedAt: startMs,
+                  params: messageData?.params,
+                  response: auditResponse,
+                  meta: messageData?.meta,
+                  caller: auditCaller
+                })
+              ).catch(() => {})
+            }
           }
         }
-      }
       })
+    }
+
+    const originalOnModuleDestroy = target.prototype.onModuleDestroy
+    target.prototype.onModuleDestroy = async function () {
+      if (originalOnModuleDestroy) await originalOnModuleDestroy.call(this)
+      if (ownsRateLimiter) rateLimiter.stop()
+      for (const limiter of methodLimiters.values()) limiter.stop()
+      methodLimiters.clear()
     }
 
     registerHandler(target, eventPattern, handlerName)

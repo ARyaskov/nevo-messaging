@@ -100,7 +100,7 @@ const contract = await this.query<ServiceContract>("user", "nevo.contract", {})
 console.log(contract.methods)
 ```
 
-This signal is registered for free by the framework (see `src/common/base.controller.ts:211` and `src/signal-router.utils.ts`). You don't need to declare it in your controller.
+This signal is registered by the framework unless the router/controller option `disableBuiltinHandlers: true` is set. You don't need to declare it in your controller. Built-in dispatch still runs caller extraction, rate limiting, tenant policy, and ACL first; include an explicit allow rule for `nevo.contract` when access control is enabled.
 
 ## CLI: `nevo-contract`
 

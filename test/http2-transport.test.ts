@@ -22,7 +22,10 @@ async function startStubH2(onReq: (stream: http2.ServerHttp2Stream) => void): Pr
   const port = (server.address() as AddressInfo).port
   return {
     url: `http://127.0.0.1:${port}`,
-    close: () => new Promise<void>((resolve) => { server.close(() => resolve()) })
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.close(() => resolve())
+      })
   }
 }
 
@@ -42,7 +45,10 @@ test("query throws a mapped MessagingError (not undefined) on error statuses", a
     { status: 500, code: ErrorCode.REMOTE_ERROR }
   ]
   for (const { status, code } of cases) {
-    const stub = await startStubH2((stream) => { stream.respond({ ":status": status }); stream.end() })
+    const stub = await startStubH2((stream) => {
+      stream.respond({ ":status": status })
+      stream.end()
+    })
     const client = new NevoHttp2Client({ svc: stub.url }, { codec: new JsonCodec(), retry: { enabled: false } })
     try {
       await expectCode(client.query("svc", "m", {}), code)
@@ -54,7 +60,9 @@ test("query throws a mapped MessagingError (not undefined) on error statuses", a
 })
 
 test("a raw stream error is wrapped as CONNECTION_LOST", async () => {
-  const stub = await startStubH2((stream) => { stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR) })
+  const stub = await startStubH2((stream) => {
+    stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR)
+  })
   const client = new NevoHttp2Client({ svc: stub.url }, { codec: new JsonCodec(), retry: { enabled: false } })
   try {
     await expectCode(client.query("svc", "m", {}), ErrorCode.CONNECTION_LOST)

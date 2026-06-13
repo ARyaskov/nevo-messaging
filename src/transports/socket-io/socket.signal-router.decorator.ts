@@ -1,17 +1,33 @@
 import { Type } from "@nestjs/common"
 import { createServer, Server as HttpServer } from "node:http"
 import { createSignalRouterDecorator, SignalRouterOptions } from "../../signal-router.utils"
-import { DEFAULT_DISCOVERY_TOPIC, DEFAULT_SUBSCRIPTION_SUFFIX, stringifyWithBigInt, getDefaultLogger, DlqRouter } from "../../common"
+import {
+  DEFAULT_DISCOVERY_TOPIC,
+  DEFAULT_SUBSCRIPTION_SUFFIX,
+  stringifyWithBigInt,
+  getDefaultLogger,
+  DlqRouter,
+  formatMethod,
+  DEFAULT_METHOD_VERSION
+} from "../../common"
 import { getSocketIoModule } from "../optional-deps"
 
 export interface SocketSignalRouterOptions extends SignalRouterOptions {
   port?: number
   path?: string
   cors?: any
+  verifyIdentity?: (socket: any, userId: string, authToken?: string) => boolean | Promise<boolean>
+  allowClientPublish?: boolean
+  allowClientBroadcast?: boolean
   discovery?: {
     enabled?: boolean
     heartbeatIntervalMs?: number
   }
+}
+
+function toVersionedMethod(method: unknown): string | null {
+  if (typeof method !== "string" || method.length === 0) return null
+  return method.includes("@") ? method : formatMethod(method, DEFAULT_METHOD_VERSION)
 }
 
 export function SocketSignalRouter(serviceType: Type<any> | Type<any>[], options?: SocketSignalRouterOptions) {
@@ -43,13 +59,31 @@ export function SocketSignalRouter(serviceType: Type<any> | Type<any>[], options
         const path = options?.path || "/socket.io"
         const httpServer: HttpServer = createServer()
         const { Server: SocketServer } = getSocketIoModule()
-        const io = new SocketServer(httpServer, {
-          path,
-          cors: options?.cors || { origin: "*" }
-        })
+        const serverOptions: any = { path }
+        if (options?.cors !== undefined) serverOptions.cors = options.cors
+        const io = new SocketServer(httpServer, serverOptions)
 
         this.socketServer = io
         this.socketHttpServer = httpServer
+
+        let identifyWarned = false
+        let publishWarned = false
+        let broadcastWarned = false
+        const verifyUserId = async (socket: any, userId: string, authToken?: string): Promise<boolean> => {
+          if (!options?.verifyIdentity) {
+            if (!identifyWarned) {
+              identifyWarned = true
+              logger.warn({ event: "socket.identify.rejected", reason: "no verifyIdentity callback configured" })
+            }
+            return false
+          }
+          try {
+            return (await options.verifyIdentity(socket, userId, authToken)) === true
+          } catch (err) {
+            logger.warn({ event: "socket.identify.verify_error", err: (err as Error)?.message })
+            return false
+          }
+        }
 
         io.on("connection", (socket: any) => {
           socket.on("nevo:query", async (payload: any, ack: any) => {
@@ -58,48 +92,74 @@ export function SocketSignalRouter(serviceType: Type<any> | Type<any>[], options
               if (ack) ack(response)
             } catch (err) {
               logger.error({ event: "socket.query.error", err: (err as Error)?.message })
-              if (ack) ack({ uuid: payload?.uuid, method: payload?.method, params: { result: "error", error: { code: 0, message: (err as Error)?.message } } })
+              if (ack)
+                ack({
+                  uuid: payload?.uuid,
+                  method: payload?.method,
+                  params: { result: "error", error: { code: 0, message: (err as Error)?.message } }
+                })
             }
           })
 
           socket.on("nevo:emit", async (payload: any) => {
-            try { await this[handlerName](payload) } catch (err) {
+            try {
+              await this[handlerName](payload)
+            } catch (err) {
               logger.error({ event: "socket.emit.error", err: (err as Error)?.message })
-              await dlq.route({ topic: eventPattern, reason: "emit-error", error: { message: (err as Error)?.message }, rawPayload: payload, ts: Date.now() })
+              await dlq.route({
+                topic: eventPattern,
+                reason: "emit-error",
+                error: { message: (err as Error)?.message },
+                rawPayload: payload,
+                ts: Date.now()
+              })
             }
           })
 
-          socket.on("nevo:identify", (data: any) => {
+          socket.on("nevo:identify", async (data: any) => {
             const userId = data?.userId ?? data?.subjectId
             if (!userId) return
+            if (!(await verifyUserId(socket, String(userId), data?.authToken ?? data?.meta?.auth?.token))) return
             ;(socket as any).__nevoUserId = String(userId)
             socket.join(`user:${userId}`)
           })
 
-          socket.on("nevo:subscribe", (data: any) => {
+          socket.on("nevo:subscribe", async (data: any) => {
             const serviceName = data?.serviceName?.toLowerCase?.()
-            const method = data?.method
+            const method = toVersionedMethod(data?.method)
             const explicit = data?.room
             const stickyTo = data?.stickyUserId
             if (!serviceName) return
-            socket.join(explicit ?? `${serviceName}${DEFAULT_SUBSCRIPTION_SUFFIX}`)
-            if (method && !explicit) socket.join(`${serviceName}${DEFAULT_SUBSCRIPTION_SUFFIX}:${method}`)
-            if (stickyTo) socket.join(`user:${stickyTo}`)
+            if (explicit) socket.join(explicit)
+            else if (method) socket.join(`${serviceName}${DEFAULT_SUBSCRIPTION_SUFFIX}:${method}`)
+            else socket.join(`${serviceName}${DEFAULT_SUBSCRIPTION_SUFFIX}`)
+            if (stickyTo && (await verifyUserId(socket, String(stickyTo), data?.authToken ?? data?.meta?.auth?.token))) {
+              socket.join(`user:${stickyTo}`)
+            }
           })
 
           socket.on("nevo:unsubscribe", (data: any) => {
             const serviceName = data?.serviceName?.toLowerCase?.()
-            const method = data?.method
+            const method = toVersionedMethod(data?.method)
             const explicit = data?.room
             if (!serviceName) return
-            socket.leave(explicit ?? `${serviceName}${DEFAULT_SUBSCRIPTION_SUFFIX}`)
-            if (method && !explicit) socket.leave(`${serviceName}${DEFAULT_SUBSCRIPTION_SUFFIX}:${method}`)
+            if (explicit) socket.leave(explicit)
+            else if (method) socket.leave(`${serviceName}${DEFAULT_SUBSCRIPTION_SUFFIX}:${method}`)
+            else socket.leave(`${serviceName}${DEFAULT_SUBSCRIPTION_SUFFIX}`)
           })
 
           socket.on("nevo:publish", (payload: any) => {
-            const serviceName = (options as any)?.serviceName || eventPattern.replace("-events", "")
+            if (options?.allowClientPublish !== true) {
+              if (!publishWarned) {
+                publishWarned = true
+                logger.warn({ event: "socket.publish.rejected", reason: "allowClientPublish is disabled" })
+              }
+              return
+            }
+            const serviceName = String((options as any)?.serviceName || eventPattern.replace("-events", "")).toLowerCase()
             const baseRoom = `${serviceName}${DEFAULT_SUBSCRIPTION_SUFFIX}`
-            const methodRoom = payload?.method ? `${baseRoom}:${payload.method}` : null
+            const method = toVersionedMethod(payload?.method)
+            const methodRoom = method ? `${baseRoom}:${method}` : null
             const targetUserId = payload?.meta?.headers?.["nevo-target-user"]
             if (targetUserId) {
               io.to(`user:${targetUserId}`).emit("nevo:sub", payload)
@@ -110,6 +170,13 @@ export function SocketSignalRouter(serviceType: Type<any> | Type<any>[], options
           })
 
           socket.on("nevo:broadcast", (payload: any) => {
+            if (options?.allowClientBroadcast !== true) {
+              if (!broadcastWarned) {
+                broadcastWarned = true
+                logger.warn({ event: "socket.broadcast.rejected", reason: "allowClientBroadcast is disabled" })
+              }
+              return
+            }
             io.emit("nevo:broadcast", payload)
           })
         })
@@ -137,10 +204,14 @@ export function SocketSignalRouter(serviceType: Type<any> | Type<any>[], options
         await originalOnModuleDestroy.call(this)
         if (this.socketDiscoveryTimer) clearInterval(this.socketDiscoveryTimer)
         if (this.socketServer) {
-          try { await this.socketServer.close() } catch {}
+          try {
+            await this.socketServer.close()
+          } catch {}
         }
         if (this.socketHttpServer) {
-          try { this.socketHttpServer.close() } catch {}
+          try {
+            this.socketHttpServer.close()
+          } catch {}
         }
       }
     }
