@@ -24,10 +24,11 @@
     "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "pnpm run clean && tsc && node -e \"try { require('fs').chmodSync('dist/cli/contract.js', 0o755); require('fs').chmodSync('dist/cli/gen-service.js', 0o755) } catch {}\"",
     "dev": "tsc --watch",
-    "prepublishOnly": "pnpm run clean && pnpm run lint && pnpm run test && pnpm run build",
+    "prepublishOnly": "pnpm run clean && pnpm run format && pnpm run lint && pnpm run test && pnpm run build",
     "test": "node --import tsx --test \"test/**/*.test.ts\"",
     "test:watch": "node --import tsx --test --watch \"test/**/*.test.ts\"",
     "lint": "eslint \"src/**/*.ts\" --max-warnings=0",
+    "lint:fix": "eslint \"src/**/*.ts\" --max-warnings=0 --fix",
     "format": "prettier --write \"src/**/*.ts\" \"examples/**/*.ts\" \"test/**/*.ts\""
   },
   "keywords": [

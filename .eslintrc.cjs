@@ -15,6 +15,7 @@ module.exports = {
     "no-empty": ["warn", { allowEmptyCatch: true }],
     "no-useless-escape": "off",
     "@typescript-eslint/ban-ts-comment": "off",
-    "@typescript-eslint/no-var-requires": "off"
+    "@typescript-eslint/no-var-requires": "off",
+    "no-extra-semi": "off"
   }
 }
