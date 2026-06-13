@@ -3,26 +3,8 @@ import type { IdempotencyStore } from "./idempotency-store"
 import type { IdempotencyOptions } from "./types"
 import { getDefaultLogger, type NevoLogger } from "./logger"
 
-/**
- * Shared two-tier idempotency runtime used by BOTH server pipelines
- * (`BaseMessageController` and the live `signal-router.utils` path) so there is
- * a single source of truth for the cross-cutting dedup logic.
- *
- * Three layers, checked in order on {@link begin}:
- *  1. **L1** — the in-process LRU (sub-ms, per-replica).
- *  2. **In-process leader election** — concurrent calls for the same key in one
- *     process await the first caller instead of all executing (the local half of
- *     claim-before-execute; works even with no distributed store).
- *  3. **Distributed claim** — `SET NX` reserve across replicas, then poll for the
- *     winner's result (the cross-replica half).
- *
- * On success the caller {@link commit}s (L1 write + awaited write-through);
- * on failure / early-return it {@link release}s the claim so it isn't stranded.
- */
-
-export type IdempotencyBegin<T> =
-  | { status: "hit"; value: T }
-  | { status: "execute" }
+/** Shared two-tier (L1 LRU + in-process leader election + distributed claim) idempotency runtime. */
+export type IdempotencyBegin<T> = { status: "hit"; value: T } | { status: "execute" }
 
 export interface TwoTierIdempotencyOptions<T> {
   /** Provide an existing L1 cache (e.g. to share with a subclass field). */
@@ -57,17 +39,15 @@ export class TwoTierIdempotency<T> {
   }
 
   /** The L1 cache, for callers that want to keep a field pointing at it. */
-  get local(): LruIdempotencyCache<T> { return this.l1 }
+  get local(): LruIdempotencyCache<T> {
+    return this.l1
+  }
 
   isEnabled(): boolean {
     return this.l1.isEnabled() || (this.distributed?.isEnabled() ?? false)
   }
 
-  /**
-   * Either return an already-computed result (`hit`) or signal that THIS caller
-   * holds the claim and must run the handler (`execute`). When `execute` is
-   * returned the caller MUST eventually call {@link commit} or {@link release}.
-   */
+  /** Return a cached result (`hit`) or claim execution (`execute`); on `execute` the caller must {@link commit} or {@link release}. */
   async begin(key: string): Promise<IdempotencyBegin<T>> {
     if (!key || !this.isEnabled()) return { status: "execute" }
 
@@ -77,14 +57,7 @@ export class TwoTierIdempotency<T> {
       if (v !== undefined) return { status: "hit", value: v }
     }
 
-    // 2. In-process leader election. `openLease` is a synchronous check-and-set
-    //    (no `await` between the lookup and the registration), so exactly one
-    //    concurrent caller per key becomes the leader; the rest await its
-    //    result. If the leader FAILS (releases without committing) every waiter
-    //    wakes at once — but they must NOT all stampede into a fresh claim. The
-    //    loop re-runs `openLease`, which refuses to overwrite a live entry, so
-    //    only ONE waiter is promoted to the new leader and the rest await it (or
-    //    re-claim sequentially on repeated failures).
+    // 2. In-process leader election: one caller per key leads, the rest await it.
     while (!this.openLease(key)) {
       const pending = this.inflight.get(key)
       if (!pending) continue // entry vanished between checks — race for leadership again
@@ -110,12 +83,10 @@ export class TwoTierIdempotency<T> {
               this.settleLease(key, existing)
               return { status: "hit", value: existing }
             }
-            // Claim held by a peer that never produced a result before the
-            // deadline (crash / TTL) — best-effort: execute it ourselves.
+            // Claim held by a peer that produced no result before the deadline — execute it ourselves.
           }
         } else {
-          // Store without atomic claim: legacy read-through (races, but better
-          // than nothing for custom backends).
+          // Store without atomic claim: legacy read-through (races).
           const remote = await this.distributed.get(key)
           if (remote !== undefined) {
             if (this.l1.isEnabled()) this.l1.set(key, remote)
@@ -124,8 +95,7 @@ export class TwoTierIdempotency<T> {
           }
         }
       } catch (err) {
-        // readErrorPolicy="closed" surfaces here — release the lease and let the
-        // caller fail the request rather than risk a duplicate execution.
+        // readErrorPolicy="closed" surfaces here — release the lease and fail the request.
         this.failLease(key, err)
         throw err
       }
@@ -134,12 +104,7 @@ export class TwoTierIdempotency<T> {
     return { status: "execute" }
   }
 
-  /**
-   * Persist `value` for `key`: L1 write, then an AWAITED distributed
-   * write-through (closing the window where a peer re-executes before the result
-   * is stored). In-process waiters are unblocked immediately. Never throws on a
-   * distributed write failure — the L1 absorbed it and a metric/log was emitted.
-   */
+  /** Persist `value` for `key` (L1 + awaited distributed write-through); never throws on a write failure. */
   async commit(key: string, value: T): Promise<void> {
     if (!key) return
     if (this.l1.isEnabled()) this.l1.set(key, value)
@@ -169,19 +134,15 @@ export class TwoTierIdempotency<T> {
     }
   }
 
-  /**
-   * Synchronously try to become the in-process leader for `key`. Returns `true`
-   * when this caller registered the (single) in-flight lease, `false` when one
-   * already exists — in which case the caller must await the existing promise
-   * rather than overwrite it (overwriting would orphan earlier waiters and let a
-   * herd of callers each fire a distributed claim). Contains no `await`, so the
-   * check + set are atomic with respect to other microtasks.
-   */
+  // Synchronously claim in-process leadership for `key`; no `await`, so check + set are atomic.
   private openLease(key: string): boolean {
     if (this.inflight.has(key)) return false
     let resolve!: (value: T) => void
     let reject!: (err: unknown) => void
-    const p = new Promise<T>((res, rej) => { resolve = res; reject = rej })
+    const p = new Promise<T>((res, rej) => {
+      resolve = res
+      reject = rej
+    })
     // Pre-attach a no-op catch so a rejection (release) is never an unhandled one.
     p.catch(() => {})
     this.inflight.set(key, p)

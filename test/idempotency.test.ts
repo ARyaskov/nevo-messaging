@@ -4,7 +4,9 @@ import { LruIdempotencyCache } from "../src/common/idempotency"
 
 test("LRU evicts oldest", () => {
   const c = new LruIdempotencyCache<number>({ enabled: true, maxEntries: 2, ttlMs: 60_000 })
-  c.set("a", 1); c.set("b", 2); c.set("c", 3)
+  c.set("a", 1)
+  c.set("b", 2)
+  c.set("c", 3)
   assert.equal(c.has("a"), false)
   assert.equal(c.get("b"), 2)
   assert.equal(c.get("c"), 3)

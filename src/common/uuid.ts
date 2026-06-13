@@ -47,11 +47,26 @@ export function uuidv7(): string {
   buf[8] = (buf[8] & 0x3f) | 0x80
 
   return (
-    HEX[buf[0]] + HEX[buf[1]] + HEX[buf[2]] + HEX[buf[3]] + "-" +
-    HEX[buf[4]] + HEX[buf[5]] + "-" +
-    HEX[buf[6]] + HEX[buf[7]] + "-" +
-    HEX[buf[8]] + HEX[buf[9]] + "-" +
-    HEX[buf[10]] + HEX[buf[11]] + HEX[buf[12]] + HEX[buf[13]] + HEX[buf[14]] + HEX[buf[15]]
+    HEX[buf[0]] +
+    HEX[buf[1]] +
+    HEX[buf[2]] +
+    HEX[buf[3]] +
+    "-" +
+    HEX[buf[4]] +
+    HEX[buf[5]] +
+    "-" +
+    HEX[buf[6]] +
+    HEX[buf[7]] +
+    "-" +
+    HEX[buf[8]] +
+    HEX[buf[9]] +
+    "-" +
+    HEX[buf[10]] +
+    HEX[buf[11]] +
+    HEX[buf[12]] +
+    HEX[buf[13]] +
+    HEX[buf[14]] +
+    HEX[buf[15]]
   )
 }
 

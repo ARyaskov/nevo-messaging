@@ -25,7 +25,7 @@ import { ReplayGuard } from "./replay-protection"
 import { getSchemaFor, toValidator } from "./schema"
 import { parseMethod, isVersionCompatible, DEFAULT_METHOD_VERSION } from "./version"
 import { getDefaultMetrics, NEVO_METRIC_NAMES, methodLabel } from "./metrics"
-import { getDefaultTracer, NevoTracer } from "./tracing"
+import { getDefaultTracer, NevoTracer, runWithSpan, SpanLike } from "./tracing"
 import { DlqRouter } from "./dlq"
 import { RateLimiter, resolveRateLimiter, RateLimiterOptions } from "./rate-limit"
 import { NEVO_CONTRACT_METHOD, buildContract, ServiceContract } from "./contract"
@@ -53,31 +53,23 @@ export abstract class BaseMessageController {
     return this._logger
   }
   protected readonly idempotency: LruIdempotencyCache<MessageResponse>
-  /**
-   * Optional distributed idempotency backend (Redis, Memcached, …).
-   * When set, takes precedence over the local LRU on miss and is written
-   * through on success. See `idempotency-store.ts`.
-   */
+  /** Optional distributed idempotency backend (Redis, Memcached, …). */
   protected readonly distributedIdempotency?: IdempotencyStore<MessageResponse>
-  /**
-   * Shared two-tier idempotency runtime (L1 + claim-before-execute over the
-   * distributed store). Single source of truth with the live signal-router path.
-   */
+  /** Shared two-tier idempotency runtime (L1 + claim-before-execute). */
   private readonly idem: TwoTierIdempotency<MessageResponse>
   protected readonly replayGuard: ReplayGuard
   protected readonly dlq: DlqRouter
   protected readonly tracer: NevoTracer | null
   protected readonly defaultVersion: string
   protected readonly rateLimiter: RateLimiter
+  private readonly ownsRateLimiter: boolean
+  private readonly disableBuiltinHandlers: boolean
   protected readonly healthRegistry?: HealthRegistry
   protected readonly instanceId?: string
   protected readonly capabilities?: string[]
   protected readonly serviceVersion?: string
   protected readonly devtoolsBus: DevToolsBus | null
-  /**
-   * Optional append-only audit log. Records every successful or failed
-   * request when enabled. Sinks are pluggable — see `audit-log.ts`.
-   */
+  /** Optional append-only audit log. */
   protected readonly auditLog?: AuditLog
 
   protected constructor(
@@ -104,10 +96,7 @@ export abstract class BaseMessageController {
       capabilities?: string[]
       disableBuiltinHandlers?: boolean
       devtools?: DevToolsBus | boolean
-      /**
-       * Append-only audit log of every request/response. When set, the
-       * controller writes one redacted entry per call via `auditLog.recordFromResponse`.
-       */
+      /** Append-only audit log of every request/response. */
       auditLog?: AuditLog
     }
   ) {
@@ -133,6 +122,8 @@ export abstract class BaseMessageController {
     this.tracer = options?.tracing?.enabled === false ? null : getDefaultTracer()
     this.defaultVersion = options?.defaultVersion || DEFAULT_METHOD_VERSION
     this.rateLimiter = options?.rateLimit !== undefined ? resolveRateLimiter(options.rateLimit) : new RateLimiter()
+    this.ownsRateLimiter = !(options?.rateLimit instanceof RateLimiter)
+    this.disableBuiltinHandlers = options?.disableBuiltinHandlers === true
     this.healthRegistry = options?.health
     this.instanceId = options?.instanceId
     this.capabilities = options?.capabilities
@@ -168,10 +159,7 @@ export abstract class BaseMessageController {
     })
   }
 
-  // Version-stripped method name for metric labels, bucketing any unregistered
-  // / forged method (e.g. on METHOD_NOT_FOUND) to a single `<unknown>` series.
-  // `hasOwnProperty` (not `in`) so inherited Object members like "toString" are
-  // not mistaken for registered handlers.
+  // Version-stripped metric label; unregistered/forged methods bucket to `<unknown>`.
   private metricMethodLabel(method: string): string {
     return methodLabel(method, (name) => Object.prototype.hasOwnProperty.call(this.methodRegistry, name))
   }
@@ -239,7 +227,7 @@ export abstract class BaseMessageController {
         result: "error",
         error: {
           code: ErrorCode.INTERNAL,
-          message: !IS_PROD ? error?.message ?? String(error) : "Internal server error",
+          message: !IS_PROD ? (error?.message ?? String(error)) : "Internal server error",
           details: {},
           service: this.serviceName
         }
@@ -282,11 +270,11 @@ export abstract class BaseMessageController {
     const { method, uuid, params, meta } = this.extractMessageData(data)
     const success = true
 
-    // Establish a chain context for the duration of this handler so any
-    // outbound calls picks up the same chain id via AsyncLocalStorage.
-    // See `chain-context.ts` and the DevTools /traces view.
+    // Establish a chain context so outbound calls inherit the same chain id.
     const chainId = resolveInboundChainId(meta?.nevoChainId)
-    return runInChain({ chainId, parentUuid: uuid }, () => this.runProcessMessage(data, method, uuid, params, meta, nowMs, startMs, success, chainId, metrics))
+    return runInChain({ chainId, parentUuid: uuid }, () =>
+      this.runProcessMessage(data, method, uuid, params, meta, nowMs, startMs, success, chainId, metrics)
+    )
   }
 
   private async runProcessMessage(
@@ -305,11 +293,6 @@ export abstract class BaseMessageController {
     let idemKey: string | undefined
     let idemBegan = false
     let idemCommitted = false
-
-    if (!this["__disableBuiltinHandlers"]) {
-      const builtin = await this.handleBuiltinMethod(method, uuid, meta).catch(() => null)
-      if (builtin) return builtin
-    }
 
     const baseContext = { method, serviceName: this.serviceName, uuid, rawData: data, meta }
     const requestContext = { ...baseContext, params }
@@ -335,23 +318,6 @@ export abstract class BaseMessageController {
         return this.createErrorResponse(uuid, method, err, meta)
       }
 
-      // Idempotency (claim-before-execute) via the shared two-tier runtime: dedup
-      // on the wire-level idempotency key when the client stamped one, else the
-      // envelope uuid. A hit returns the stored response; otherwise we hold the
-      // claim until `finally` commits it (success) or releases it.
-      idemKey = meta?.idempotencyKey || uuid
-      if (idemKey && this.idem.isEnabled()) {
-        const began = await this.idem.begin(idemKey)
-        if (began.status === "hit") return began.value
-        idemBegan = true
-      }
-
-      let processedParams = params
-      if (this.beforeHook) {
-        const hookResult = await this.beforeHook(requestContext)
-        if (hookResult !== undefined) processedParams = hookResult
-      }
-
       const callerService = await extractCallerService(meta, this.accessControl?.jwtVerifier)
       auditCaller = callerService ?? null
       const parsed = parseMethod(method)
@@ -361,8 +327,7 @@ export abstract class BaseMessageController {
         this.rateLimiter.check({ topic, method: parsed.name, callerService, tenantId: meta?.tenantId, meta })
       }
 
-      // Tenant kill-switch — checked after rate-limit so disabled tenants
-      // are charged a token but get a clean `UNAUTHORIZED` response.
+      // Tenant kill-switch — checked after rate-limit.
       assertTenantAllowed(this.serviceName, meta?.tenantId)
 
       if (!isAccessAllowed(this.accessControl, topic, parsed.name, callerService)) {
@@ -375,6 +340,30 @@ export abstract class BaseMessageController {
           meta
         }
         return finalResponse
+      }
+
+      if (!this.disableBuiltinHandlers) {
+        const builtin = await this.handleBuiltinMethod(method, uuid, meta)
+        if (builtin) {
+          finalResponse = builtin
+          return builtin
+        }
+      }
+
+      // Idempotency (claim-before-execute): dedup on idempotencyKey, else uuid,
+      // scoped by caller identity so one caller's key never serves another's cache.
+      const baseIdemKey = meta?.idempotencyKey || uuid
+      idemKey = baseIdemKey ? `${callerService ?? "anon"}::${meta?.tenantId ?? ""}::${baseIdemKey}` : undefined
+      if (idemKey && this.idem.isEnabled()) {
+        const began = await this.idem.begin(idemKey)
+        if (began.status === "hit") return { ...began.value, uuid, meta }
+        idemBegan = true
+      }
+
+      let processedParams = params
+      if (this.beforeHook) {
+        const hookResult = await this.beforeHook(requestContext)
+        if (hookResult !== undefined) processedParams = hookResult
       }
 
       const handler = this.methodRegistry[parsed.name] ?? this.methodRegistry[method]
@@ -392,22 +381,30 @@ export abstract class BaseMessageController {
         })
       }
 
-      const span = this.tracer?.startSpan(`nevo.serve ${this.serviceName}.${parsed.name}`, {
-        "nevo.method": method,
-        "nevo.service": this.serviceName
-      })
-
-      let result: unknown
-      try {
-        result = await this.executeHandler(handler, processedParams)
-        span?.setStatus({ code: 1 })
-      } catch (err) {
-        span?.recordException(err)
-        span?.setStatus({ code: 2, message: (err as Error)?.message })
-        throw err
-      } finally {
-        span?.end()
+      const invokeWithSpan = async (span: SpanLike | null): Promise<unknown> => {
+        try {
+          const value = await this.executeHandler(handler, processedParams)
+          span?.setStatus({ code: 1 })
+          return value
+        } catch (err) {
+          span?.recordException(err)
+          span?.setStatus({ code: 2, message: (err as Error)?.message })
+          throw err
+        }
       }
+
+      const result: unknown = this.tracer
+        ? await runWithSpan(
+            this.tracer,
+            `nevo.serve ${this.serviceName}.${parsed.name}`,
+            {
+              "nevo.method": method,
+              "nevo.service": this.serviceName
+            },
+            meta,
+            invokeWithSpan
+          )
+        : await invokeWithSpan(null)
       const formattedResult = await this.formatResult(result)
 
       let response: MessageResponse = { uuid, method, params: { result: formattedResult }, meta }
@@ -421,10 +418,7 @@ export abstract class BaseMessageController {
 
       await this.systemAfterHook({ ...responseContext, response })
 
-      // Commit through the shared runtime: L1 write + an AWAITED distributed
-      // write-through (closing the window where a peer re-executes before the
-      // result is stored — previously this distributed set was fire-and-forget).
-      // Errors are not cached; the `finally` block releases the claim instead.
+      // Commit the idempotency result (errors are not cached).
       if (idemKey && idemBegan && response.params.result !== "error") {
         await this.idem.commit(idemKey, response)
         idemCommitted = true
@@ -471,7 +465,7 @@ export abstract class BaseMessageController {
         } catch {}
       }
       if (this.auditLog?.isEnabled() && finalResponse) {
-        // Fire-and-forget — never block request completion on audit writes.
+        // Fire-and-forget.
         Promise.resolve(
           this.auditLog.recordFromResponse({
             service: this.serviceName,
@@ -485,11 +479,11 @@ export abstract class BaseMessageController {
           })
         ).catch(() => {})
       }
-      // Release a still-held idempotency claim when no result was committed
-      // (handler error, policy denial, early return) so a retry can re-execute
-      // instead of polling a stranded sentinel until its TTL expires.
+      // Release a still-held claim when no result was committed.
       if (idemKey && idemBegan && !idemCommitted) {
-        try { await this.idem.release(idemKey) } catch {}
+        try {
+          await this.idem.release(idemKey)
+        } catch {}
       }
     }
   }
@@ -497,4 +491,12 @@ export abstract class BaseMessageController {
   protected abstract extractMessageData(data: any): { method: string; uuid: string; params: any; meta?: MessageMeta }
 
   public abstract handleMessage(data: any): Promise<MessageResponse>
+
+  async close(): Promise<void> {
+    if (this.ownsRateLimiter) this.rateLimiter.stop()
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await this.close()
+  }
 }

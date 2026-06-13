@@ -27,7 +27,10 @@ test("buildContract skips nevo.* methods", () => {
   assert.equal(c.instanceId, "abc")
   assert.deepEqual(c.capabilities, ["a"])
   assert.equal(c.methods.length, 2)
-  assert.deepEqual(c.methods.map((m) => m.signalName), ["user.delete", "user.getById"])
+  assert.deepEqual(
+    c.methods.map((m) => m.signalName),
+    ["user.delete", "user.getById"]
+  )
   assert.equal(c.methods.find((m) => m.signalName === "user.delete")?.version, "v2")
 })
 
@@ -48,7 +51,7 @@ test("describeSchema detects zod v4 shape via _zod.def.type", () => {
       def: {
         type: "object",
         shape: {
-          id:   { _zod: { def: { type: "bigint" } } },
+          id: { _zod: { def: { type: "bigint" } } },
           tags: { _zod: { def: { type: "array", element: { _zod: { def: { type: "string" } } } } } },
           tier: { _zod: { def: { type: "literal", values: ["free"] } } },
           tail: { _zod: { def: { type: "optional", innerType: { _zod: { def: { type: "number" } } } } } }
@@ -60,7 +63,7 @@ test("describeSchema detects zod v4 shape via _zod.def.type", () => {
   assert.equal(d?.kind, "zod")
   const shape = d?.shape as any
   assert.equal(shape.type, "object")
-  assert.deepEqual(shape.fields.id,   { type: "bigint" })
+  assert.deepEqual(shape.fields.id, { type: "bigint" })
   assert.deepEqual(shape.fields.tags, { type: "array", items: { type: "string" } })
   assert.deepEqual(shape.fields.tier, { type: "literal", value: "free" })
   assert.deepEqual(shape.fields.tail, { type: "optional", inner: { type: "number" } })
@@ -116,8 +119,12 @@ test("contractsEqual detects a result-schema change without a version bump", () 
 })
 
 test("contractsEqual ignores object field ordering", () => {
-  const a = buildContract("user", { "user.create": { serviceMethod: "create", version: "v1", schema: z.object({ name: z.string(), age: z.number() }) } })
-  const b = buildContract("user", { "user.create": { serviceMethod: "create", version: "v1", schema: z.object({ age: z.number(), name: z.string() }) } })
+  const a = buildContract("user", {
+    "user.create": { serviceMethod: "create", version: "v1", schema: z.object({ name: z.string(), age: z.number() }) }
+  })
+  const b = buildContract("user", {
+    "user.create": { serviceMethod: "create", version: "v1", schema: z.object({ age: z.number(), name: z.string() }) }
+  })
   assert.equal(contractsEqual(a, b), true)
 })
 
@@ -191,7 +198,9 @@ test("contractToOpenApi maps bigint to string/format bigint (wire-consistent)", 
 })
 
 test("default fields are omitted from required in OpenAPI and marked optional in TS", () => {
-  const c = buildContract("svc", { "svc.m": { serviceMethod: "m", version: "v1", schema: z.object({ name: z.string(), role: z.string().default("user") }) } })
+  const c = buildContract("svc", {
+    "svc.m": { serviceMethod: "m", version: "v1", schema: z.object({ name: z.string(), role: z.string().default("user") }) }
+  })
   assert.deepEqual(paramsJsonSchema(c).required, ["name"])
   assert.match(generateContractModule(c), /role\?:/)
 })

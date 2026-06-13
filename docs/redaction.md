@@ -1,6 +1,6 @@
 # PII redaction
 
-`redactObject` strips known-sensitive fields before they reach pino, the DevTools bus, or any error path.
+`redactObject` strips known-sensitive fields before they reach pino, the DevTools bus, or any error path. The built-in console and pino loggers apply the recursive transform to logged objects, so nested secrets are covered rather than only the first two levels.
 
 ## Real API
 

@@ -81,7 +81,9 @@ function serializeZodIssues(err: unknown): unknown {
 export function Schema(schema: unknown): MethodDecorator {
   return (target, propertyKey) => {
     const ctorOrTarget: any = (target as any).constructor ?? target
-    const existing = (Reflect.getMetadata(SCHEMA_METADATA_KEY, ctorOrTarget) as Map<string, unknown> | undefined) ?? new Map<string, unknown>()
+    const own = Reflect.getOwnMetadata(SCHEMA_METADATA_KEY, ctorOrTarget) as Map<string, unknown> | undefined
+    const inherited = Reflect.getMetadata(SCHEMA_METADATA_KEY, ctorOrTarget) as Map<string, unknown> | undefined
+    const existing = new Map<string, unknown>(own ?? inherited)
     existing.set(propertyKey as string, schema)
     Reflect.defineMetadata(SCHEMA_METADATA_KEY, existing, ctorOrTarget)
   }

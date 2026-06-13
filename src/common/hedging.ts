@@ -19,6 +19,12 @@ export async function hedge<T>(fn: (attempt: number, signal: AbortSignal) => Pro
   const { promise: outer, resolve, reject } = Promise.withResolvers<T>()
   let resolved = false
   let rejectedCount = 0
+  const timers: NodeJS.Timeout[] = []
+
+  const clearTimers = () => {
+    for (const timer of timers) clearTimeout(timer)
+    timers.length = 0
+  }
 
   const fireOne = (i: number) => {
     const ctrl = new AbortController()
@@ -28,18 +34,30 @@ export async function hedge<T>(fn: (attempt: number, signal: AbortSignal) => Pro
     p.then((v) => {
       if (resolved) return
       resolved = true
-      for (const c of controllers) if (c !== ctrl) try { c.abort() } catch {}
+      clearTimers()
+      for (const c of controllers)
+        if (c !== ctrl)
+          try {
+            c.abort()
+          } catch {}
       resolve(v)
     }).catch((err) => {
       rejectedCount++
       if (resolved) return
-      if (rejectedCount >= copies) reject(err)
+      if (rejectedCount >= copies) {
+        clearTimers()
+        reject(err)
+      }
     })
   }
 
   fireOne(0)
   for (let i = 1; i < copies; i++) {
-    setTimeout(() => { if (!resolved) fireOne(i) }, delayMs * i)
+    const timer = setTimeout(() => {
+      if (!resolved) fireOne(i)
+    }, delayMs * i)
+    if (typeof timer.unref === "function") timer.unref()
+    timers.push(timer)
   }
 
   return outer

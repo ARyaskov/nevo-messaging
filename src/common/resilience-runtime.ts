@@ -13,6 +13,8 @@ import {
   type CircuitBreakerDecoratorOptions
 } from "./resilience-decorators"
 import { buildResilienceKey, type TenantKeyDimension, type ResilienceKeyContext } from "./tenant-policy"
+import { computeDelay, resolveRetryOptions, shouldRetry } from "./retry"
+import { setTimeout as sleep } from "node:timers/promises"
 
 /**
  * Glue layer that materialises decorator metadata into actual resilience behaviour at call time.
@@ -32,16 +34,26 @@ export interface CompiledResilience {
 }
 
 /** Apply optional `keyBy` widening to the supplied base key. */
-function widenKey(
-  baseKey: string,
-  keyBy: TenantKeyDimension[] | undefined,
-  dimensions: ResilienceKeyContext | undefined
-): string {
+function widenKey(baseKey: string, keyBy: TenantKeyDimension[] | undefined, dimensions: ResilienceKeyContext | undefined): string {
   if (!keyBy || keyBy.length === 0 || !dimensions) return baseKey
   // Append only the dynamic dims (skip service/method — they're already in baseKey).
   const extra = keyBy.filter((d) => d === "tenantId" || d === "callerService")
   if (extra.length === 0) return baseKey
   return `${baseKey}:${buildResilienceKey(dimensions, extra)}`
+}
+
+/** Sliding-specific options imply sliding; a bare `failureThreshold` implies count; default stays sliding. */
+function inferCircuitMode(c: CircuitBreakerDecoratorOptions): "count" | "sliding" {
+  const s = c as SlidingCircuitOptions
+  if (
+    typeof s.windowMs === "number" ||
+    typeof s.bucketMs === "number" ||
+    typeof s.errorRateThreshold === "number" ||
+    typeof s.minSampleSize === "number"
+  ) {
+    return "sliding"
+  }
+  return typeof c.failureThreshold === "number" ? "count" : "sliding"
 }
 
 /** Read every resilience annotation on `target[propertyKey]` and return a normalised config bundle. */
@@ -55,7 +67,7 @@ export function readMethodResilience(target: any, propertyKey: string): Compiled
     hedge: h,
     circuit: c
       ? {
-          mode: c.mode ?? (typeof (c as SlidingCircuitOptions).windowMs === "number" ? "sliding" : "sliding"),
+          mode: c.mode ?? inferCircuitMode(c),
           opts: c,
           keyBy: c.keyBy
         }
@@ -65,29 +77,41 @@ export function readMethodResilience(target: any, propertyKey: string): Compiled
   }
 }
 
-const slidingByMode = new WeakMap<object, SlidingCircuitBreakerRegistry>()
-const countByMode = new WeakMap<object, CircuitBreakerRegistry>()
 const adaptiveByKey = new Map<string, AdaptiveTuner>()
 const backpressureByKey = new Map<string, BackpressureLimiter>()
 
-// Keyed by `globalThis` so multiple imports share state across re-imports.
-const SLIDING_ANCHOR: object = ((globalThis as any).__nevoSlidingAnchor ??= {})
-const COUNT_ANCHOR: object = ((globalThis as any).__nevoCountAnchor ??= {})
+// Keyed on `globalThis` so multiple imports share state across re-imports.
+// Registries are keyed per option-set: each distinct decorator config gets its
+// own registry instead of silently inheriting the first method's thresholds.
+const slidingRegistries: Map<string, SlidingCircuitBreakerRegistry> = ((globalThis as any).__nevoSlidingRegistries ??= new Map())
+const countRegistries: Map<string, CircuitBreakerRegistry> = ((globalThis as any).__nevoCountRegistries ??= new Map())
+
+function circuitConfigKey(opts: CircuitBreakerDecoratorOptions): string {
+  const plain: Record<string, unknown> = {}
+  for (const k of Object.keys(opts as Record<string, unknown>).sort()) {
+    const v = (opts as Record<string, unknown>)[k]
+    if (v === undefined || typeof v === "function") continue
+    plain[k] = v
+  }
+  return JSON.stringify(plain)
+}
 
 function getSlidingRegistry(opts: CircuitBreakerDecoratorOptions): SlidingCircuitBreakerRegistry {
-  let r = slidingByMode.get(SLIDING_ANCHOR)
+  const key = circuitConfigKey(opts)
+  let r = slidingRegistries.get(key)
   if (!r) {
     r = new SlidingCircuitBreakerRegistry({ enabled: true, ...(opts as SlidingCircuitOptions) })
-    slidingByMode.set(SLIDING_ANCHOR, r)
+    slidingRegistries.set(key, r)
   }
   return r
 }
 
 function getCountRegistry(opts: CircuitBreakerDecoratorOptions): CircuitBreakerRegistry {
-  let r = countByMode.get(COUNT_ANCHOR)
+  const key = circuitConfigKey(opts)
+  let r = countRegistries.get(key)
   if (!r) {
     r = new CircuitBreakerRegistry({ enabled: true, ...opts })
-    countByMode.set(COUNT_ANCHOR, r)
+    countRegistries.set(key, r)
   }
   return r
 }
@@ -101,11 +125,7 @@ function getAdaptive(key: string, opts: AdaptiveOptions): AdaptiveTuner {
   return t
 }
 
-function getBackpressureLimiter(
-  key: string,
-  opts: BackpressureOptions,
-  subscription?: PausableSubscription
-): BackpressureLimiter {
+function getBackpressureLimiter(key: string, opts: BackpressureOptions, subscription?: PausableSubscription): BackpressureLimiter {
   let l = backpressureByKey.get(key)
   if (!l) {
     l = new BackpressureLimiter(opts, {
@@ -125,7 +145,12 @@ export function snapshotResilience(): {
 } {
   const adaptive: Record<string, ReturnType<AdaptiveTuner["snapshot"]>> = {}
   for (const [k, t] of adaptiveByKey.entries()) adaptive[k] = t.snapshot()
-  const sliding = slidingByMode.get(SLIDING_ANCHOR)?.snapshot() ?? null
+  let sliding: Record<string, { state: string; errorRate: number; sampleSize: number }> | null = null
+  for (const r of slidingRegistries.values()) {
+    const snap = r.snapshot()
+    if (sliding) Object.assign(sliding, snap)
+    else sliding = { ...snap }
+  }
   const backpressure: Record<string, { inflight: number; paused: boolean }> = {}
   for (const [k, l] of backpressureByKey.entries()) {
     backpressure[k] = { inflight: l.getInflight(), paused: l.isPaused() }
@@ -138,11 +163,37 @@ export interface ApplyResilienceArgs<T> {
   ctx: ResilienceContext
   invoke: (attempt: number, signal: AbortSignal) => Promise<T>
   subscription?: PausableSubscription
+  budget?: InvocationBudget
+}
+
+export const DEFAULT_MAX_PHYSICAL_CALLS = 8
+
+/** Shared cap across adaptive retries, transport retries, and hedge copies. */
+export class InvocationBudget {
+  private used = 0
+  constructor(readonly maxCalls = DEFAULT_MAX_PHYSICAL_CALLS) {}
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.used >= this.maxCalls) {
+      throw new MessagingError(ErrorCode.SERVICE_UNAVAILABLE, {
+        message: `Resilience invocation budget exhausted after ${this.maxCalls} physical calls`,
+        retryable: false,
+        maxPhysicalCalls: this.maxCalls
+      })
+    }
+    this.used++
+    return fn()
+  }
+
+  get usedCalls(): number {
+    return this.used
+  }
 }
 
 /** Apply the compiled resilience config around `invoke`. */
 export async function applyResilience<T>(args: ApplyResilienceArgs<T>): Promise<T> {
   const { config, ctx, invoke, subscription } = args
+  const budget = args.budget ?? new InvocationBudget()
   const key = ctx.key
 
   if (config.backpressure) {
@@ -157,19 +208,20 @@ export async function applyResilience<T>(args: ApplyResilienceArgs<T>): Promise<
       })
     }
     try {
-      return await runCircuitHedge(config, ctx, invoke)
+      return await runCircuitHedge(config, ctx, invoke, budget)
     } finally {
       limiter.end()
     }
   }
 
-  return runCircuitHedge(config, ctx, invoke)
+  return runCircuitHedge(config, ctx, invoke, budget)
 }
 
 async function runCircuitHedge<T>(
   config: CompiledResilience,
   ctx: ResilienceContext,
-  invoke: (attempt: number, signal: AbortSignal) => Promise<T>
+  invoke: (attempt: number, signal: AbortSignal) => Promise<T>,
+  budget: InvocationBudget
 ): Promise<T> {
   const key = ctx.key
   const circuitKey = widenKey(key, config.circuit?.keyBy, ctx.dimensions)
@@ -188,7 +240,9 @@ async function runCircuitHedge<T>(
     // Feed the whole logical call (all adaptive retries + hedge copies count as
     // one observation) back into the tuner so its next read reflects reality.
     if (tuner) {
-      try { tuner.observe(duration, ok) } catch {}
+      try {
+        tuner.observe(duration, ok)
+      } catch {}
     }
     if (slidingReg) {
       if (ok) slidingReg.onSuccess(circuitKey)
@@ -206,16 +260,14 @@ async function runCircuitHedge<T>(
   // call no matter how many retries or hedged copies fire underneath.
   const attemptOnce = (attempt: number, signal: AbortSignal): Promise<T> => {
     const hedgeOpts = config.hedge
-    if (hedgeOpts && hedgeOpts.enabled !== false && (hedgeOpts.copies ?? 1) > 1) {
-      return hedge<T>((hAttempt, hSignal) => invoke(hAttempt, hSignal), hedgeOpts)
+    if (hedgeOpts && hedgeOpts.enabled !== false && (hedgeOpts.copies ?? 2) > 1) {
+      return hedge<T>((hAttempt, hSignal) => budget.run(() => invoke(hAttempt, hSignal)), hedgeOpts)
     }
-    return invoke(attempt, signal)
+    return budget.run(() => invoke(attempt, signal))
   }
 
   try {
-    const result = tuner
-      ? await runAdaptive<T>(tuner, attemptOnce)
-      : await attemptOnce(1, new AbortController().signal)
+    const result = tuner ? await runAdaptive<T>(tuner, attemptOnce) : await attemptOnce(1, new AbortController().signal)
     finish(true)
     return result
   } catch (err) {
@@ -231,19 +283,24 @@ async function runCircuitHedge<T>(
  * output genuinely shapes retry count and per-attempt timeout instead of being
  * computed and thrown away.
  */
-async function runAdaptive<T>(
-  tuner: AdaptiveTuner,
-  attempt: (n: number, signal: AbortSignal) => Promise<T>
-): Promise<T> {
+async function runAdaptive<T>(tuner: AdaptiveTuner, attempt: (n: number, signal: AbortSignal) => Promise<T>): Promise<T> {
   const maxAttempts = Math.max(1, tuner.getRetries())
   const timeoutMs = tuner.getTimeoutMs()
+  const retry = resolveRetryOptions({
+    enabled: true,
+    maxAttempts,
+    baseMs: 100,
+    maxMs: 2000,
+    jitter: true
+  })
   let lastErr: unknown
   for (let n = 1; n <= maxAttempts; n++) {
     try {
       return await callWithTimeout(timeoutMs, (signal) => attempt(n, signal))
     } catch (err) {
       lastErr = err
-      if (n >= maxAttempts) throw err
+      if (n >= maxAttempts || !shouldRetry(err, retry)) throw err
+      await sleep(computeDelay(n, retry))
     }
   }
   throw lastErr
@@ -261,8 +318,7 @@ async function callWithTimeout<T>(timeoutMs: number, fn: (signal: AbortSignal) =
   if (typeof timer.unref === "function") timer.unref()
   try {
     return await new Promise<T>((resolve, reject) => {
-      const onAbort = () =>
-        reject(new MessagingError(ErrorCode.TIMEOUT, { message: `Adaptive timeout after ${timeoutMs}ms`, retryable: true }))
+      const onAbort = () => reject(new MessagingError(ErrorCode.TIMEOUT, { message: `Adaptive timeout after ${timeoutMs}ms`, retryable: true }))
       if (ctrl.signal.aborted) return onAbort()
       ctrl.signal.addEventListener("abort", onAbort, { once: true })
       fn(ctrl.signal).then(resolve, reject)

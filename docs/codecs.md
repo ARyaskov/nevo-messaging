@@ -27,7 +27,7 @@ import {
 
 | Codec | Speed | Size | When to use |
 |---|---|---|---|
-| `MessagePackCodec` | ★★★ | ★★★★ | Default. Fast, compact, native BigInt. |
+| `MessagePackCodec` | ★★★ | ★★★★ | Default. Fast, compact, arbitrary-precision BigInt. |
 | `JsonCodec` | ★★ | ★ | Debuggability — payloads readable in logs/captures. |
 | `JsonCodecFast` | ★★★ | ★ | JSON with fewer allocations on hot paths. |
 | `FastJsonStringifyCodec` | ★★★★ | ★ | JSON with a precompiled schema — highest throughput when shape is known. |
@@ -47,11 +47,11 @@ createNevoNatsClient(["USER"], {
 
 The framework reads `meta.codec` (or a one-byte content-type hint) on inbound envelopes and dispatches to the matching registered codec — peers don't need to agree on codec choice.
 
-## MessagePack details
+## Built-in type semantics
 
-- `useBigInt64: true` — native BigInt → int64 mapping
-- Shared encoder / decoder instances per process (created once)
-- Custom extension support via the `@msgpack/msgpack` extension API
+All built-in codecs share one normalization model: `Date` becomes an ISO string, object properties containing `undefined` are omitted, array `undefined` becomes `null`, and `bigint` uses the `@@nevo:bigint:<digits>` sentinel. MessagePack intentionally avoids `useBigInt64`, because values outside int64 would otherwise wrap silently.
+
+Legacy strings such as `"42n"` are not converted by default. Use the explicit BigInt helpers with `{ acceptLegacy: true }` only while migrating old stored data.
 
 Peer dep: `npm install @msgpack/msgpack`.
 

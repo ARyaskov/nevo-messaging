@@ -32,6 +32,10 @@ export class CoordinatorController {
   }
 
   // Probes for Kubernetes.
-  @Get("/healthz") liveness()  { return this.health.liveness() }
-  @Get("/readyz")  readiness() { return this.health.readiness() }
+  @Get("/healthz") liveness() {
+    return this.health.liveness()
+  }
+  @Get("/readyz") readiness() {
+    return this.health.readiness()
+  }
 }

@@ -17,7 +17,9 @@ export interface TenantPolicy {
 export class TenantPolicyRegistry {
   private readonly map = new Map<string, TenantPolicy>()
 
-  private k(serviceName: string, tenantId: string): string { return `${serviceName}::${tenantId}` }
+  private k(serviceName: string, tenantId: string): string {
+    return `${serviceName}::${tenantId}`
+  }
 
   set(serviceName: string, tenantId: string, policy: TenantPolicy): void {
     this.map.set(this.k(serviceName, tenantId), { ...policy, updatedAt: Date.now() })
@@ -51,7 +53,9 @@ export class TenantPolicyRegistry {
     return this.map.delete(this.k(serviceName, tenantId))
   }
 
-  clear(): void { this.map.clear() }
+  clear(): void {
+    this.map.clear()
+  }
 }
 
 let globalRegistry: TenantPolicyRegistry | null = null
@@ -61,7 +65,9 @@ export function getTenantPolicyRegistry(): TenantPolicyRegistry {
   return globalRegistry
 }
 
-export function setTenantPolicyRegistry(r: TenantPolicyRegistry): void { globalRegistry = r }
+export function setTenantPolicyRegistry(r: TenantPolicyRegistry): void {
+  globalRegistry = r
+}
 
 /** Throw `UNAUTHORIZED` when the caller's tenant has been administratively disabled. */
 export function assertTenantAllowed(serviceName: string, tenantId: string | undefined): void {
@@ -89,10 +95,18 @@ export function buildResilienceKey(ctx: ResilienceKeyContext, keyBy?: TenantKeyD
   const parts: string[] = []
   for (const d of dims) {
     switch (d) {
-      case "service": parts.push(ctx.service); break
-      case "method": parts.push(ctx.method); break
-      case "callerService": parts.push(ctx.callerService ?? "anon"); break
-      case "tenantId": parts.push(ctx.tenantId ?? "no-tenant"); break
+      case "service":
+        parts.push(ctx.service)
+        break
+      case "method":
+        parts.push(ctx.method)
+        break
+      case "callerService":
+        parts.push(ctx.callerService ?? "anon")
+        break
+      case "tenantId":
+        parts.push(ctx.tenantId ?? "no-tenant")
+        break
     }
   }
   return parts.join(":")

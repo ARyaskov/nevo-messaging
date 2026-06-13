@@ -65,6 +65,10 @@ export class NevoSocketClient {
   private readonly maxPayloadBytes: number
   private readonly idempotencyCache: LruIdempotencyCache<unknown>
   private readonly sockets = new Map<string, Socket>()
+  private readonly activeSubscriptions = new Map<
+    string,
+    Map<string, { payload: { serviceName: string; method: string; room?: string }; count: number }>
+  >()
   private readonly discoveryRegistry = new DiscoveryRegistry()
   private readonly discoveryEnabled: boolean
   private readonly discoveryHeartbeatIntervalMs: number
@@ -99,7 +103,9 @@ export class NevoSocketClient {
     })
   }
 
-  getInstanceId(): string { return this.instanceId }
+  getInstanceId(): string {
+    return this.instanceId
+  }
 
   private buildMeta(type: MessageType, opts?: any): MessageMeta {
     const baseMeta: MessageMeta = {
@@ -110,7 +116,6 @@ export class NevoSocketClient {
       idempotencyKey: opts?.idempotencyKey,
       tenantId: opts?.tenantId,
       headers: opts?.headers,
-      // Stamp chain id from ALS (or mint a new one at the entry of a chain).
       nevoChainId: resolveOutboundChainId()
     }
     return this.tracer.inject(baseMeta)
@@ -133,15 +138,24 @@ export class NevoSocketClient {
     const normalized = normalizeServiceName(serviceName)
     const url = this.serviceUrls.get(normalized)
     if (!url) {
-      throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, { message: `Service "${serviceName}" is not registered`, availableServices: this.serviceUrls.keys().toArray() })
+      throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, {
+        message: `Service "${serviceName}" is not registered`,
+        availableServices: this.serviceUrls.keys().toArray()
+      })
     }
     let socket = this.sockets.get(normalized)
     if (!socket) {
       const { io } = getSocketIoClientModule()
-      socket = io(url, { transports: ["websocket"] })
-      this.sockets.set(normalized, socket)
+      const created: Socket = io(url, { transports: ["websocket"] })
+      socket = created
+      this.sockets.set(normalized, created)
+      created.on("connect", () => {
+        const active = this.activeSubscriptions.get(normalized)
+        if (!active) return
+        for (const { payload } of active.values()) created.emit("nevo:subscribe", payload)
+      })
       if (this.discoveryEnabled) {
-        socket.on(DEFAULT_DISCOVERY_TOPIC, (raw: any) => {
+        created.on(DEFAULT_DISCOVERY_TOPIC, (raw: any) => {
           try {
             const payload = typeof raw === "string" ? JSON.parse(raw) : raw
             if (payload?.serviceName) this.discoveryRegistry.update(payload as DiscoveryAnnouncement)
@@ -154,41 +168,62 @@ export class NevoSocketClient {
     return socket
   }
 
-  async query<T = unknown>(serviceName: string, method: string, params: unknown, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; timeoutMs?: number; tenantId?: string }): Promise<T> {
+  async query<T = unknown>(
+    serviceName: string,
+    method: string,
+    params: unknown,
+    opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; timeoutMs?: number; tenantId?: string }
+  ): Promise<T> {
     const cbKey = `${normalizeServiceName(serviceName)}:${method}`
-    return this.shutdown.trackInflight((async () => {
-      if (opts?.idempotencyKey && this.idempotencyCache.isEnabled() && this.idempotencyCache.has(opts.idempotencyKey)) {
-        return this.idempotencyCache.get(opts.idempotencyKey) as T
-      }
-      const result = await withRetry(async (attempt) => {
-        this.circuitBreaker.before(cbKey)
-        try {
-          const socket = this.getSocket(serviceName)
-          const { env } = this.buildEnvelope(method, params, "query", { ...opts, headers: { ...(opts?.headers || {}), "nevo-attempt": String(attempt) } })
-          const { promise, resolve, reject } = Promise.withResolvers<T>()
-          const effectiveTimeout = opts?.timeoutMs ?? this.timeoutMs
-          const timer = setTimeout(() => reject(new TimeoutError(serviceName, method, effectiveTimeout)), effectiveTimeout)
-          socket.emit("nevo:query", env, (response: any) => {
-            clearTimeout(timer)
-            if (response?.params?.result === "error" && response?.params?.error) {
-              const err = response.params.error
-              reject(new MessagingError(err.code, err.details ?? { message: err.message }, err.service || serviceName))
-              return
-            }
-            this.circuitBreaker.onSuccess(cbKey)
-            this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, { transport: "socketio", service: serviceName, method: methodLabel(method), role: "client" })
-            resolve(response?.params?.result as T)
-          })
-          return await promise
-        } catch (err) {
-          this.circuitBreaker.onFailure(cbKey, err)
-          if (attempt > 1) this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "socketio", service: serviceName, method: methodLabel(method) })
-          throw err
+    return this.shutdown.trackInflight(
+      (async () => {
+        if (opts?.idempotencyKey && this.idempotencyCache.isEnabled() && this.idempotencyCache.has(opts.idempotencyKey)) {
+          return this.idempotencyCache.get(opts.idempotencyKey) as T
         }
-      }, this.retryOptions)
-      if (opts?.idempotencyKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(opts.idempotencyKey, result)
-      return result
-    })())
+        const result = await withRetry(async (attempt) => {
+          this.circuitBreaker.before(cbKey)
+          try {
+            const socket = this.getSocket(serviceName)
+            const { env } = this.buildEnvelope(method, params, "query", {
+              ...opts,
+              headers: { ...(opts?.headers || {}), "nevo-attempt": String(attempt) }
+            })
+            const { promise, resolve, reject } = Promise.withResolvers<T>()
+            const effectiveTimeout = opts?.timeoutMs ?? this.timeoutMs
+            let settled = false
+            socket.timeout(effectiveTimeout).emit("nevo:query", env, (timeoutErr: any, response: any) => {
+              if (settled) return
+              settled = true
+              if (timeoutErr) {
+                reject(new TimeoutError(serviceName, method, effectiveTimeout))
+                return
+              }
+              if (response?.params?.result === "error" && response?.params?.error) {
+                const err = response.params.error
+                reject(new MessagingError(err.code, err.details ?? { message: err.message }, err.service || serviceName))
+                return
+              }
+              this.circuitBreaker.onSuccess(cbKey)
+              this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, {
+                transport: "socketio",
+                service: serviceName,
+                method: methodLabel(method),
+                role: "client"
+              })
+              resolve(response?.params?.result as T)
+            })
+            return await promise
+          } catch (err) {
+            this.circuitBreaker.onFailure(cbKey, err)
+            if (attempt > 1)
+              this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "socketio", service: serviceName, method: methodLabel(method) })
+            throw err
+          }
+        }, this.retryOptions)
+        if (opts?.idempotencyKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(opts.idempotencyKey, result)
+        return result
+      })()
+    )
   }
 
   async emit(serviceName: string, method: string, params: unknown, opts?: any): Promise<void> {
@@ -219,10 +254,22 @@ export class NevoSocketClient {
   ): Promise<Subscription> {
     const normalized = normalizeServiceName(serviceName)
     const isBroadcast = normalized === DEFAULT_BROADCAST_TOPIC
+    const socketKey = isBroadcast ? normalizeServiceName(this.serviceUrls.keys().toArray()[0]) : normalized
     const socket = this.getSocket(isBroadcast ? this.serviceUrls.keys().toArray()[0] : serviceName)
-    const room = options?.room ?? (method ? `${normalized}:${method}` : `${normalized}`)
+    const room = options?.room
+    const subKey = `${normalized}:${method}:${room ?? ""}`
 
-    if (!isBroadcast) socket.emit("nevo:subscribe", { serviceName, method, room })
+    if (!isBroadcast) {
+      let active = this.activeSubscriptions.get(socketKey)
+      if (!active) {
+        active = new Map()
+        this.activeSubscriptions.set(socketKey, active)
+      }
+      const tracked = active.get(subKey)
+      if (tracked) tracked.count++
+      else active.set(subKey, { payload: { serviceName, method, room }, count: 1 })
+      socket.emit("nevo:subscribe", { serviceName, method, room })
+    }
 
     const onMessage = async (raw: any) => {
       const payload: any = typeof raw === "string" ? JSON.parse(raw) : raw
@@ -247,19 +294,38 @@ export class NevoSocketClient {
     return {
       unsubscribe: async () => {
         socket.off(event, onMessage)
-        if (!isBroadcast) socket.emit("nevo:unsubscribe", { serviceName, method, room })
+        if (!isBroadcast) {
+          const active = this.activeSubscriptions.get(socketKey)
+          const tracked = active?.get(subKey)
+          if (tracked) {
+            tracked.count--
+            if (tracked.count > 0) return
+            active!.delete(subKey)
+            if (active!.size === 0) this.activeSubscriptions.delete(socketKey)
+          }
+          socket.emit("nevo:unsubscribe", { serviceName, method, room })
+        }
       }
     }
   }
 
-  getAvailableServices(): string[] { return this.serviceUrls.keys().toArray() }
-  getDiscoveredServices() { this.discoveryRegistry.prune(this.discoveryTtlMs); return this.discoveryRegistry.list() }
-  isServiceAvailable(serviceName: string): boolean { return this.discoveryRegistry.isAvailable(serviceName, this.discoveryTtlMs) }
+  getAvailableServices(): string[] {
+    return this.serviceUrls.keys().toArray()
+  }
+  getDiscoveredServices() {
+    this.discoveryRegistry.prune(this.discoveryTtlMs)
+    return this.discoveryRegistry.list()
+  }
+  isServiceAvailable(serviceName: string): boolean {
+    return this.discoveryRegistry.isAvailable(serviceName, this.discoveryTtlMs)
+  }
 
   async close(timeoutMs = 30_000): Promise<void> {
     this.discoveryRegistry.stopBackgroundPrune()
     for (const s of this.sockets.values()) {
-      try { s.close() } catch {}
+      try {
+        s.close()
+      } catch {}
     }
     this.sockets.clear()
     await this.shutdown.shutdown(timeoutMs)

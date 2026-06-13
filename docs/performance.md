@@ -125,6 +125,6 @@ Or use `--inspect` + Chrome DevTools' Performance tab. Common bottlenecks:
 
 ## What is NOT a knob
 
-- There is no global retry budget cap — see [retry.md](./retry.md).
+- Resilience composition has a default eight-call physical invocation budget across transport retry, adaptive retry, and hedge copies — see [retry.md](./retry.md) and [hedging.md](./hedging.md).
 - There is no built-in tail-based sampler — use the OTel Collector.
-- There is no distributed rate-limit / idempotency store — the in-memory caches are per-process.
+- Distributed rate limiting uses `RedisRateLimiter`; distributed idempotency uses `RedisIdempotencyStore` or `EtcdIdempotencyStore`. The in-memory variants remain per-process.

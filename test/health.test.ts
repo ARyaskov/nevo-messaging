@@ -18,7 +18,9 @@ test("aggregates check statuses", async () => {
 
 test("thrown check is treated as down", async () => {
   const r = new HealthRegistry({ serviceName: "user" })
-  r.register("x", () => { throw new Error("boom") })
+  r.register("x", () => {
+    throw new Error("boom")
+  })
   const report = await r.report()
   assert.equal(report.status, "down")
 })
@@ -27,7 +29,9 @@ test("checks run concurrently, not sequentially", async () => {
   const reg = new HealthRegistry({ serviceName: "svc" })
   let started = 0
   let release!: () => void
-  const gate = new Promise<void>((r) => { release = r })
+  const gate = new Promise<void>((r) => {
+    release = r
+  })
   // Each check parks on the gate; the gate only opens once BOTH have started.
   // Under sequential execution the first check would park forever (the second
   // never starts) and time out — so this passing fast proves concurrency.
@@ -47,7 +51,10 @@ test("checks run concurrently, not sequentially", async () => {
 test("second call within the cache window does not re-invoke the probe fn", async () => {
   const reg = new HealthRegistry({ serviceName: "svc", cacheMs: 5_000 })
   let calls = 0
-  reg.register("dep", () => { calls += 1; return { status: "ok" } })
+  reg.register("dep", () => {
+    calls += 1
+    return { status: "ok" }
+  })
   await reg.report()
   await reg.report()
   assert.equal(calls, 1)
@@ -56,7 +63,10 @@ test("second call within the cache window does not re-invoke the probe fn", asyn
 test("cached result is refreshed after the cache window expires", async () => {
   const reg = new HealthRegistry({ serviceName: "svc", cacheMs: 20 })
   let calls = 0
-  reg.register("dep", () => { calls += 1; return { status: "ok" } })
+  reg.register("dep", () => {
+    calls += 1
+    return { status: "ok" }
+  })
   await reg.report()
   await delay(80)
   await reg.report()

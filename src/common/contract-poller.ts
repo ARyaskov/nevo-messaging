@@ -29,16 +29,32 @@ export class ContractPoller {
 
   start(): void {
     this.stopped = false
-    void this.tick()
-    this.timer = setInterval(() => void this.tick(), this.intervalMs)
-    if (typeof this.timer.unref === "function") this.timer.unref()
+    // Self-scheduling loop so a poll that outlasts the interval can't overlap the next.
+    const loop = async () => {
+      if (this.stopped) return
+      const startedAt = performance.now()
+      try {
+        await this.tick()
+      } catch {
+        // swallow: a failed tick must not stop the loop
+      }
+      if (this.stopped) return
+      const elapsed = performance.now() - startedAt
+      const delay = Math.max(0, this.intervalMs - elapsed)
+      this.timer = setTimeout(loop, delay)
+      if (typeof this.timer.unref === "function") this.timer.unref()
+    }
+    void loop()
   }
 
-  async pollOnce(): Promise<void> { await this.tick() }
+  async pollOnce(): Promise<void> {
+    await this.tick()
+  }
 
   stop(): void {
     this.stopped = true
-    if (this.timer) clearInterval(this.timer)
+    if (this.timer) clearTimeout(this.timer)
+    this.timer = undefined
   }
 
   getContract(serviceName: string): ServiceContract | undefined {
@@ -70,9 +86,7 @@ export function contractsEqual(a: ServiceContract, b: ServiceContract): boolean 
     const bm = b.methods[i]
     if (am.signalName !== bm.signalName) return false
     if (am.version !== bm.version) return false
-    // A breaking param/result schema change (field added, removed, or retyped)
-    // without a version bump must still register as drift, so compare the
-    // structural shape of both schema descriptors — not just the version tag.
+    // Compare schema shape, not just version, so an unversioned schema change still registers as drift.
     if (schemaKey(am.paramsSchema) !== schemaKey(bm.paramsSchema)) return false
     if (schemaKey(am.resultSchema) !== schemaKey(bm.resultSchema)) return false
   }
@@ -83,9 +97,7 @@ function schemaKey(schema: SchemaDescriptor | null | undefined): string {
   return schema ? stableStringify(schema) : "null"
 }
 
-// Order-insensitive canonical serialization used to compare schema descriptors
-// structurally. Object keys are sorted so an unrelated re-ordering of fields
-// does not register as a contract change.
+// Order-insensitive canonical serialization (keys sorted) for structural comparison.
 function stableStringify(value: unknown): string {
   if (value === null || value === undefined) return "null"
   if (typeof value === "bigint") return `${value}n`
@@ -111,7 +123,9 @@ export async function broadcastContractChanged(
   }
 }
 
-export function createContractFetcherForClient(client: { query: (svc: string, method: string, params: unknown) => Promise<unknown> }): ContractFetcher {
+export function createContractFetcherForClient(client: {
+  query: (svc: string, method: string, params: unknown) => Promise<unknown>
+}): ContractFetcher {
   return {
     fetch: async (serviceName: string) => {
       const result = await client.query(serviceName, NEVO_CONTRACT_METHOD, {})

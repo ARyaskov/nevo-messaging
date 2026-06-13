@@ -13,7 +13,10 @@ const NOOP_DETACH: CqrsDetach = () => {}
 
 export interface CqrsBridgeOptions {
   service: string
-  client: { query: (svc: string, method: string, params: unknown) => Promise<unknown>; emit: (svc: string, method: string, params: unknown) => Promise<void> }
+  client: {
+    query: (svc: string, method: string, params: unknown) => Promise<unknown>
+    emit: (svc: string, method: string, params: unknown) => Promise<void>
+  }
   remoteCommands?: string[]
   remoteEvents?: string[]
   commandKey?: (cmd: unknown) => string
@@ -58,9 +61,6 @@ export class CqrsBridge {
     // Idempotent: a second attach must not double-wrap execute().
     if ((bus as any)[ATTACHED_COMMAND]) return NOOP_DETACH
 
-    // Keep the *exact* original reference so the disposer restores it verbatim;
-    // invoke it via `.call(bus, …)` to preserve the receiver for method-style
-    // buses.
     const original = bus.execute
     const wrapped: NonNullable<CqrsLikeBus["execute"]> = (command: unknown) => {
       if (this.shouldForwardCommand(command)) return this.executeRemote(command)
@@ -70,8 +70,7 @@ export class CqrsBridge {
     ;(bus as any)[ATTACHED_COMMAND] = true
 
     return () => {
-      // Only restore if our wrapper is still the active one (avoid clobbering a
-      // later wrapper installed on top of ours).
+      // Only restore if our wrapper is still the active one.
       if (bus.execute === wrapped) bus.execute = original
       delete (bus as any)[ATTACHED_COMMAND]
     }
@@ -82,15 +81,8 @@ export class CqrsBridge {
     // Idempotent: a second attach must not double-wrap publish().
     if ((bus as any)[ATTACHED_EVENT]) return NOOP_DETACH
 
-    // Keep the *exact* original reference so the disposer can restore it
-    // verbatim (a `.bind()` copy would not be reference-equal to what the
-    // caller installed). The wrapper invokes it via `.call(bus, …)` so the
-    // receiver is still preserved when the underlying publish is a method.
     const original = bus.publish
-    // Not declared `async`: the non-forwarded path returns `original(event)`
-    // verbatim, preserving whether the underlying publish is sync (void) or
-    // async (Promise) rather than silently turning a sync publish into a
-    // fire-and-forget async call.
+    // Not `async`: the non-forwarded path returns original(event) verbatim to keep sync/async shape.
     const wrapped: NonNullable<CqrsLikeBus["publish"]> = (event: unknown) => {
       if (this.shouldForwardEvent(event)) return this.publishRemote(event)
       return original.call(bus, event)

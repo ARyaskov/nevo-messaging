@@ -7,8 +7,12 @@ test("outbox uses emitBatch when publisher supports it", async () => {
   let batched = 0
   let single = 0
   const publisher = {
-    emit: async () => { single++ },
-    emitBatch: async () => { batched++ }
+    emit: async () => {
+      single++
+    },
+    emitBatch: async () => {
+      batched++
+    }
   }
   const ob = new Outbox(store, publisher, { batch: 10, maxAttempts: 3 })
   for (let i = 0; i < 5; i++) await ob.enqueue("user", `m${i}`, { i })
@@ -22,7 +26,9 @@ test("outbox falls back to per-record emit when batch missing", async () => {
   const store = new InMemoryOutboxStore()
   let single = 0
   const publisher = {
-    emit: async () => { single++ }
+    emit: async () => {
+      single++
+    }
   }
   const ob = new Outbox(store, publisher, { batch: 10, maxAttempts: 3 })
   for (let i = 0; i < 3; i++) await ob.enqueue("user", `m${i}`, { i })
@@ -35,7 +41,9 @@ test("outbox batch failure marks all records failed", async () => {
   const store = new InMemoryOutboxStore()
   const publisher = {
     emit: async () => {},
-    emitBatch: async () => { throw new Error("network") }
+    emitBatch: async () => {
+      throw new Error("network")
+    }
   }
   const ob = new Outbox(store, publisher, { batch: 10, maxAttempts: 1 })
   for (let i = 0; i < 4; i++) await ob.enqueue("user", `m${i}`, { i })
@@ -49,7 +57,9 @@ test("emitBatch partial success only re-sends the unaccepted items", async () =>
   const seen: string[] = []
   let call = 0
   const publisher = {
-    emit: async (_svc: string, m: string) => { seen.push(`emit:${m}`) },
+    emit: async (_svc: string, m: string) => {
+      seen.push(`emit:${m}`)
+    },
     emitBatch: async (items: Array<{ method: string }>) => {
       call++
       seen.push(`batch:${items.map((i) => i.method).join(",")}`)
@@ -64,18 +74,24 @@ test("emitBatch partial success only re-sends the unaccepted items", async () =>
   await ob.enqueue("svc", "m2", {})
 
   const r1 = await ob.flushOnce()
-  assert.equal(r1.published, 2)   // m0 + m2 accepted
-  assert.equal(r1.failed, 0)      // m1 only deferred (under maxAttempts), not parked
+  assert.equal(r1.published, 2) // m0 + m2 accepted
+  assert.equal(r1.failed, 0) // m1 only deferred (under maxAttempts), not parked
 
   // Only the rejected item remains pending — the accepted ones are gone.
   const pending = await store.listPending(10)
-  assert.deepEqual(pending.map((p) => p.method), ["m1"])
+  assert.deepEqual(
+    pending.map((p) => p.method),
+    ["m1"]
+  )
 
   // Second flush must re-send m1 and must NOT re-send the already-accepted m0/m2.
   seen.length = 0
   const r2 = await ob.flushOnce()
   assert.equal(r2.published, 1)
-  assert.ok(seen.some((s) => s.includes("m1")), "m1 should be retried")
+  assert.ok(
+    seen.some((s) => s.includes("m1")),
+    "m1 should be retried"
+  )
   assert.ok(!seen.some((s) => s.includes("m0")), "m0 must not be re-sent")
   assert.ok(!seen.some((s) => s.includes("m2")), "m2 must not be re-sent")
 })

@@ -1,22 +1,10 @@
-// PII / secret redaction for logs, audit entries, DLQ payloads, and anywhere
-// user data is persisted or shipped off-box.
-//
-// `redactObject` deep-clones a value, replacing the values of sensitive keys
-// with "[REDACTED]" and representing non-plain objects faithfully (binaries are
-// summarized, Map/Set are unfolded, Date/RegExp pass through). `jsonByteSize` is
-// its size-estimating twin used by the audit hot path to drop oversized payloads
-// BEFORE paying for a full redaction pass — keep the two in sync when changing
-// how a type is represented.
+// PII / secret redaction for logs, audit entries, and DLQ payloads.
+// NOTE: `jsonByteSize` must mirror `_redact`'s per-type representation; keep them in sync.
 
-// Any key CONTAINING one of these tokens (case-insensitive) is redacted. Catches
-// camelCase / snake_case / prefixed variants such as `userPassword`,
-// `db_password_enc`, `x-api-key`, `refreshToken`, `oauth`.
+// Any key CONTAINING one of these tokens (case-insensitive) is redacted.
 const REDACT_SUBSTRING = /password|secret|token|key|auth|cookie|credential/i
 
-// Exact (case-insensitive) sensitive key names. Covers the common ones the
-// substring pattern above misses (passwd, pwd, ssn, cvv, bearer) plus the
-// canonical headers/fields, and doubles as the single source of truth for the
-// pino redact paths in logger.ts (see `pinoRedactPaths`).
+// Exact (case-insensitive) sensitive key names; also the source of truth for `pinoRedactPaths`.
 export const REDACT_KEY_NAMES: readonly string[] = [
   "password",
   "passwd",
@@ -73,14 +61,10 @@ export function redactObject<T>(value: T, customKeys?: string[]): T {
   return _redact(value, toExtra(customKeys), []) as T
 }
 
-// `ancestors` is the current path from the root to `v` (NOT every object ever
-// seen). We add `v` before recursing into its children and remove it after, so a
-// value that appears in two sibling branches is redacted normally and only a
-// genuine back-reference onto the active path is flagged "[Circular]".
+// `ancestors` tracks the active root-to-`v` path so only genuine back-references become "[Circular]".
 function _redact(v: unknown, extra: Set<string> | null, ancestors: object[]): unknown {
   if (v === null || typeof v !== "object") return v
 
-  // Non-plain objects: represent faithfully instead of walking their internals.
   if (v instanceof Date || v instanceof RegExp) return v
   if (isBinary(v)) return binarySummary(v)
 
@@ -111,12 +95,7 @@ function _redact(v: unknown, extra: Set<string> | null, ancestors: object[]): un
   }
 }
 
-// Estimate the UTF-8 byte length of `JSON.stringify(redactObject(value))` while
-// (a) bailing out as soon as `limit` is exceeded and (b) never allocating the
-// redacted clone or the JSON string. The audit log uses this to short-circuit
-// oversized payloads on the hot path before committing to deep redaction. The
-// size model mirrors `_redact`: sensitive values collapse to "[REDACTED]",
-// binaries to "[Buffer NB]", and back-references to "[Circular]".
+// Estimate UTF-8 byte length of `JSON.stringify(redactObject(value))`, bailing once `limit` is exceeded and without allocating.
 export function jsonByteSize(value: unknown, limit = Number.POSITIVE_INFINITY, customKeys?: string[]): number {
   const extra = toExtra(customKeys)
   const ancestors: object[] = []
@@ -126,24 +105,51 @@ export function jsonByteSize(value: unknown, limit = Number.POSITIVE_INFINITY, c
 
   const walk = (v: unknown): void => {
     if (bytes > limit) return
-    if (v === null || v === undefined) { bytes += 4; return } // "null"
+    if (v === null || v === undefined) {
+      bytes += 4
+      return
+    }
     const t = typeof v
-    if (t === "string") { bytes += quoted(v as string); return }
-    if (t === "number") { bytes += Number.isFinite(v as number) ? String(v).length : 4; return }
-    if (t === "boolean") { bytes += v ? 4 : 5; return }
-    if (t !== "object") { bytes += 4; return } // bigint/symbol/function — approximate
+    if (t === "string") {
+      bytes += quoted(v as string)
+      return
+    }
+    if (t === "number") {
+      bytes += Number.isFinite(v as number) ? String(v).length : 4
+      return
+    }
+    if (t === "boolean") {
+      bytes += v ? 4 : 5
+      return
+    }
+    if (t !== "object") {
+      bytes += 4
+      return
+    } // bigint/symbol/function — approximate
 
     const obj = v as object
-    if (obj instanceof Date) { bytes += 26; return } // "2024-01-01T00:00:00.000Z" + quotes
-    if (obj instanceof RegExp) { bytes += 2; return } // {}
-    if (isBinary(obj)) { bytes += quoted(binarySummary(obj)); return }
-    if (ancestors.includes(obj)) { bytes += quoted(CIRCULAR); return }
+    if (obj instanceof Date) {
+      bytes += 26
+      return
+    } // ISO string + quotes
+    if (obj instanceof RegExp) {
+      bytes += 2
+      return
+    }
+    if (isBinary(obj)) {
+      bytes += quoted(binarySummary(obj))
+      return
+    }
+    if (ancestors.includes(obj)) {
+      bytes += quoted(CIRCULAR)
+      return
+    }
 
     ancestors.push(obj)
     if (Array.isArray(obj)) {
-      bytes += 2 // []
+      bytes += 2
       for (let i = 0; i < obj.length && bytes <= limit; i++) {
-        if (i > 0) bytes += 1 // comma
+        if (i > 0) bytes += 1
         walk(obj[i])
       }
     } else if (obj instanceof Set) {
@@ -163,12 +169,12 @@ export function jsonByteSize(value: unknown, limit = Number.POSITIVE_INFINITY, c
         const key = typeof k === "string" ? k : String(k)
         if (!first) bytes += 1
         first = false
-        bytes += quoted(key) + 1 // "key":
+        bytes += quoted(key) + 1
         if (isSensitiveKey(key, extra)) bytes += quoted(REDACTED)
         else walk(val)
       }
     } else {
-      bytes += 2 // {}
+      bytes += 2
       let first = true
       for (const [k, val] of Object.entries(obj as Record<string, unknown>)) {
         if (bytes > limit) break
@@ -187,20 +193,18 @@ export function jsonByteSize(value: unknown, limit = Number.POSITIVE_INFINITY, c
   return bytes
 }
 
-// Derive pino/fast-redact paths from REDACT_KEY_NAMES so the structured logger
-// and the runtime redactor share one source of truth. fast-redact has no
-// recursive descent and is case-sensitive, so this covers each known key name at
-// the top level and one level deep only; `redactObject` additionally does
-// substring + case-insensitive matching that pino cannot express. Keys with
-// non-identifier characters (e.g. "x-api-key") use bracket notation, which bare
-// dotted paths reject.
-export function pinoRedactPaths(): string[] {
+// Derive bounded-depth pino/fast-redact paths. Logger inputs are also
+// recursively redacted before pino sees them; these paths are defense in depth.
+export function pinoRedactPaths(maxDepth = 8): string[] {
   const paths: string[] = []
   for (const name of REDACT_KEY_NAMES) {
-    if (/^[A-Za-z0-9_]+$/.test(name)) {
-      paths.push(name, `*.${name}`)
-    } else {
-      paths.push(`["${name}"]`, `*["${name}"]`)
+    for (let depth = 0; depth <= maxDepth; depth++) {
+      if (/^[A-Za-z0-9_]+$/.test(name)) {
+        paths.push(`${depth === 0 ? "" : "*.".repeat(depth)}${name}`)
+      } else {
+        const prefix = depth === 0 ? "" : `${"*.".repeat(depth - 1)}*`
+        paths.push(`${prefix}["${name}"]`)
+      }
     }
   }
   return paths

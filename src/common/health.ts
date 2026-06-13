@@ -65,15 +65,14 @@ export class HealthRegistry {
     }
   }
 
-  // Per-check result cache + single-flight coalescing: rapid/concurrent probes
-  // reuse a fresh cached result and never start more than one probe at a time.
+  // Per-check result cache with single-flight coalescing of concurrent probes.
   private runCached(name: string, entry: RegisteredCheck): Promise<HealthCheckResult> {
     const cacheMs = entry.cacheMs ?? this.defaultCacheMs
     if (cacheMs > 0 && entry.cache && Date.now() - entry.cache.at < cacheMs) {
       return Promise.resolve(entry.cache.result)
     }
     if (entry.inFlight) {
-      // A probe is already running — serve the last result if we have one, else join it.
+      // Probe already running — serve the last result if any, else join it.
       return entry.cache ? Promise.resolve(entry.cache.result) : entry.inFlight
     }
     const inFlight = (async () => {
@@ -119,6 +118,10 @@ export class HealthRegistry {
     }
   }
 
-  async liveness(): Promise<HealthStatus> { return this.report("liveness") }
-  async readiness(): Promise<HealthStatus> { return this.report("readiness") }
+  async liveness(): Promise<HealthStatus> {
+    return this.report("liveness")
+  }
+  async readiness(): Promise<HealthStatus> {
+    return this.report("readiness")
+  }
 }

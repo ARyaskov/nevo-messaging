@@ -51,14 +51,18 @@ export class NatsDevToolsAdapter implements DevToolsAdapter {
     const bus = this.bus
     const logger = this.logger
     ;(async () => {
-      for await (const msg of sub) {
-        try {
-          const event = codec.decode<DevToolsEvent>(msg.data)
-          if (!event || typeof event !== "object") continue
-          bus.ingestRemote(event)
-        } catch (err) {
-          logger.warn({ event: "devtools.decode_error", err: (err as Error)?.message }, "Failed to decode devtools event")
+      try {
+        for await (const msg of sub) {
+          try {
+            const event = codec.decode<DevToolsEvent>(msg.data)
+            if (!event || typeof event !== "object") continue
+            bus.ingestRemote(event)
+          } catch (err) {
+            logger.warn({ event: "devtools.decode_error", err: (err as Error)?.message }, "Failed to decode devtools event")
+          }
         }
+      } catch (err) {
+        logger.warn({ event: "devtools.subscription_error", err: (err as Error)?.message }, "devtools subscription iterator ended")
       }
     })()
 
@@ -84,17 +88,16 @@ export class NatsDevToolsAdapter implements DevToolsAdapter {
       if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
       if (this.localOff) this.localOff()
       if (this.subscription) {
-        try { this.subscription.unsubscribe() } catch {}
+        try {
+          this.subscription.unsubscribe()
+        } catch {}
       }
       this.attached = false
     }
   }
 }
 
-export async function wireDevToolsToNats(
-  nc: NatsConnection,
-  opts?: NatsDevToolsAdapterOptions
-): Promise<{ detach: () => Promise<void> }> {
+export async function wireDevToolsToNats(nc: NatsConnection, opts?: NatsDevToolsAdapterOptions): Promise<{ detach: () => Promise<void> }> {
   const adapter = new NatsDevToolsAdapter(nc, opts)
   const detach = await adapter.attach()
   return { detach }
@@ -110,7 +113,9 @@ export async function wireDevToolsToNatsByConfig(
   return {
     detach: async () => {
       await detach()
-      try { await nc.drain() } catch {}
+      try {
+        await nc.drain()
+      } catch {}
     }
   }
 }

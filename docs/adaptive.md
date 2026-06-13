@@ -13,6 +13,7 @@ interface AdaptiveOptions {
   maxRetries?: number      // ceiling for tuned retries, default: 5
   minTimeoutMs?: number    // floor for tuned timeout, default: 100
   maxTimeoutMs?: number    // ceiling for tuned timeout, default: 30000
+  recomputeIntervalMs?: number // minimum percentile recompute interval, default: 250
 }
 
 class AdaptiveTuner {
@@ -21,7 +22,7 @@ class AdaptiveTuner {
   observe(durationMs: number, ok: boolean): void
   getRetries(): number
   getTimeoutMs(): number
-  snapshot(): { p50, p95, p99, samples, currentRetries, currentTimeoutMs }
+  snapshot(): { p50, p95, p99, errorRate, sampleSize, retries, timeoutMs }
 }
 ```
 
@@ -56,7 +57,7 @@ try {
 }
 ```
 
-The tuner maintains a rolling histogram. When p99 latency moves above `targetP99Ms`, it shortens the timeout and reduces retries (so failing calls don't pile up). When p99 falls below `targetP99Ms`, it grows the timeout and adds back retries (so transient errors are absorbed). Bounds are honored.
+The tuner maintains a bounded rolling window. Observations are O(1) on the hot path; percentile recomputation is batched by `recomputeIntervalMs` or every 64 observations rather than sorting on every call. A high error rate reduces retries. Retry capacity is restored only for a healthy, low-latency window, preventing a failing peer from creating a positive feedback loop.
 
 ## When to use this
 
@@ -70,7 +71,7 @@ A fixed timeout is still appropriate when an SLA contract dictates the cap.
 
 ```ts
 const snap = tuner.snapshot()
-// → { p50: 30, p95: 120, p99: 450, samples: 1834, currentRetries: 2, currentTimeoutMs: 600 }
+// → { p50: 30, p95: 120, p99: 450, errorRate: 0.01, sampleSize: 1834, retries: 2, timeoutMs: 600 }
 ```
 
 Export these as gauges for dashboards — see [metrics.md](./metrics.md).
@@ -92,6 +93,8 @@ export class UserService extends NatsClientBase {
 ```
 
 The resilience runtime starts a wall-clock at the outermost wrapper, calls the inner work, and feeds `observe(durationMs, ok)` automatically when it returns or throws. The tuner state is keyed by `service:method`, so retries and parallel calls share one rolling histogram per method.
+
+Adaptive retries use the normal retry classifier and exponential jittered backoff; validation, authorization, and other non-retryable failures are not retried. Adaptive retries, transport retries, and hedge copies share a default budget of eight physical calls per logical request, so composing decorators cannot multiply into an unbounded retry storm.
 
 To read the tuner state at runtime, use `snapshotResilience().adaptive[key]` — see [resilience-decorators.md](./resilience-decorators.md).
 

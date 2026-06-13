@@ -25,7 +25,7 @@ import { formatMethod, DEFAULT_METHOD_VERSION } from "./version"
 import { RateLimiter, resolveRateLimiter } from "./rate-limit"
 import { getDevToolsBus, DevToolsBus } from "./devtools"
 import { uuidv7 } from "./uuid"
-import { applyResilience, type CompiledResilience } from "./resilience-runtime"
+import { applyResilience, InvocationBudget, type CompiledResilience } from "./resilience-runtime"
 
 export interface PreparedRequest {
   uuid: string
@@ -34,18 +34,7 @@ export interface PreparedRequest {
   request: MessageRequest
 }
 
-/**
- * Shared client resilience pipeline — the single source of truth for the
- * ordering "circuit breaker wraps the **entire** retried operation (plus any
- * optional decorator resilience)". Recording exactly one breaker outcome per
- * logical call (instead of one per retry attempt) is what stops N retries from
- * tripping the breaker N× too early.
- *
- * Transport clients that do not (yet) extend {@link BaseMessagingClient} — e.g.
- * `NevoNatsClient` — call this directly, so there is exactly one implementation
- * of the ordering across the codebase rather than divergent per-transport
- * copies. See the note on {@link BaseMessagingClient}.
- */
+/** Shared client resilience pipeline: circuit breaker wraps the entire retried operation. */
 export async function runClientPipeline<T>(
   circuitBreaker: CircuitBreakerRegistry,
   retryOptions: ResolvedRetryOptions,
@@ -54,11 +43,20 @@ export async function runClientPipeline<T>(
   resilience?: CompiledResilience
 ): Promise<T> {
   circuitBreaker.before(key)
+  const budget = new InvocationBudget()
   try {
-    const inner = (): Promise<T> => withRetry(attempt, retryOptions)
-    const result = resilience
-      ? await applyResilience<T>({ config: resilience, ctx: { key }, invoke: () => inner() })
-      : await inner()
+    const result = await withRetry(
+      (retryAttempt) =>
+        resilience
+          ? applyResilience<T>({
+              config: resilience,
+              ctx: { key },
+              invoke: () => attempt(retryAttempt),
+              budget
+            })
+          : budget.run(() => attempt(retryAttempt)),
+      retryOptions
+    )
     circuitBreaker.onSuccess(key)
     return result
   } catch (err) {
@@ -67,12 +65,7 @@ export async function runClientPipeline<T>(
   }
 }
 
-/**
- * Reference base for transport clients. Its constructor wires the shared
- * primitives (codec, circuit breaker, retry, metrics, idempotency, …) and
- * {@link withClientPipeline} is the canonical request path.
- *
- */
+/** Reference base for transport clients; wires shared primitives and the canonical request path. */
 export abstract class BaseMessagingClient {
   protected readonly options: TransportClientOptions
   protected readonly microservices: Map<string, string> = new Map()
@@ -99,6 +92,7 @@ export abstract class BaseMessagingClient {
   protected readonly maxPayloadBytes: number
   protected readonly defaultVersion: string
   protected readonly rateLimiter: RateLimiter
+  private readonly ownsRateLimiter: boolean
   protected readonly devtoolsBus: DevToolsBus | null
 
   protected constructor(options?: TransportClientOptions) {
@@ -107,23 +101,34 @@ export abstract class BaseMessagingClient {
     this.instanceId = this.options.instanceId || randomUUID()
     this.authToken = this.options.authToken
     this._loggerOverride = (this.options.logger as NevoLogger) ?? null
-    this.codec = typeof this.options.codec === "string" ? getCodec(this.options.codec) : (this.options.codec as Codec | undefined) || getDefaultCodec()
+    this.codec =
+      typeof this.options.codec === "string" ? getCodec(this.options.codec) : (this.options.codec as Codec | undefined) || getDefaultCodec()
     this.circuitBreaker = new CircuitBreakerRegistry(this.options.circuitBreaker)
     this.retryOptions = resolveRetryOptions(this.options.retry)
     this.compressionOptions = resolveCompressionOptions(this.options.compression)
     this.tracer = getDefaultTracer()
     this.metrics = getDefaultMetrics()
-    this.idempotencyResults = new LruIdempotencyCache<unknown>({ enabled: this.options.idempotency?.enabled === true, maxEntries: this.options.idempotency?.maxEntries, ttlMs: this.options.idempotency?.ttlMs })
+    this.idempotencyResults = new LruIdempotencyCache<unknown>({
+      enabled: this.options.idempotency?.enabled === true,
+      maxEntries: this.options.idempotency?.maxEntries,
+      ttlMs: this.options.idempotency?.ttlMs
+    })
     this.timeoutMs = this.options.timeout ?? 20000
     this.debug = this.options.debug ?? false
     this.maxPayloadBytes = this.options.security?.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES
     this.defaultVersion = (this.options.defaultVersion as string) || DEFAULT_METHOD_VERSION
     this.rateLimiter = this.options.rateLimit !== undefined ? resolveRateLimiter(this.options.rateLimit) : new RateLimiter()
-    this.devtoolsBus = this.options.devtools === false ? null : (this.options.devtools instanceof Object ? (this.options.devtools as DevToolsBus) : getDevToolsBus())
+    this.ownsRateLimiter = !(this.options.rateLimit instanceof RateLimiter)
+    this.devtoolsBus =
+      this.options.devtools === false ? null : this.options.devtools instanceof Object ? (this.options.devtools as DevToolsBus) : getDevToolsBus()
   }
 
-  getServiceName(): string { return this.serviceName }
-  getInstanceId(): string { return this.instanceId }
+  getServiceName(): string {
+    return this.serviceName
+  }
+  getInstanceId(): string {
+    return this.instanceId
+  }
 
   protected registerMicroservices(configs: MicroserviceConfig[]): void {
     for (const config of configs) {
@@ -137,7 +142,12 @@ export abstract class BaseMessagingClient {
     return formatMethod(method, explicitVersion || this.defaultVersion)
   }
 
-  protected buildRequest(method: string, params: unknown, type: MessageType, opts?: { idempotencyKey?: string; version?: string; headers?: Record<string, string>; tenantId?: string }): PreparedRequest {
+  protected buildRequest(
+    method: string,
+    params: unknown,
+    type: MessageType,
+    opts?: { idempotencyKey?: string; version?: string; headers?: Record<string, string>; tenantId?: string }
+  ): PreparedRequest {
     const uuid = uuidv7()
     const versioned = this.formatVersionedMethod(method, opts?.version)
     const baseMeta: MessageMeta = {
@@ -159,7 +169,11 @@ export abstract class BaseMessagingClient {
   protected encodeMessage(value: unknown): Uint8Array {
     const buf = this.codec.encode(value)
     if (buf.byteLength > this.maxPayloadBytes) {
-      throw new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, { message: `Payload size ${buf.byteLength}B exceeds ${this.maxPayloadBytes}B`, size: buf.byteLength, limit: this.maxPayloadBytes })
+      throw new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, {
+        message: `Payload size ${buf.byteLength}B exceeds ${this.maxPayloadBytes}B`,
+        size: buf.byteLength,
+        limit: this.maxPayloadBytes
+      })
     }
     this.metrics.observeHistogram(NEVO_METRIC_NAMES.payloadBytes, { direction: "out", service: this.serviceName }, buf.byteLength)
     return buf
@@ -172,12 +186,7 @@ export abstract class BaseMessagingClient {
     return this.codec.decode<T>(data)
   }
 
-  protected async withClientPipeline<T>(
-    serviceName: string,
-    method: string,
-    fn: () => Promise<T>,
-    resilience?: CompiledResilience
-  ): Promise<T> {
+  protected async withClientPipeline<T>(serviceName: string, method: string, fn: () => Promise<T>, resilience?: CompiledResilience): Promise<T> {
     const key = `${serviceName}:${method}`
     // Version-stripped label so `foo@v1`/`foo@v2` don't split into separate series.
     const methodName = methodLabel(method)
@@ -199,7 +208,12 @@ export abstract class BaseMessagingClient {
   }
 
   async close(): Promise<void> {
+    if (this.ownsRateLimiter) this.rateLimiter.stop()
     await this.shutdown.shutdown()
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await this.close()
   }
 
   protected publishClientDevToolsEvent(eventInput: {
@@ -226,7 +240,12 @@ export abstract class BaseMessagingClient {
     } catch {}
   }
 
-  protected async query<T = unknown>(serviceName: string, method: string, params: unknown, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<T> {
+  protected async query<T = unknown>(
+    serviceName: string,
+    method: string,
+    params: unknown,
+    opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }
+  ): Promise<T> {
     const clientName = this.microservices.get(serviceName)
     if (!clientName) {
       throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, { message: `Microservice ${serviceName} is not registered`, serviceName })
@@ -234,7 +253,12 @@ export abstract class BaseMessagingClient {
     return this.shutdown.trackInflight(this._queryMicroservice<T>(clientName, method, params, opts))
   }
 
-  protected async emit(serviceName: string, method: string, params: unknown, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<void> {
+  protected async emit(
+    serviceName: string,
+    method: string,
+    params: unknown,
+    opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }
+  ): Promise<void> {
     const clientName = this.microservices.get(serviceName)
     if (!clientName) {
       throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, { message: `Microservice ${serviceName} is not registered`, serviceName })
@@ -242,9 +266,24 @@ export abstract class BaseMessagingClient {
     return this.shutdown.trackInflight(this._emitToMicroservice(clientName, method, params, opts))
   }
 
-  protected abstract _queryMicroservice<T>(clientName: string, method: string, params: unknown, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<T>
-  protected abstract _emitToMicroservice(clientName: string, method: string, params: unknown, opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<void>
-  protected abstract _publishToMicroservice(clientName: string, method: string, params: unknown, opts?: { version?: string; headers?: Record<string, string> }): Promise<void>
+  protected abstract _queryMicroservice<T>(
+    clientName: string,
+    method: string,
+    params: unknown,
+    opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }
+  ): Promise<T>
+  protected abstract _emitToMicroservice(
+    clientName: string,
+    method: string,
+    params: unknown,
+    opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }
+  ): Promise<void>
+  protected abstract _publishToMicroservice(
+    clientName: string,
+    method: string,
+    params: unknown,
+    opts?: { version?: string; headers?: Record<string, string> }
+  ): Promise<void>
   protected abstract _broadcast(method: string, params: unknown, opts?: { version?: string; headers?: Record<string, string> }): Promise<void>
   protected abstract _subscribeToMicroservice<T>(
     clientName: string,

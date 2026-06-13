@@ -15,13 +15,8 @@ interface VerifyCacheEntry {
   expiresAt: number
 }
 
-// Cache of successful token verifications. It is scoped PER verifier (so two
-// verifiers with different issuers/keys can never read each other's results) and
-// keyed by a SHA-256 hash of the token — never the raw bearer string — so live
-// secrets are not left lying around in a process-global Map. Only positive
-// results are cached, and an entry never outlives the token's own `exp`, so a
-// cached claim is never served past the point a fresh verification would reject
-// it. The WeakMap lets a verifier's cache be reclaimed together with the verifier.
+// Per-verifier cache of positive verifications, keyed by SHA-256 of the token
+// (never the raw bearer) and never outliving the token's own `exp`.
 const verifyCaches = new WeakMap<Verifier, Map<string, VerifyCacheEntry>>()
 
 function hashToken(token: string): string {
@@ -40,8 +35,7 @@ async function verifyToken(verifier: Verifier, token: string): Promise<VerifiedC
   const cached = cache.get(key)
   if (cached && now < cached.expiresAt) return cached.claims
 
-  // Let verifier errors propagate so the call site fails closed; a throwing
-  // verifier must never populate the cache.
+  // Let verifier errors propagate so the call site fails closed (and the cache stays unpopulated).
   const verified = (await verifier(token)) as VerifiedClaims | null
   if (!verified) return null
 
@@ -49,8 +43,6 @@ async function verifyToken(verifier: Verifier, token: string): Promise<VerifiedC
   const exp = typeof verified["exp"] === "number" ? (verified["exp"] as number) * 1000 : undefined
   if (exp !== undefined && exp < expiresAt) expiresAt = exp
 
-  // Skip caching an already-expired token: it would only ever produce a hit we
-  // would immediately have to reject.
   if (expiresAt > now) {
     if (cache.size >= JWT_CACHE_MAX) {
       const oldest = cache.keys().next().value
@@ -77,17 +69,13 @@ function warnTokenWithoutVerifier(): void {
 
 export async function extractCallerService(meta?: MessageMeta, verifier?: AccessControlConfig["jwtVerifier"]): Promise<string | undefined> {
   if (verifier) {
-    // A verifier is configured: the caller identity is derived ONLY from a
-    // cryptographically verified token. The client-supplied, unauthenticated
-    // meta.service is never trusted as identity here — trusting it would let any
-    // caller impersonate any service simply by stamping meta.service.
+    // Verifier configured: identity comes ONLY from the verified token, never the unauthenticated meta.service.
     const token = meta?.auth?.token
     if (!token) return undefined
     const verified = await verifyToken(verifier, token)
     if (!verified) return undefined
     const identity = (verified["service"] || verified["serviceName"] || verified["svc"] || verified["sub"]) as string | undefined
-    // If the caller ALSO stamped a meta.service that disagrees with the verified
-    // identity, fail closed instead of silently preferring one over the other.
+    // A meta.service that disagrees with the verified identity fails closed.
     if (identity && meta?.service && meta.service !== identity) {
       throw new MessagingError(ErrorCode.UNAUTHORIZED, {
         message: "meta.service does not match the verified token identity"
@@ -96,11 +84,8 @@ export async function extractCallerService(meta?: MessageMeta, verifier?: Access
     return identity
   }
 
-  // No verifier configured: "trusted network" mode. Identity is taken from the
-  // unauthenticated meta.service. An unsigned token cannot be trusted (the classic
-  // "alg:none" forgery), so it is never decoded for identity — doing so previously
-  // let a caller assert any identity with a forged JWT. Warn once so the
-  // misconfiguration is visible.
+  // No verifier ("trusted network" mode): identity is the unauthenticated meta.service;
+  // a token is never decoded for identity (would allow alg:none forgery). Warn once if one is present.
   if (meta?.auth?.token) warnTokenWithoutVerifier()
   return meta?.service
 }
@@ -137,15 +122,24 @@ function compile(config: AccessControlConfig): CompiledAcl {
     if (topic && method) {
       const key = `${topic}::${method}`
       let arr = compiled.byTopicMethod.get(key)
-      if (!arr) { arr = []; compiled.byTopicMethod.set(key, arr) }
+      if (!arr) {
+        arr = []
+        compiled.byTopicMethod.set(key, arr)
+      }
       arr.push(rule)
     } else if (topic && !method) {
       let arr = compiled.byTopic.get(topic)
-      if (!arr) { arr = []; compiled.byTopic.set(topic, arr) }
+      if (!arr) {
+        arr = []
+        compiled.byTopic.set(topic, arr)
+      }
       arr.push(rule)
     } else if (!topic && method) {
       let arr = compiled.byMethod.get(method)
-      if (!arr) { arr = []; compiled.byMethod.set(method, arr) }
+      if (!arr) {
+        arr = []
+        compiled.byMethod.set(method, arr)
+      }
       arr.push(rule)
     } else {
       compiled.globalDefault.push(rule)
@@ -179,20 +173,18 @@ export function isAccessAllowed(config: AccessControlConfig | undefined, topic: 
 
   if (candidates.length === 0) return compiled.allowAllByDefault
 
-  let matched = false
-  let denied = false
+  // Deny is authoritative: a matching deny in any candidate rule wins over any allow.
   for (const rule of candidates) {
-    matched = true
-    if (listHasValue(rule.deny, callerService)) { denied = true; continue }
+    if (listHasValue(rule.deny, callerService)) return false
+  }
+  for (const rule of candidates) {
     if (rule.allow && rule.allow.length > 0) {
       if (listHasValue(rule.allow, callerService)) return true
       continue
     }
     return true
   }
-
-  if (denied) return false
-  return matched ? false : compiled.allowAllByDefault
+  return false
 }
 
 export function logAccessDenied(config: AccessControlConfig | undefined, details: Record<string, unknown>) {

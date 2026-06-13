@@ -10,7 +10,14 @@ const baseContract: ServiceContract = {
   generatedAt: 1714000000000,
   methods: [
     { signalName: "user.getById", version: "v1" },
-    { signalName: "user.create", version: "v1", paramsSchema: { kind: "zod", shape: { type: "object", fields: { name: { type: "string" }, age: { type: "optional", inner: { type: "number" } } } } } },
+    {
+      signalName: "user.create",
+      version: "v1",
+      paramsSchema: {
+        kind: "zod",
+        shape: { type: "object", fields: { name: { type: "string" }, age: { type: "optional", inner: { type: "number" } } } }
+      }
+    },
     { signalName: "user.delete", version: "v2" }
   ]
 }

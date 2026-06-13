@@ -7,7 +7,15 @@ import { SqliteOutboxStore } from "../src/common/sqlite-outbox"
 test("outbox publishes pending records", async () => {
   const store = new InMemoryOutboxStore()
   const calls: string[] = []
-  const ob = new Outbox(store, { emit: async (svc, m) => { calls.push(`${svc}:${m}`) } }, { batch: 10, maxAttempts: 3 })
+  const ob = new Outbox(
+    store,
+    {
+      emit: async (svc, m) => {
+        calls.push(`${svc}:${m}`)
+      }
+    },
+    { batch: 10, maxAttempts: 3 }
+  )
   await ob.enqueue("user", "user.created", { id: 1 })
   await ob.enqueue("user", "user.deleted", { id: 2 })
   const { published, failed } = await ob.flushOnce()
@@ -18,7 +26,15 @@ test("outbox publishes pending records", async () => {
 
 test("outbox records failed on persistent error", async () => {
   const store = new InMemoryOutboxStore()
-  const ob = new Outbox(store, { emit: async () => { throw new Error("nope") } }, { batch: 1, maxAttempts: 1 })
+  const ob = new Outbox(
+    store,
+    {
+      emit: async () => {
+        throw new Error("nope")
+      }
+    },
+    { batch: 1, maxAttempts: 1 }
+  )
   await ob.enqueue("user", "x", {})
   const { failed } = await ob.flushOnce()
   assert.equal(failed, 1)
@@ -91,7 +107,7 @@ test("withOutboxTransaction rolls back the outbox row with business state (sqlit
   assert.equal(orderCount(), 1)
   assert.equal((await store.listPending(10)).length, 1)
 
-  store.close()   // borrowed connection -> no-op
+  store.close() // borrowed connection -> no-op
   db.close()
 })
 
@@ -102,7 +118,17 @@ test("withOutboxTransaction throws on a handle it cannot drive", async () => {
   )
 })
 
-const silentLogger: any = { trace() {}, debug() {}, info() {}, warn() {}, error() {}, fatal() {}, child() { return silentLogger } }
+const silentLogger: any = {
+  trace() {},
+  debug() {},
+  info() {},
+  warn() {},
+  error() {},
+  fatal() {},
+  child() {
+    return silentLogger
+  }
+}
 
 /**
  * A stateful in-memory stand-in for a Postgres connection that executes the
@@ -126,16 +152,23 @@ function statefulFakePg(): PgClient & { rows: any[] } {
         for (const r of claimable) r.claimed_by = workerId
         return {
           rows: claimable.map((r) => ({
-            id: r.id, service_name: r.service_name, method: r.method, params: r.params,
-            partition_key: r.partition_key ?? null, attempts: r.attempts, status: r.status,
-            last_error: r.last_error ?? null, created_at: new Date(r.created_at)
+            id: r.id,
+            service_name: r.service_name,
+            method: r.method,
+            params: r.params,
+            partition_key: r.partition_key ?? null,
+            attempts: r.attempts,
+            status: r.status,
+            last_error: r.last_error ?? null,
+            created_at: new Date(r.created_at)
           })) as T[],
           rowCount: claimable.length
         }
       }
       if (t.includes("insert into") && t.includes("on conflict")) {
         const [id, service_name, method, params, partition_key, status, attempts, created_at] = values as any[]
-        if (!find(String(id))) rows.push({ id, service_name, method, params, partition_key, status, attempts, created_at, claimed_by: null, last_error: null })
+        if (!find(String(id)))
+          rows.push({ id, service_name, method, params, partition_key, status, attempts, created_at, claimed_by: null, last_error: null })
         return { rows: [] as T[], rowCount: 1 }
       }
       if (t.includes("'published'")) {
@@ -205,7 +238,15 @@ test("markFailed on a stolen claim is ignored (pg ownership guard)", async () =>
 
 test("configured maxAttempts parks a poison row after exactly N attempts (sqlite)", async () => {
   const store = new SqliteOutboxStore()
-  const ob = new Outbox(store, { emit: async () => { throw new Error("broker down") } }, { batch: 10, maxAttempts: 3 })
+  const ob = new Outbox(
+    store,
+    {
+      emit: async () => {
+        throw new Error("broker down")
+      }
+    },
+    { batch: 10, maxAttempts: 3 }
+  )
   await ob.enqueue("user", "user.created", { id: 1 })
 
   // Attempts 1 and 2 leave the row pending (no park yet).
@@ -226,9 +267,17 @@ test("configured maxAttempts parks a poison row after exactly N attempts (sqlite
 
 test("maxAttempts threading works through the in-memory store", async () => {
   const store = new InMemoryOutboxStore()
-  const ob = new Outbox(store, { emit: async () => { throw new Error("down") } }, { batch: 10, maxAttempts: 2 })
+  const ob = new Outbox(
+    store,
+    {
+      emit: async () => {
+        throw new Error("down")
+      }
+    },
+    { batch: 10, maxAttempts: 2 }
+  )
   await ob.enqueue("user", "x", {})
-  assert.equal((await ob.flushOnce()).failed, 0)   // attempt 1 -> pending
-  assert.equal((await ob.flushOnce()).failed, 1)   // attempt 2 -> failed
+  assert.equal((await ob.flushOnce()).failed, 0) // attempt 1 -> pending
+  assert.equal((await ob.flushOnce()).failed, 1) // attempt 2 -> failed
   assert.equal((await store.listPending(10)).length, 0)
 })

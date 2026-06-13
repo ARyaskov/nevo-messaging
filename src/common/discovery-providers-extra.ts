@@ -53,13 +53,17 @@ export class EtcdDiscoveryProvider implements DiscoveryProvider {
     if (this.watcher) await this.watcher.close()
   }
 
-  private prefix(): string { return this.opts.prefix ?? "/services/" }
+  private prefix(): string {
+    return this.opts.prefix ?? "/services/"
+  }
 
   private schedule(): void {
     if (this.stopped) return
     const interval = Math.max(500, this.opts.pollIntervalMs ?? 5000)
     this.timer = setTimeout(async () => {
-      try { await this.refresh() } catch (err) {
+      try {
+        await this.refresh()
+      } catch (err) {
         this.logger.warn({ event: "etcd.poll.failed", err: (err as Error)?.message })
       }
       this.schedule()
@@ -147,7 +151,9 @@ export class EurekaDiscoveryProvider implements DiscoveryProvider {
     const interval = Math.max(500, this.opts.pollIntervalMs ?? 10_000)
     const tick = async () => {
       if (this.stopped) return
-      try { await this.refresh() } catch (err) {
+      try {
+        await this.refresh()
+      } catch (err) {
         this.logger.warn({ event: "eureka.poll.failed", err: (err as Error)?.message })
       } finally {
         if (!this.stopped) this.timer = setTimeout(tick, interval)
@@ -250,7 +256,9 @@ export class CloudMapDiscoveryProvider implements DiscoveryProvider {
     const interval = Math.max(500, this.opts.pollIntervalMs ?? 10_000)
     const tick = async () => {
       if (this.stopped) return
-      try { await this.refresh() } catch (err) {
+      try {
+        await this.refresh()
+      } catch (err) {
         this.logger.warn({ event: "cloud-map.poll.failed", err: (err as Error)?.message })
       } finally {
         if (!this.stopped) this.timer = setTimeout(tick, interval)
@@ -346,7 +354,9 @@ export class NomadDiscoveryProvider implements DiscoveryProvider {
     const interval = Math.max(500, this.opts.pollIntervalMs ?? 5_000)
     const tick = async () => {
       if (this.stopped) return
-      try { await this.refresh() } catch (err) {
+      try {
+        await this.refresh()
+      } catch (err) {
         this.logger.warn({ event: "nomad.poll.failed", err: (err as Error)?.message })
       } finally {
         if (!this.stopped) this.timer = setTimeout(tick, interval)

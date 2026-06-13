@@ -2,12 +2,7 @@ import { uuidv7 } from "../../common/uuid"
 import { MessagingError } from "../../common/errors"
 import { ErrorCode } from "../../common/error-code"
 import { matchesFilter } from "../../common/subscription-filters"
-import type {
-  MessageMeta,
-  Subscription,
-  SubscriptionContext,
-  SubscriptionOptions
-} from "../../common/types"
+import type { MessageMeta, Subscription, SubscriptionContext, SubscriptionOptions } from "../../common/types"
 
 /**
  * In-memory transport for unit and integration tests.
@@ -17,10 +12,7 @@ import type {
 
 export type MemoryHandler = (params: any, ctx: { meta: MessageMeta }) => Promise<unknown> | unknown
 
-export type MemorySubscribeHandler<T = unknown> = (
-  data: T,
-  ctx: SubscriptionContext
-) => Promise<void> | void
+export type MemorySubscribeHandler<T = unknown> = (data: T, ctx: SubscriptionContext) => Promise<void> | void
 
 interface RecordedCall {
   ts: number
@@ -58,8 +50,12 @@ export class MemoryHarness {
   }
 
   /** Logical clock offset; useful for replay-window / TTL-driven tests. */
-  advanceTime(ms: number): void { this.timeOffset += ms }
-  now(): number { return Date.now() + this.timeOffset }
+  advanceTime(ms: number): void {
+    this.timeOffset += ms
+  }
+  now(): number {
+    return Date.now() + this.timeOffset
+  }
 
   /** Drop all recorded calls and pending injections. */
   reset(): void {
@@ -81,7 +77,9 @@ export class MemoryHarness {
     return this.delays.get(this.k(serviceName, method)) ?? 0
   }
 
-  private k(s: string, m: string): string { return `${s}:${m}` }
+  private k(s: string, m: string): string {
+    return `${s}:${m}`
+  }
 }
 
 /** In-process bus. Usually created via {@link createMemoryTransport}. */
@@ -118,13 +116,7 @@ export class MemoryTransport {
     this.harness.reset()
   }
 
-  async query<T = unknown>(
-    callerService: string,
-    serviceName: string,
-    method: string,
-    params: unknown,
-    meta?: MessageMeta
-  ): Promise<T> {
+  async query<T = unknown>(callerService: string, serviceName: string, method: string, params: unknown, meta?: MessageMeta): Promise<T> {
     const uuid = uuidv7()
     const envMeta: MessageMeta = { ...meta, service: callerService, ts: Date.now() }
     this.harness.calls.push({ ts: Date.now(), kind: "query", serviceName, method, uuid, params, meta: envMeta })
@@ -142,13 +134,7 @@ export class MemoryTransport {
     return handler(params, { meta: envMeta }) as T
   }
 
-  async emit(
-    callerService: string,
-    serviceName: string,
-    method: string,
-    params: unknown,
-    meta?: MessageMeta
-  ): Promise<void> {
+  async emit(callerService: string, serviceName: string, method: string, params: unknown, meta?: MessageMeta): Promise<void> {
     const uuid = uuidv7()
     const envMeta: MessageMeta = { ...meta, service: callerService, ts: Date.now() }
     this.harness.calls.push({ ts: Date.now(), kind: "emit", serviceName, method, uuid, params, meta: envMeta })
@@ -161,18 +147,14 @@ export class MemoryTransport {
       // before the handler starts. `queueMicrotask` would run the handler
       // inside the caller's current await boundary, defeating the point.
       setImmediate(() => {
-        try { Promise.resolve(handler(params, { meta: envMeta })).catch(() => undefined) } catch {}
+        try {
+          Promise.resolve(handler(params, { meta: envMeta })).catch(() => undefined)
+        } catch {}
       })
     }
   }
 
-  async publish(
-    callerService: string,
-    serviceName: string,
-    method: string,
-    params: unknown,
-    meta?: MessageMeta
-  ): Promise<void> {
+  async publish(callerService: string, serviceName: string, method: string, params: unknown, meta?: MessageMeta): Promise<void> {
     const uuid = uuidv7()
     const envMeta: MessageMeta = { ...meta, service: callerService, ts: Date.now() }
     this.harness.calls.push({ ts: Date.now(), kind: "publish", serviceName, method, uuid, params, meta: envMeta })
@@ -239,13 +221,7 @@ export class MemoryTransport {
     if (ms > 0) await new Promise((r) => setTimeout(r, ms))
   }
 
-  private async fanout(
-    serviceName: string,
-    method: string,
-    params: unknown,
-    meta: MessageMeta,
-    uuid: string
-  ): Promise<void> {
+  private async fanout(serviceName: string, method: string, params: unknown, meta: MessageMeta, uuid: string): Promise<void> {
     for (const sub of this.subscribers) {
       if (!sub.active) continue
       if (sub.serviceName !== serviceName) continue
@@ -257,23 +233,11 @@ export class MemoryTransport {
 
   private wildcardMatch(pattern: string, method: string): boolean {
     if (!pattern.includes("*") && !pattern.includes(">")) return false
-    const re = new RegExp(
-      "^" +
-        pattern
-          .replaceAll(".", "\\.")
-          .replaceAll("*", "[^.]+")
-          .replaceAll(">", ".+") +
-        "$"
-    )
+    const re = new RegExp("^" + pattern.replaceAll(".", "\\.").replaceAll("*", "[^.]+").replaceAll(">", ".+") + "$")
     return re.test(method)
   }
 
-  private async deliver(
-    sub: RegisteredSubscriber,
-    params: unknown,
-    meta: MessageMeta,
-    _uuid: string
-  ): Promise<void> {
+  private async deliver(sub: RegisteredSubscriber, params: unknown, meta: MessageMeta, _uuid: string): Promise<void> {
     const ctx: SubscriptionContext = {
       meta: { ...meta, type: "sub" } as MessageMeta,
       async ack() {},
@@ -304,36 +268,21 @@ export abstract class MemoryClientBase {
     this.tenantId = options?.tenantId
   }
 
-  protected query<T = unknown>(
-    serviceName: string,
-    method: string,
-    params: unknown,
-    opts?: { meta?: MessageMeta; tenantId?: string }
-  ): Promise<T> {
+  protected query<T = unknown>(serviceName: string, method: string, params: unknown, opts?: { meta?: MessageMeta; tenantId?: string }): Promise<T> {
     return this.transport.query<T>(this.serviceName, serviceName, method, params, {
       ...opts?.meta,
       tenantId: opts?.tenantId ?? this.tenantId
     })
   }
 
-  protected emit(
-    serviceName: string,
-    method: string,
-    params: unknown,
-    opts?: { meta?: MessageMeta; tenantId?: string }
-  ): Promise<void> {
+  protected emit(serviceName: string, method: string, params: unknown, opts?: { meta?: MessageMeta; tenantId?: string }): Promise<void> {
     return this.transport.emit(this.serviceName, serviceName, method, params, {
       ...opts?.meta,
       tenantId: opts?.tenantId ?? this.tenantId
     })
   }
 
-  protected publish(
-    serviceName: string,
-    method: string,
-    params: unknown,
-    opts?: { meta?: MessageMeta }
-  ): Promise<void> {
+  protected publish(serviceName: string, method: string, params: unknown, opts?: { meta?: MessageMeta }): Promise<void> {
     return this.transport.publish(this.serviceName, serviceName, method, params, opts?.meta)
   }
 

@@ -2,6 +2,7 @@ import { createRequire } from "node:module"
 import type { Codec, CodecName } from "./codec"
 import { MessagingError } from "./errors"
 import { ErrorCode } from "./error-code"
+import { makeBigIntReviver, normalizeWireValue } from "./bigint.utils"
 
 const nodeRequire = createRequire(__filename)
 
@@ -13,6 +14,7 @@ interface FastJsonCodecOptions {
 }
 
 let modCache: FastJsonStringifyModule | null = null
+const bigintReviver = makeBigIntReviver()
 
 function loadModule(): FastJsonStringifyModule {
   if (modCache) return modCache
@@ -39,7 +41,7 @@ export class FastJsonStringifyCodec implements Codec {
   }
 
   encode(value: unknown): Uint8Array {
-    const str = this.stringify(value)
+    const str = this.stringify(normalizeWireValue(value))
     const byteLen = Buffer.byteLength(str, "utf8")
     const buf = Buffer.allocUnsafe(byteLen)
     buf.write(str, 0, byteLen, "utf8")
@@ -49,7 +51,7 @@ export class FastJsonStringifyCodec implements Codec {
   decode<T = unknown>(data: Uint8Array | string): T {
     const str = typeof data === "string" ? data : Buffer.from(data).toString("utf8")
     try {
-      return JSON.parse(str) as T
+      return JSON.parse(str, bigintReviver) as T
     } catch (err: any) {
       throw new MessagingError(ErrorCode.PARSE_ERROR, { message: `FastJsonStringify decode error: ${err.message}` })
     }

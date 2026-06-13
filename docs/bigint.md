@@ -6,7 +6,7 @@
 
 | Codec | Wire representation |
 |---|---|
-| MessagePack | Native int64 via `useBigInt64: true` |
+| MessagePack | Sentinel string `@@nevo:bigint:<digits>` |
 | JSON / JsonFast | Sentinel string `@@nevo:bigint:<digits>` |
 | fast-json-stringify | Sentinel string (declare the property as `{ type: "string" }`) |
 
@@ -36,7 +36,7 @@ const parsed = parseWithBigInt(json)
 // parsed.id === 1n
 ```
 
-`parseWithBigInt(str, { acceptLegacy: true })` also recognises the older `"1n"` shape (used pre-2.0) for backwards compatibility on stored data.
+`parseWithBigInt(str, { acceptLegacy: true })` also recognises the older `"1n"` shape (used pre-2.0) for backwards compatibility on stored data. Legacy decoding is opt-in; ordinary strings such as `"42n"` remain strings by default.
 
 ## Example
 
@@ -50,10 +50,19 @@ const id = await this.query<bigint>("user", "user.getId", {})
 typeof id === "bigint"  // true
 ```
 
-## Custom extension types
+## Cross-codec type matrix
 
-The MessagePack codec supports `@msgpack/msgpack` extensions natively (`Map`, `Set`, `Date`, `Buffer`). The JSON codecs only handle BigInt as a special case — for other non-JSON types in JSON-mode, use a string convention of your own design.
+The built-in codecs normalize the JSON-compatible types consistently:
+
+| JavaScript value | Decoded value |
+|---|---|
+| `bigint` | Exact arbitrary-precision `bigint` |
+| `Date` | ISO-8601 string |
+| Object property with `undefined` | Omitted |
+| Array element with `undefined` | `null` |
+
+MessagePack deliberately does not use `useBigInt64`: that option silently wraps values outside signed/unsigned 64-bit range. The sentinel representation preserves arbitrary-size BigInts without truncation.
 
 ## Performance
 
-The sentinel adds a small per-encode/decode scan to detect BigInts in JSON. For payloads with many fields and few BigInts, prefer MessagePack — it skips the scan entirely. For pure JSON, sentinel overhead is roughly 2–3% on typical payloads.
+Normalization adds a bounded object walk before encoding. MessagePack remains the compact default, while all built-in codecs now preserve the same application-level values.

@@ -14,7 +14,7 @@ export interface ResolvedRetryOptions {
 
 export function resolveRetryOptions(opts?: RetryOptions): ResolvedRetryOptions {
   return {
-    enabled: opts?.enabled !== false && (opts?.maxAttempts ?? 0) !== 0,
+    enabled: opts?.enabled !== false && (opts?.maxAttempts ?? 3) !== 0,
     maxAttempts: opts?.maxAttempts ?? 3,
     baseMs: opts?.baseMs ?? 100,
     maxMs: opts?.maxMs ?? 2000,
@@ -27,6 +27,7 @@ export function shouldRetry(err: unknown, opts: ResolvedRetryOptions): boolean {
   if (!opts.enabled) return false
   if (err instanceof MessagingError) {
     if (opts.retryOnCodes.has(err.code)) return true
+    if (Object.prototype.hasOwnProperty.call(err.details, "retryable")) return err.retryable
     if (err.retryable) return true
     return isRetryable(err.code)
   }

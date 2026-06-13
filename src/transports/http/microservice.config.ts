@@ -8,6 +8,17 @@ export async function createHttpMicroservice(options: NestApplicationOptions): P
 
   const app = await NestFactory.create<NestFastifyApplication>(module, new FastifyAdapter())
 
+  const fastify = app.getHttpAdapter().getInstance()
+  for (const contentType of ["application/msgpack", "application/x-msgpack"]) {
+    fastify.addContentTypeParser(
+      contentType,
+      { parseAs: "buffer" },
+      (_req: unknown, body: Buffer, done: (err: Error | null, parsed?: unknown) => void) => {
+        done(null, body)
+      }
+    )
+  }
+
   if (onInit) {
     await onInit(app)
   }

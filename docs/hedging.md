@@ -68,7 +68,7 @@ await hedge(
 
 ## Bounding the cost
 
-Hedging adds roughly `copies * tail-probability` extra calls. If your tail is at the 99th percentile, one extra copy adds ~1% overhead on average. Two copies add ~2%. There is no built-in budget cap — keep `copies` small (1 or 2) and only enable hedging on hot, idempotent reads.
+Hedging adds roughly `copies * tail-probability` extra calls. If your tail is at the 99th percentile, one extra copy adds ~1% overhead on average. Two copies add ~2%. Hedge copies, adaptive retries, and transport retries share a default budget of eight physical calls per logical request. Keep `copies` small (1 or 2) and only enable hedging on hot, idempotent reads.
 
 ## Declarative form — `@Hedge`
 

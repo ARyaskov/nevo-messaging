@@ -1,10 +1,5 @@
 import { Inject, Injectable } from "@nestjs/common"
-import {
-  NevoSocketClient,
-  RateLimit,
-  Schema,
-  SocketClientBase
-} from "@riaskov/nevo-messaging"
+import { NevoSocketClient, RateLimit, Schema, SocketClientBase } from "@riaskov/nevo-messaging"
 import { z } from "zod"
 
 const GetByIdInput = z.object({ id: z.bigint() })

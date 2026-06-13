@@ -13,10 +13,22 @@ export type ServiceMethod<TParams = unknown, TResult = unknown> = {
 export type ServiceMethodMap = Record<string, ServiceMethod>
 
 export interface TypedServiceClient<T extends ServiceMethodMap> {
-  query<M extends keyof T & string>(method: M, params: T[M]["params"], opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<T[M]["result"]>
-  emit<M extends keyof T & string>(method: M, params: T[M]["params"], opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }): Promise<void>
+  query<M extends keyof T & string>(
+    method: M,
+    params: T[M]["params"],
+    opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }
+  ): Promise<T[M]["result"]>
+  emit<M extends keyof T & string>(
+    method: M,
+    params: T[M]["params"],
+    opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }
+  ): Promise<void>
   publish<M extends keyof T & string>(method: M, params: T[M]["params"], opts?: { version?: string; headers?: Record<string, string> }): Promise<void>
-  subscribe<M extends keyof T & string>(method: M, handler: (data: T[M]["result"]) => void | Promise<void>, opts?: { ack?: boolean; durableKey?: string }): Promise<{ unsubscribe: () => Promise<void> }>
+  subscribe<M extends keyof T & string>(
+    method: M,
+    handler: (data: T[M]["result"]) => void | Promise<void>,
+    opts?: { ack?: boolean; durableKey?: string }
+  ): Promise<{ unsubscribe: () => Promise<void> }>
 }
 
 export interface ClientTransportLike {
@@ -38,7 +50,11 @@ export function createServiceClient<T extends ServiceMethodMap>(serviceName: str
       if (!client.publish) throw new Error("Transport does not support publish")
       return client.publish(serviceName, method as string, params as any, opts) as Promise<void>
     },
-    subscribe<M extends keyof T & string>(method: M, handler: (data: T[M]["result"]) => void | Promise<void>, opts?: { ack?: boolean; durableKey?: string }) {
+    subscribe<M extends keyof T & string>(
+      method: M,
+      handler: (data: T[M]["result"]) => void | Promise<void>,
+      opts?: { ack?: boolean; durableKey?: string }
+    ) {
       if (!client.subscribe) throw new Error("Transport does not support subscribe")
       return client.subscribe(serviceName, method as string, opts, (data: any) => handler(data)) as Promise<{ unsubscribe: () => Promise<void> }>
     }
@@ -78,7 +94,7 @@ export function mapServiceMethods<T>(
       if (typeof mapping === "string") {
         methodPrefix = mapping
       } else {
-        [methodPrefix, options] = mapping
+        ;[methodPrefix, options] = mapping
       }
 
       const matchingMethod = serviceMethods.find((m) => m.toLowerCase().startsWith(methodPrefix.toLowerCase()))

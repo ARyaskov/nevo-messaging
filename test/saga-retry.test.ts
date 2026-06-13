@@ -7,7 +7,10 @@ test("step retries on failure", async () => {
   const result = await createSaga<{ x: number }>()
     .step({
       name: "a",
-      execute: () => { attempts++; if (attempts < 3) throw new Error("flaky") },
+      execute: () => {
+        attempts++
+        if (attempts < 3) throw new Error("flaky")
+      },
       retries: 5,
       backoff: { baseMs: 1, maxMs: 1, jitter: false }
     })
@@ -32,10 +35,20 @@ test("compensation runs LIFO and is retried on failure", async () => {
   const order: string[] = []
   let compensateAttempts = 0
   const result = await createSaga<{}>()
-    .step({ name: "a", execute: () => { order.push("a") }, compensate: () => { order.push("-a") } })
+    .step({
+      name: "a",
+      execute: () => {
+        order.push("a")
+      },
+      compensate: () => {
+        order.push("-a")
+      }
+    })
     .step({
       name: "b",
-      execute: () => { order.push("b") },
+      execute: () => {
+        order.push("b")
+      },
       compensate: () => {
         compensateAttempts++
         if (compensateAttempts < 2) throw new Error("comp fail")
@@ -44,7 +57,12 @@ test("compensation runs LIFO and is retried on failure", async () => {
       compensateRetries: 3,
       compensateBackoff: { baseMs: 1, maxMs: 1, jitter: false }
     })
-    .step({ name: "c", execute: () => { throw new Error("boom") } })
+    .step({
+      name: "c",
+      execute: () => {
+        throw new Error("boom")
+      }
+    })
     .run({})
   assert.equal(result.status, "failed")
   assert.deepEqual(order, ["a", "b", "-b", "-a"])
@@ -57,8 +75,19 @@ test("saga persists snapshots and can resume", async () => {
 
   await new Saga<typeof ctx>()
     .withStore(store, sagaId)
-    .step({ name: "a", execute: (c) => { c.counter++ } })
-    .step({ name: "fail", execute: () => { throw new Error("die") }, retries: 0 })
+    .step({
+      name: "a",
+      execute: (c) => {
+        c.counter++
+      }
+    })
+    .step({
+      name: "fail",
+      execute: () => {
+        throw new Error("die")
+      },
+      retries: 0
+    })
     .run(ctx)
 
   const snap = await store.load(sagaId)
@@ -70,7 +99,12 @@ test("saga persists snapshots and can resume", async () => {
   }
 
   const resumeResult = await Saga.resume(store, sagaId, [
-    { name: "a", execute: (c: any) => { c.counter++ } },
+    {
+      name: "a",
+      execute: (c: any) => {
+        c.counter++
+      }
+    },
     { name: "fixed", execute: () => undefined }
   ])
   assert.equal(resumeResult.status, "success")
@@ -83,6 +117,7 @@ test("recovery worker resumes a pending saga from the store after a simulated cr
   const sagaType = "order-checkout"
 
   // Simulate a process that executed step "a", persisted, then crashed before "b".
+  // The snapshot is stale (older than the recovery threshold), so it is recoverable.
   await store.save({
     sagaId,
     type: sagaType,
@@ -90,15 +125,27 @@ test("recovery worker resumes a pending saga from the store after a simulated cr
     executed: ["a"],
     ctx: { done: ["a"] },
     status: "pending",
-    updatedAt: Date.now()
+    updatedAt: Date.now() - 60_000
   })
 
   // A fresh process re-registers step definitions by saga type + step name so a
   // recovered saga can find them again.
   const ran: string[] = []
   const registry = new SagaStepRegistry<{ done: string[] }>()
-    .register(sagaType, { name: "a", execute: (c) => { ran.push("a"); c.done.push("a") } })
-    .register(sagaType, { name: "b", execute: (c) => { ran.push("b"); c.done.push("b") } })
+    .register(sagaType, {
+      name: "a",
+      execute: (c) => {
+        ran.push("a")
+        c.done.push("a")
+      }
+    })
+    .register(sagaType, {
+      name: "b",
+      execute: (c) => {
+        ran.push("b")
+        c.done.push("b")
+      }
+    })
 
   const recovery = new SagaRecovery(store, registry, { intervalMs: 5_000 })
   const result = await recovery.recoverOnce()
@@ -113,8 +160,13 @@ test("recovery worker resumes a pending saga from the store after a simulated cr
   // The worker is stoppable: after stop() it ignores new pending sagas.
   recovery.stop()
   await store.save({
-    sagaId: "saga-recover-2", type: sagaType, steps: ["a"], executed: [],
-    ctx: { done: [] }, status: "pending", updatedAt: Date.now()
+    sagaId: "saga-recover-2",
+    type: sagaType,
+    steps: ["a"],
+    executed: [],
+    ctx: { done: [] },
+    status: "pending",
+    updatedAt: Date.now()
   })
   const afterStop = await recovery.recoverOnce()
   assert.equal(afterStop.recovered, 0)
@@ -123,11 +175,15 @@ test("recovery worker resumes a pending saga from the store after a simulated cr
 test("recovery worker skips a saga whose step type is not registered", async () => {
   const store = new InMemorySagaStore()
   await store.save({
-    sagaId: "saga-unknown-type", type: "never-registered", steps: ["a"], executed: [],
-    ctx: {}, status: "pending", updatedAt: Date.now()
+    sagaId: "saga-unknown-type",
+    type: "never-registered",
+    steps: ["a"],
+    executed: [],
+    ctx: {},
+    status: "pending",
+    updatedAt: Date.now() - 120_000
   })
-  const registry = new SagaStepRegistry()
-    .register("some-other-type", { name: "a", execute: () => undefined })
+  const registry = new SagaStepRegistry().register("some-other-type", { name: "a", execute: () => undefined })
 
   const recovery = new SagaRecovery(store, registry)
   const result = await recovery.recoverOnce()
@@ -151,7 +207,14 @@ test("step receives and can observe the abort signal on timeout", async () => {
           sawSignal = signal instanceof AbortSignal
           // Honour cancellation: stop as soon as the timeout aborts us instead of
           // running to completion behind a retry (which would double a side effect).
-          signal.addEventListener("abort", () => { abortedDuringRun = true; resolve() }, { once: true })
+          signal.addEventListener(
+            "abort",
+            () => {
+              abortedDuringRun = true
+              resolve()
+            },
+            { once: true }
+          )
         }),
       timeoutMs: 20,
       retries: 0

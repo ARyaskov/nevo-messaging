@@ -6,7 +6,7 @@ import { UserService } from "./user.service"
 @HttpSignalRouter([UserService], {
   accessControl: {
     rules: [
-      { topic: "user-events", method: "*",           allow: ["frontend", "coordinator"] },
+      { topic: "user-events", method: "*", allow: ["frontend", "coordinator"] },
       { topic: "user-events", method: "user.delete", allow: ["coordinator"] }
     ],
     logDenied: true,

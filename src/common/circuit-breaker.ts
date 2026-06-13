@@ -14,6 +14,7 @@ export interface ResolvedCircuitOptions {
   failureThreshold: number
   resetTimeoutMs: number
   halfOpenSuccessThreshold: number
+  maxKeys: number
 }
 
 export function resolveCircuitOptions(opts?: CircuitBreakerOptions): ResolvedCircuitOptions {
@@ -21,7 +22,8 @@ export function resolveCircuitOptions(opts?: CircuitBreakerOptions): ResolvedCir
     enabled: opts?.enabled === true,
     failureThreshold: opts?.failureThreshold ?? 5,
     resetTimeoutMs: opts?.resetTimeoutMs ?? 10000,
-    halfOpenSuccessThreshold: opts?.halfOpenSuccessThreshold ?? 1
+    halfOpenSuccessThreshold: opts?.halfOpenSuccessThreshold ?? 1,
+    maxKeys: opts?.maxKeys ?? 10_000
   }
 }
 
@@ -30,6 +32,7 @@ interface CircuitData {
   failures: number
   successes: number
   openedAt: number
+  halfOpenInFlight: boolean
 }
 
 export class CircuitBreakerRegistry {
@@ -49,15 +52,31 @@ export class CircuitBreakerRegistry {
     }
   }
 
-  isEnabled(): boolean { return this.opts.enabled }
+  isEnabled(): boolean {
+    return this.opts.enabled
+  }
 
   private getCircuit(key: string): CircuitData {
     let c = this.circuits.get(key)
     if (!c) {
-      c = { state: "closed", failures: 0, successes: 0, openedAt: 0 }
+      this.evictIfFull()
+      c = { state: "closed", failures: 0, successes: 0, openedAt: 0, halfOpenInFlight: false }
       this.circuits.set(key, c)
     }
     return c
+  }
+
+  private evictIfFull(): void {
+    if (this.circuits.size < this.opts.maxKeys) return
+    let fallback: string | undefined
+    for (const [k, v] of this.circuits) {
+      if (fallback === undefined) fallback = k
+      if (v.state === "closed") {
+        this.circuits.delete(k)
+        return
+      }
+    }
+    if (fallback !== undefined) this.circuits.delete(fallback)
   }
 
   private emitTransition(key: string, prev: CircuitState, next: CircuitState, c: CircuitData, err?: unknown): void {
@@ -91,11 +110,19 @@ export class CircuitBreakerRegistry {
         const prev = c.state
         c.state = "half-open"
         c.successes = 0
+        c.halfOpenInFlight = false
         this.emitTransition(key, prev, c.state, c)
       } else {
         const [service, method] = key.split(":")
         throw new CircuitOpenError(service ?? "unknown", method ?? "unknown")
       }
+    }
+    if (c.state === "half-open") {
+      if (c.halfOpenInFlight) {
+        const [service, method] = key.split(":")
+        throw new CircuitOpenError(service ?? "unknown", method ?? "unknown")
+      }
+      c.halfOpenInFlight = true
     }
   }
 
@@ -103,12 +130,14 @@ export class CircuitBreakerRegistry {
     if (!this.opts.enabled) return
     const c = this.getCircuit(key)
     if (c.state === "half-open") {
+      c.halfOpenInFlight = false
       c.successes++
       if (c.successes >= this.opts.halfOpenSuccessThreshold) {
         const prev = c.state
         c.state = "closed"
         c.failures = 0
         c.successes = 0
+        c.halfOpenInFlight = false
         this.emitTransition(key, prev, c.state, c)
       }
     } else if (c.state === "closed") {
@@ -118,10 +147,14 @@ export class CircuitBreakerRegistry {
 
   onFailure(key: string, err: unknown): void {
     if (!this.opts.enabled) return
-    if (err instanceof MessagingError && err.code === ErrorCode.VALIDATION_FAILED) return
-    if (err instanceof MessagingError && err.code === ErrorCode.UNAUTHORIZED) return
+    if (err instanceof MessagingError && (err.code === ErrorCode.VALIDATION_FAILED || err.code === ErrorCode.UNAUTHORIZED)) {
+      const current = this.circuits.get(key)
+      if (current?.state === "half-open") current.halfOpenInFlight = false
+      return
+    }
     const c = this.getCircuit(key)
     if (c.state === "half-open") {
+      c.halfOpenInFlight = false
       const prev = c.state
       c.state = "open"
       c.openedAt = Date.now()

@@ -10,10 +10,14 @@ test("circuit transitions emit devtools events", async () => {
   const cb = new CircuitBreakerRegistry({ enabled: true, failureThreshold: 2, resetTimeoutMs: 50 }, { bus, registry })
 
   const events: any[] = []
-  bus.on((e) => { if (e.type === "circuit") events.push(e) })
+  bus.on((e) => {
+    if (e.type === "circuit") events.push(e)
+  })
 
-  cb.before("svc:m"); cb.onFailure("svc:m", new Error("x"))
-  cb.before("svc:m"); cb.onFailure("svc:m", new Error("x"))
+  cb.before("svc:m")
+  cb.onFailure("svc:m", new Error("x"))
+  cb.before("svc:m")
+  cb.onFailure("svc:m", new Error("x"))
   assert.equal(events.length, 1)
   assert.equal(events[0].extra.to, "open")
 
@@ -34,6 +38,7 @@ test("no events when disabled", () => {
   const events: any[] = []
   bus.on((e) => events.push(e))
   const cb = new CircuitBreakerRegistry({ enabled: false }, { bus })
-  cb.before("x:y"); cb.onFailure("x:y", new Error("x"))
+  cb.before("x:y")
+  cb.onFailure("x:y", new Error("x"))
   assert.equal(events.length, 0)
 })

@@ -1,6 +1,6 @@
 {
   "name": "@riaskov/nevo-messaging",
-  "version": "2.3.2",
+  "version": "2.4.0",
   "description": "Microservices messaging framework for NestJS with NATS/Kafka/SocketIO/HTTP transport, MessagePack, retry/circuit-breaker, OTel, schema validation, DLQ, idempotency, saga, outbox, metrics, health, DevTools",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -19,15 +19,16 @@
   "engines": {
     "node": ">=24"
   },
-  "packageManager": "pnpm@11.0.0",
+  "packageManager": "pnpm@11.5.2",
   "scripts": {
     "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "pnpm run clean && tsc && node -e \"try { require('fs').chmodSync('dist/cli/contract.js', 0o755); require('fs').chmodSync('dist/cli/gen-service.js', 0o755) } catch {}\"",
     "dev": "tsc --watch",
-    "prepublishOnly": "pnpm run clean && pnpm run lint && pnpm run test && pnpm run build",
+    "prepublishOnly": "pnpm run clean && pnpm run format && pnpm run lint && pnpm run test && pnpm run build",
     "test": "node --import tsx --test \"test/**/*.test.ts\"",
     "test:watch": "node --import tsx --test --watch \"test/**/*.test.ts\"",
     "lint": "eslint \"src/**/*.ts\" --max-warnings=0",
+    "lint:fix": "eslint \"src/**/*.ts\" --max-warnings=0 --fix",
     "format": "prettier --write \"src/**/*.ts\" \"examples/**/*.ts\" \"test/**/*.ts\""
   },
   "keywords": [
@@ -59,9 +60,16 @@
     "@nestjs/microservices": "^11.1.0",
     "@nestjs/platform-fastify": "^11.1.0",
     "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/exporter-jaeger": "^1.25.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.57.0 || ^1.0.0 || ^2.0.0",
+    "@opentelemetry/exporter-zipkin": "^1.30.0 || ^2.0.0",
+    "@opentelemetry/resources": "^1.30.0 || ^2.0.0",
+    "@opentelemetry/sdk-trace-node": "^1.30.0 || ^2.0.0",
+    "@opentelemetry/semantic-conventions": "^1.28.0",
     "cacheable-lookup": "^7.0.0",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.0",
+    "etcd3": "^1.1.2",
     "fast-json-stringify": "^6.0.0",
     "kafkajs": "^2.2.4",
     "pino": "^9.0.0",
@@ -97,10 +105,31 @@
     "@opentelemetry/api": {
       "optional": true
     },
+    "@opentelemetry/exporter-jaeger": {
+      "optional": true
+    },
+    "@opentelemetry/exporter-trace-otlp-http": {
+      "optional": true
+    },
+    "@opentelemetry/exporter-zipkin": {
+      "optional": true
+    },
+    "@opentelemetry/resources": {
+      "optional": true
+    },
+    "@opentelemetry/sdk-trace-node": {
+      "optional": true
+    },
+    "@opentelemetry/semantic-conventions": {
+      "optional": true
+    },
     "class-transformer": {
       "optional": true
     },
     "class-validator": {
+      "optional": true
+    },
+    "etcd3": {
       "optional": true
     },
     "kafkajs": {

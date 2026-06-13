@@ -1,11 +1,4 @@
-import {
-  GracefulShutdown,
-  HealthRegistry,
-  createNatsMicroservice,
-  createLogger,
-  setDefaultLogger,
-  setupNevoTracing
-} from "@riaskov/nevo-messaging"
+import { GracefulShutdown, HealthRegistry, createNatsMicroservice, createLogger, setDefaultLogger, setupNevoTracing } from "@riaskov/nevo-messaging"
 import { AppModule } from "./app.module"
 
 async function bootstrap() {

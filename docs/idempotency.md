@@ -89,7 +89,7 @@ For long-lived entries the framework already detaches buffer views in place — 
 
 ## Distributed store — `IdempotencyStore`
 
-A single-replica LRU is fine for stateful services, but pointless for fleets where the same retry can hit any pod. The `IdempotencyStore<T>` interface lets you swap in a shared backend; a ready-to-use Redis adapter is included.
+A single-replica LRU is fine for stateful services, but pointless for fleets where the same retry can hit any pod. The `IdempotencyStore<T>` interface lets you swap in a shared backend; ready-to-use Redis and etcd adapters are included.
 
 ```ts
 interface IdempotencyStore<T = unknown> {
@@ -157,6 +157,44 @@ Behavioural notes:
 - Reads are read-through: L1 miss → `client.get` → warm L1 → return (the in-progress sentinel written by `claim()` is treated as absent).
 - Writes are write-through and **awaited**: `set()` updates L1 immediately, then overwrites the Redis key with `PX <ttlMs>` (no `NX` — it must replace the claimer's own in-progress sentinel; cross-replica races are prevented by the atomic `claim()`, not by the result write).
 - Read failures emit a high-severity metric (`nevo_messaging_store_errors_total`) and an error log, then follow `readErrorPolicy`: `"open"` (default) treats the failure as a miss and proceeds (at-least-once; may re-execute), `"closed"` rethrows so the caller fails the request rather than risk a duplicate. Write failures stay soft — the L1 absorbed the entry.
+
+### etcd adapter (v3.6.12)
+
+Use etcd when the cluster already has a highly available etcd control plane and you want idempotency claims to share the same quorum-backed coordination layer:
+
+```ts
+import { Etcd3 } from "etcd3"
+import { EtcdIdempotencyStore } from "@riaskov/nevo-messaging"
+
+const client = new Etcd3({
+  hosts: process.env.ETCD_ENDPOINTS!.split(",")
+})
+
+const store = new EtcdIdempotencyStore({
+  client,
+  enabled: true,
+  ttlMs: 5 * 60_000,
+  claimTtlMs: 60_000,
+  keyPrefix: "myapp/idem/",
+  readErrorPolicy: "closed"
+})
+
+@Controller()
+@NatsSignalRouter([PaymentService], { idempotencyStore: store })
+export class PaymentController {}
+```
+
+Install the peer-optional client with `npm install etcd3`.
+
+The adapter uses the etcd v3 transaction and lease APIs supported by etcd 3.6.12:
+
+- `CreateRevision == 0` is compared atomically before writing the in-progress sentinel, so only one pod wins a claim.
+- Claims and completed values are attached to server-side leases with keepalive disabled. Expiration therefore follows the etcd cluster's clock, not pod clocks.
+- Losing claimers revoke their unused lease and poll for the winner's completed value.
+- An in-process L1 LRU avoids an etcd round-trip for repeat hits on the same pod.
+- `readErrorPolicy` has the same fail-open/fail-closed semantics as the Redis adapter.
+
+Use a dedicated key prefix and an etcd role limited to read/write/delete within that prefix. The adapter targets the stable v3 API; it does not depend on deprecated v2 endpoints.
 
 ### Implementing your own store (Memcached, Dynamo, …)
 

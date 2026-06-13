@@ -28,13 +28,33 @@ function parseArgs(argv: string[]): GenOptions {
     const a = argv[i]
     const next = () => argv[++i]
     switch (a) {
-      case "-h": case "--help": out.help = true; break
-      case "-n": case "--name": out.name = next(); break
-      case "-o": case "--out": out.outDir = next(); break
-      case "-t": case "--transport": out.transport = next() as any; break
-      case "-p": case "--port": out.port = Number(next()); break
-      case "-f": case "--force": out.force = true; break
-      case "--type": out.type = next() as GenServiceType; break
+      case "-h":
+      case "--help":
+        out.help = true
+        break
+      case "-n":
+      case "--name":
+        out.name = next()
+        break
+      case "-o":
+      case "--out":
+        out.outDir = next()
+        break
+      case "-t":
+      case "--transport":
+        out.transport = next() as any
+        break
+      case "-p":
+      case "--port":
+        out.port = Number(next())
+        break
+      case "-f":
+      case "--force":
+        out.force = true
+        break
+      case "--type":
+        out.type = next() as GenServiceType
+        break
       default:
         if (!out.name && !a.startsWith("-")) out.name = a
     }
@@ -51,7 +71,12 @@ function parseArgs(argv: string[]): GenOptions {
  *   toClassName("user_profile")  → "UserProfile"
  */
 function toClassName(s: string): string {
-  return s.replaceAll(/[^A-Za-z0-9]+/g, " ").split(" ").filter(Boolean).map((w) => w[0].toUpperCase() + w.slice(1)).join("")
+  return s
+    .replaceAll(/[^A-Za-z0-9]+/g, " ")
+    .split(" ")
+    .filter(Boolean)
+    .map((w) => w[0].toUpperCase() + w.slice(1))
+    .join("")
 }
 
 function printHelp(): void {
@@ -704,7 +729,8 @@ function buildFilesForType(opts: GenOptions, name: string, className: string, ou
         [path.join(srcDir, `${name}.worker.ts`), workerServiceTemplate(name, className)],
         [path.join(outDir, "src", "app.module.ts"), appModuleTemplate(className, name)],
         // workers don't expose RPC by default — main.ts boots Nest but skips microservice
-        [path.join(outDir, "src", "main.ts"),
+        [
+          path.join(outDir, "src", "main.ts"),
           `import { NestFactory } from "@nestjs/core"
 import { GracefulShutdown } from "@riaskov/nevo-messaging"
 import { AppModule } from "./app.module"
@@ -727,7 +753,8 @@ async function bootstrap() {
   }
 }
 bootstrap()
-`],
+`
+        ],
         [path.join(outDir, "package.json"), packageJsonTemplate(name)],
         [path.join(outDir, "tsconfig.json"), tsconfigTemplate()]
       ]
@@ -767,7 +794,10 @@ bootstrap()
 
 export async function runGen(argv: string[]): Promise<number> {
   const opts = parseArgs(argv)
-  if (opts.help || !opts.name) { printHelp(); return opts.help ? 0 : 2 }
+  if (opts.help || !opts.name) {
+    printHelp()
+    return opts.help ? 0 : 2
+  }
   const validTypes: GenServiceType[] = ["service", "consumer", "worker", "saga", "workflow"]
   if (opts.type && !validTypes.includes(opts.type)) {
     process.stderr.write(`Unknown --type "${opts.type}". Valid: ${validTypes.join(", ")}\n`)
@@ -775,6 +805,12 @@ export async function runGen(argv: string[]): Promise<number> {
   }
 
   const name = opts.name.toLowerCase()
+  if (!/^[a-z][a-z0-9_-]*$/.test(name)) {
+    process.stderr.write(
+      `Invalid --name "${opts.name}". Use lowercase letters, digits, "-" or "_", starting with a letter (e.g. user, legal-entity).\n`
+    )
+    return 2
+  }
   const className = toClassName(name)
   const outDir = path.resolve(opts.outDir ?? `./${name}`)
   const srcDir = path.join(outDir, "src", name)
@@ -786,21 +822,26 @@ export async function runGen(argv: string[]): Promise<number> {
 
   for (const [filePath, content] of files) {
     if (!opts.force) {
-      try { await fs.access(filePath); process.stderr.write(`Refusing to overwrite ${filePath} (use --force)\n`); return 1 } catch {}
+      try {
+        await fs.access(filePath)
+        process.stderr.write(`Refusing to overwrite ${filePath} (use --force)\n`)
+        return 1
+      } catch {}
     }
     await fs.writeFile(filePath, content, "utf8")
   }
 
   process.stdout.write(
-    `Scaffolded ${opts.transport} ${opts.type ?? "service"} "${name}" at ${outDir}\n` +
-    `Next steps:\n  cd ${outDir}\n  npm install\n  npm run dev\n`
+    `Scaffolded ${opts.transport} ${opts.type ?? "service"} "${name}" at ${outDir}\n` + `Next steps:\n  cd ${outDir}\n  npm install\n  npm run dev\n`
   )
   return 0
 }
 
 if (require.main === module) {
-  runGen(process.argv).then((code) => process.exit(code)).catch((err) => {
-    process.stderr.write(`Unexpected error: ${err?.message ?? err}\n`)
-    process.exit(1)
-  })
+  runGen(process.argv)
+    .then((code) => process.exit(code))
+    .catch((err) => {
+      process.stderr.write(`Unexpected error: ${err?.message ?? err}\n`)
+      process.exit(1)
+    })
 }

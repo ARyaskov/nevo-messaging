@@ -23,8 +23,7 @@ export function wrapSubscriptionHandler<T>(
   opts: BackpressureWrapperOptions
 ): SubscriptionHandler<T> {
   let limiter: BackpressureLimiter | null = null
-  const sub = (): PausableSubscription | undefined =>
-    typeof subscription === "function" ? subscription() : subscription
+  const sub = (): PausableSubscription | undefined => (typeof subscription === "function" ? subscription() : subscription)
   const getLimiter = () => {
     if (limiter) return limiter
     limiter = new BackpressureLimiter(opts, {
@@ -40,7 +39,9 @@ export function wrapSubscriptionHandler<T>(
     if (!lim.begin()) {
       if (overflow === "drop") return
       if (overflow === "nack") {
-        try { await ctx.nack?.("backpressure overflow") } catch {}
+        try {
+          await ctx.nack?.("backpressure overflow")
+        } catch {}
         return
       }
       throw new MessagingError(ErrorCode.RATE_LIMITED, {
@@ -72,9 +73,12 @@ export function installBackpressureFromDecorator<T>(
 export function makeBackpressureRunner<T>(
   opts: BackpressureWrapperOptions,
   subscription: PausableSubscription | (() => PausableSubscription | undefined)
-): { run: (data: T, ctx: SubscriptionContext, handler: SubscriptionHandler<T>) => Promise<void>; getInflight: () => number; isPaused: () => boolean } {
-  const sub = (): PausableSubscription | undefined =>
-    typeof subscription === "function" ? subscription() : subscription
+): {
+  run: (data: T, ctx: SubscriptionContext, handler: SubscriptionHandler<T>) => Promise<void>
+  getInflight: () => number
+  isPaused: () => boolean
+} {
+  const sub = (): PausableSubscription | undefined => (typeof subscription === "function" ? subscription() : subscription)
   const limiter = new BackpressureLimiter(opts, {
     onPause: () => sub()?.pause?.(),
     onResume: () => sub()?.resume?.()
@@ -87,7 +91,9 @@ export function makeBackpressureRunner<T>(
       if (!limiter.begin()) {
         if (overflow === "drop") return
         if (overflow === "nack") {
-          try { await ctx.nack?.("backpressure overflow") } catch {}
+          try {
+            await ctx.nack?.("backpressure overflow")
+          } catch {}
           return
         }
         throw new MessagingError(ErrorCode.RATE_LIMITED, {

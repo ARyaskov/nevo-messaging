@@ -7,14 +7,20 @@ test("ring buffer keeps only last N events", () => {
   for (let i = 0; i < 12; i++) bus.publish({ ts: i, type: "request", method: `m${i}` })
   const recent = bus.recent(100)
   assert.equal(recent.length, 5)
-  assert.deepEqual(recent.map((e) => e.method), ["m7", "m8", "m9", "m10", "m11"])
+  assert.deepEqual(
+    recent.map((e) => e.method),
+    ["m7", "m8", "m9", "m10", "m11"]
+  )
 })
 
 test("recent(N) returns last N in order", () => {
   const bus = new DevToolsBus({ maxEvents: 1000 })
   for (let i = 0; i < 100; i++) bus.publish({ ts: i, type: "response", method: `m${i}` })
   const last5 = bus.recent(5)
-  assert.deepEqual(last5.map((e) => e.method), ["m95", "m96", "m97", "m98", "m99"])
+  assert.deepEqual(
+    last5.map((e) => e.method),
+    ["m95", "m96", "m97", "m98", "m99"]
+  )
 })
 
 test("batched flush emits via setImmediate", async () => {

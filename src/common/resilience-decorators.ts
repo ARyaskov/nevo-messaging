@@ -31,8 +31,9 @@ export type AdaptiveDecoratorOptions = AdaptiveOptions & {
 
 function defineOnMethod(metaKey: string, target: any, propertyKey: string | symbol, value: unknown): void {
   const ctor = target?.constructor ?? target
-  const map =
-    (Reflect.getMetadata(metaKey, ctor) as Map<string, unknown> | undefined) ?? new Map<string, unknown>()
+  const own = Reflect.getOwnMetadata(metaKey, ctor) as Map<string, unknown> | undefined
+  const inherited = Reflect.getMetadata(metaKey, ctor) as Map<string, unknown> | undefined
+  const map = new Map<string, unknown>(own ?? inherited)
   map.set(propertyKey as string, value)
   Reflect.defineMetadata(metaKey, map, ctor)
 }

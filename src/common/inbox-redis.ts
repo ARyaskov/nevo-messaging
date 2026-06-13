@@ -5,30 +5,15 @@ import { getDefaultMetrics, NEVO_METRIC_NAMES } from "./metrics"
 
 /** Distributed inbox store backed by Redis. */
 
-/**
- * In-progress marker written by {@link RedisInboxStore.claim} before the real
- * result exists. NUL-wrapped so it can never collide with an encoded payload.
- */
+/** In-progress marker written by {@link RedisInboxStore.claim} before the real result exists. */
 const INBOX_IN_PROGRESS = " nevo:inbox:in-progress "
 
-/**
- * Marker for a handler that completed but produced no value (void / null
- * return). Distinct, non-empty, and space-wrapped (like {@link INBOX_IN_PROGRESS})
- * so it can never collide with an encoded payload — `JSON.stringify` of any
- * value either escapes its quotes or yields a non-string. Stored instead of the
- * literal `"null"` (which `readReal` treats as absent), so a finished void
- * completion is reliably reported as seen — losers must not re-run the handler —
- * while `getResult` still yields `undefined` for the actual value.
- */
+/** Marker for a handler that finished with no value (void/null), distinct from absent and from in-progress. */
 const INBOX_DONE_NO_VALUE = " nevo:inbox:done "
 
 export interface InboxRedisClient {
   get(key: string): Promise<string | null>
-  set(
-    key: string,
-    value: string,
-    options: { ttlMs: number; ifNotExists?: boolean }
-  ): Promise<"OK" | null | string>
+  set(key: string, value: string, options: { ttlMs: number; ifNotExists?: boolean }): Promise<"OK" | null | string>
   del?(key: string): Promise<number>
   exists?(key: string): Promise<number>
 }
@@ -39,14 +24,7 @@ export interface RedisInboxStoreOptions {
   ttlMs?: number
   /** How long an in-progress claim is honoured before it can be re-claimed. Default 60s. */
   claimTtlMs?: number
-  /**
-   * What to do when a Redis read (`hasSeen`/`claim`) throws.
-   * - `"open"` (default): `hasSeen` returns false / `claim` acquires — the
-   *   handler runs (at-least-once; may duplicate). A high-severity metric +
-   *   error log are emitted either way.
-   * - `"closed"`: `hasSeen` returns true (treat as already-seen) / `claim`
-   *   rethrows so the message is redelivered rather than risk a duplicate.
-   */
+  /** On a Redis read failure: `"open"` (default) run the handler; `"closed"` treat as seen / rethrow. */
   readErrorPolicy?: StoreReadErrorPolicy
   logger?: NevoLogger
   metrics?: ReturnType<typeof getDefaultMetrics>
@@ -78,21 +56,16 @@ export class RedisInboxStore implements InboxStore {
     this.metrics = opts.metrics ?? getDefaultMetrics()
   }
 
-  private k(uuid: string): string { return this.keyPrefix + uuid }
+  private k(uuid: string): string {
+    return this.keyPrefix + uuid
+  }
 
   private recordReadError(op: string, err: unknown): void {
     this.metrics.incCounter(NEVO_METRIC_NAMES.storeErrors, { store: "inbox", op, policy: this.readErrorPolicy })
-    this.logger.error(
-      { event: "inbox.redis.read.failed", op, policy: this.readErrorPolicy, err: (err as Error)?.message },
-      "Inbox read failed"
-    )
+    this.logger.error({ event: "inbox.redis.read.failed", op, policy: this.readErrorPolicy, err: (err as Error)?.message }, "Inbox read failed")
   }
 
-  /**
-   * Read the stored result VALUE, treating every sentinel / empty marker as
-   * having no value. Note this returns `undefined` for BOTH "absent" and
-   * "completed with no value" — use {@link readDone} to tell those apart.
-   */
+  /** Read the stored result value, mapping every sentinel/empty marker to `undefined`. */
   private async readReal(uuid: string): Promise<unknown | undefined> {
     const blob = await this.client.get(this.k(uuid))
     return this.decodeBlob(blob)
@@ -100,21 +73,11 @@ export class RedisInboxStore implements InboxStore {
 
   /** Decode a raw blob into a value, mapping sentinels / empties to `undefined`. */
   private decodeBlob(blob: string | null): unknown | undefined {
-    if (
-      blob === null ||
-      blob === "" ||
-      blob === "null" ||
-      blob === INBOX_IN_PROGRESS ||
-      blob === INBOX_DONE_NO_VALUE
-    ) return undefined
+    if (blob === null || blob === "" || blob === "null" || blob === INBOX_IN_PROGRESS || blob === INBOX_DONE_NO_VALUE) return undefined
     return this.decode(blob)
   }
 
-  /**
-   * Whether `uuid` holds a FINISHED result (real value or the done-no-value
-   * sentinel) — i.e. the handler ran to completion. The bare in-progress
-   * sentinel and an absent key both report `false`.
-   */
+  /** Whether `uuid` holds a finished result (real value or done-no-value sentinel). */
   private async readDone(uuid: string): Promise<boolean> {
     const blob = await this.client.get(this.k(uuid))
     if (blob === null || blob === "" || blob === INBOX_IN_PROGRESS) return false
@@ -127,16 +90,12 @@ export class RedisInboxStore implements InboxStore {
       return (await this.client.get(this.k(uuid))) !== null
     } catch (err) {
       this.recordReadError("hasSeen", err)
-      // fail-closed → assume seen (skip, no duplicate); fail-open → assume unseen.
+      // fail-closed → assume seen; fail-open → assume unseen.
       return this.readErrorPolicy === "closed"
     }
   }
 
-  /**
-   * Atomic claim: `SET uuid <sentinel> NX PX <claimTtlMs>`. The single winner
-   * gets `{ acquired: true }` and must run the handler then {@link markSeen} the
-   * result; losers get the finished result if present, else `{ acquired: false }`.
-   */
+  /** Atomic claim (`SET NX PX`): single winner gets `{ acquired: true }`; losers get the finished result if present. */
   async claim(uuid: string, opts?: { ttlMs?: number }): Promise<IdempotencyClaim<unknown>> {
     const ttlMs = opts?.ttlMs ?? this.claimTtlMs
     try {
@@ -159,18 +118,13 @@ export class RedisInboxStore implements InboxStore {
 
   async markSeen(uuid: string, result?: unknown): Promise<void> {
     try {
-      // Overwrite (no NX): the claim winner replaces its own in-progress sentinel
-      // with the real result. NX here would strand pollers behind the sentinel.
-      // A void/null completion stores a distinct done sentinel (NOT the literal
-      // "null", which reads as absent) so losers see it as finished and skip.
+      // Overwrite (no NX): the claim winner replaces its own in-progress sentinel.
+      // A void/null completion stores a distinct done sentinel so losers skip.
       const blob = result == null ? INBOX_DONE_NO_VALUE : this.encode(result)
       await this.client.set(this.k(uuid), blob, { ttlMs: this.ttlMs })
     } catch (err) {
       this.metrics.incCounter(NEVO_METRIC_NAMES.storeErrors, { store: "inbox", op: "markSeen", policy: this.readErrorPolicy })
-      this.logger.warn(
-        { event: "inbox.redis.write.failed", err: (err as Error)?.message },
-        "Inbox markSeen failed; handler may run twice"
-      )
+      this.logger.warn({ event: "inbox.redis.write.failed", err: (err as Error)?.message }, "Inbox markSeen failed; handler may run twice")
     }
   }
 
@@ -183,19 +137,13 @@ export class RedisInboxStore implements InboxStore {
     }
   }
 
-  /**
-   * Whether `uuid` holds a FINISHED result — a real value OR a void/null
-   * completion — as opposed to merely the in-progress claim sentinel (or being
-   * absent). Lets callers distinguish "done, no value" from "still running":
-   * {@link getResult} returns `undefined` for both, but only the former must
-   * stop a loser from re-executing the handler.
-   */
+  /** Whether `uuid` holds a finished result (real value or void/null completion). */
   async isDone(uuid: string): Promise<boolean> {
     try {
       return await this.readDone(uuid)
     } catch (err) {
       this.recordReadError("isDone", err)
-      // fail-closed → assume done (skip, no duplicate); fail-open → assume not.
+      // fail-closed → assume done; fail-open → assume not.
       return this.readErrorPolicy === "closed"
     }
   }

@@ -135,6 +135,8 @@ export interface CircuitBreakerOptions {
   failureThreshold?: number
   resetTimeoutMs?: number
   halfOpenSuccessThreshold?: number
+  /** Cap on distinct breaker keys kept in a registry (oldest closed circuits are evicted past it). */
+  maxKeys?: number
 }
 
 export interface IdempotencyOptions {

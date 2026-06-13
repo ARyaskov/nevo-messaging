@@ -19,7 +19,10 @@ import { getKafkaModule } from "../optional-deps"
 
 export const NEVO_KAFKA_CLIENT_TOKEN = "NEVO_KAFKA_CLIENT"
 
-interface TopicCacheEntry { topics: Set<string>; fetchedAt: number }
+interface TopicCacheEntry {
+  topics: Set<string>
+  fetchedAt: number
+}
 const ADMIN_TOPICS_CACHE = new Map<string, TopicCacheEntry>()
 const ADMIN_TOPICS_CACHE_TTL_MS = 60_000
 

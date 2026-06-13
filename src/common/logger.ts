@@ -1,6 +1,6 @@
 import { createRequire } from "node:module"
 import { isProduction } from "./env"
-import { pinoRedactPaths } from "./redact"
+import { pinoRedactPaths, redactObject } from "./redact"
 
 const nodeRequire = createRequire(__filename)
 
@@ -48,18 +48,30 @@ class ConsoleLogger implements NevoLogger {
 
   private emit(level: NevoLogLevel, obj: object | string, msg?: string): void {
     if (!this.shouldLog(level)) return
-    const payload = typeof obj === "string" ? { msg: obj } : { ...obj, ...(msg ? { msg } : {}) }
+    const payload = typeof obj === "string" ? { msg: obj } : { ...(redactObject(obj) as object), ...(msg ? { msg } : {}) }
     const merged = { level, time: Date.now(), ...this.bindings, ...payload }
     const stream = level === "error" || level === "fatal" ? console.error : level === "warn" ? console.warn : console.log
     stream(JSON.stringify(merged))
   }
 
-  trace(o: object | string, m?: string) { this.emit("trace", o, m) }
-  debug(o: object | string, m?: string) { this.emit("debug", o, m) }
-  info(o: object | string, m?: string) { this.emit("info", o, m) }
-  warn(o: object | string, m?: string) { this.emit("warn", o, m) }
-  error(o: object | string, m?: string) { this.emit("error", o, m) }
-  fatal(o: object | string, m?: string) { this.emit("fatal", o, m) }
+  trace(o: object | string, m?: string) {
+    this.emit("trace", o, m)
+  }
+  debug(o: object | string, m?: string) {
+    this.emit("debug", o, m)
+  }
+  info(o: object | string, m?: string) {
+    this.emit("info", o, m)
+  }
+  warn(o: object | string, m?: string) {
+    this.emit("warn", o, m)
+  }
+  error(o: object | string, m?: string) {
+    this.emit("error", o, m)
+  }
+  fatal(o: object | string, m?: string) {
+    this.emit("fatal", o, m)
+  }
 
   child(bindings: Record<string, unknown>): NevoLogger {
     const c = new ConsoleLogger({ level: this.level })
@@ -67,7 +79,9 @@ class ConsoleLogger implements NevoLogger {
     return c
   }
 
-  setLevel(level: NevoLogLevel) { this.level = level }
+  setLevel(level: NevoLogLevel) {
+    this.level = level
+  }
 }
 
 function tryPino(opts: NevoLoggerOptions): NevoLogger | null {
@@ -78,9 +92,7 @@ function tryPino(opts: NevoLoggerOptions): NevoLogger | null {
       level: opts.level || (isProduction() ? "info" : "debug"),
       base: opts.base,
       redact: opts.redact,
-      ...(opts.pretty && !isProduction()
-        ? { transport: { target: "pino-pretty", options: { colorize: true, translateTime: "SYS:standard" } } }
-        : {})
+      ...(opts.pretty && !isProduction() ? { transport: { target: "pino-pretty", options: { colorize: true, translateTime: "SYS:standard" } } } : {})
     })
     return wrapPino(pinoLogger)
   } catch {
@@ -89,16 +101,19 @@ function tryPino(opts: NevoLoggerOptions): NevoLogger | null {
 }
 
 function wrapPino(pino: any): NevoLogger {
+  const clean = (value: object | string): object | string => (typeof value === "string" ? value : redactObject(value))
   return {
-    trace: (o, m) => pino.trace(o, m),
-    debug: (o, m) => pino.debug(o, m),
-    info: (o, m) => pino.info(o, m),
-    warn: (o, m) => pino.warn(o, m),
-    error: (o, m) => pino.error(o, m),
-    fatal: (o, m) => pino.fatal(o, m),
-    child: (b) => wrapPino(pino.child(b)),
-    setLevel: (lvl) => { pino.level = lvl },
-    isLevelEnabled: (lvl) => typeof pino.isLevelEnabled === "function" ? pino.isLevelEnabled(lvl) : true
+    trace: (o, m) => pino.trace(clean(o), m),
+    debug: (o, m) => pino.debug(clean(o), m),
+    info: (o, m) => pino.info(clean(o), m),
+    warn: (o, m) => pino.warn(clean(o), m),
+    error: (o, m) => pino.error(clean(o), m),
+    fatal: (o, m) => pino.fatal(clean(o), m),
+    child: (b) => wrapPino(pino.child(redactObject(b))),
+    setLevel: (lvl) => {
+      pino.level = lvl
+    },
+    isLevelEnabled: (lvl) => (typeof pino.isLevelEnabled === "function" ? pino.isLevelEnabled(lvl) : true)
   }
 }
 
