@@ -27,7 +27,7 @@ import {
   ResolvedRetryOptions,
   ResolvedCompressionOptions,
   resolveRetryOptions,
-  withRetry,
+  runClientPipeline,
   resolveCompressionOptions,
   maybeCompress,
   maybeCompressAsync,
@@ -308,17 +308,18 @@ export class NevoKafkaClient implements OnModuleDestroy {
           return this.idempotencyCache.get(idempotencyKey) as T
         }
 
-        const requestUuid = uuidv7()
-        const result = await withRetry(async (attempt) => {
-          this.circuitBreaker.before(cbKey)
+        // Fresh envelope uuid per attempt keeps replay protection intact; a stable
+        // idempotency key dedupes retries server-side instead.
+        const retryIdemKey = idempotencyKey ?? uuidv7()
+        const result = await runClientPipeline<T>(this.circuitBreaker, this.retryOptions, cbKey, async (attempt) => {
           const startMs = Date.now()
           let lastUuid: string | undefined
           let lastChainId: string | undefined
           try {
             const { key, value, uuid, meta, encoding } = await this.encodeRequest(method, params, "query", {
               ...opts,
-              headers: { ...(opts?.headers || {}), "nevo-attempt": String(attempt) },
-              uuid: requestUuid
+              idempotencyKey: retryIdemKey,
+              headers: { ...(opts?.headers || {}), "nevo-attempt": String(attempt) }
             })
             lastUuid = uuid
             lastChainId = meta.nevoChainId
@@ -338,7 +339,6 @@ export class NevoKafkaClient implements OnModuleDestroy {
                 const err = payload.params.error
                 throw new MessagingError(err.code, err.details ?? { message: err.message }, err.service || normalized)
               }
-              this.circuitBreaker.onSuccess(cbKey)
               span.setStatus({ code: 1 })
               publishClientEvent(this.devtoolsBus, {
                 service: normalized,
@@ -368,7 +368,6 @@ export class NevoKafkaClient implements OnModuleDestroy {
                 this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "kafka", service: normalized, method: methodLabel(method) })
             }
           } catch (err: any) {
-            this.circuitBreaker.onFailure(cbKey, err)
             publishClientEvent(this.devtoolsBus, {
               service: normalized,
               method,
@@ -382,7 +381,7 @@ export class NevoKafkaClient implements OnModuleDestroy {
             })
             throw err
           }
-        }, this.retryOptions)
+        })
 
         if (idempotencyKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(idempotencyKey, result)
         return result
@@ -398,8 +397,13 @@ export class NevoKafkaClient implements OnModuleDestroy {
   ): Promise<void> {
     const normalized = this.ensureServiceRegistered(serviceName)
     const topic = `${normalized}-events`
-    const { key, value, encoding } = await this.encodeRequest(method, params, "emit", opts)
-    await lastValueFrom(this.kafkaClient.emit(topic, { key, value: Buffer.from(value), headers: this.toKafkaHeaders(encoding) }))
+    const idemKey = opts?.idempotencyKey ?? uuidv7()
+    return this.shutdown.trackInflight(
+      runClientPipeline<void>(this.circuitBreaker, this.retryOptions, `${normalized}:${method}`, async () => {
+        const { key, value, encoding } = await this.encodeRequest(method, params, "emit", { ...opts, idempotencyKey: idemKey })
+        await lastValueFrom(this.kafkaClient.emit(topic, { key, value: Buffer.from(value), headers: this.toKafkaHeaders(encoding) }))
+      })
+    )
   }
 
   private ensureBatchProducer(): Promise<Producer> {
@@ -596,6 +600,9 @@ export class NevoKafkaClient implements OnModuleDestroy {
           }
           if (manualAck) {
             this.scheduleResume(pause, attempts)
+          } else {
+            // Rethrow so kafkajs does not resolve the offset and redelivers the message.
+            throw err
           }
         }
       }
@@ -620,6 +627,14 @@ export class NevoKafkaClient implements OnModuleDestroy {
     handler: (data: T, context: SubscriptionContext) => Promise<void> | void
   ): Promise<Subscription> {
     const group = await this.ensureStickyGroup(groupId, manualAck)
+    // The commit mode is fixed by the group's first subscriber; a later, differing
+    // ack setting on the same groupId can't take effect on the shared consumer.
+    if (group.manualAck !== manualAck) {
+      this.logger.warn(
+        { event: "kafka.sticky.ack_mismatch", groupId, groupManualAck: group.manualAck, requested: manualAck },
+        `Sticky consumer group "${groupId}" already runs with ack=${group.manualAck}; this subscription's ack=${manualAck} is ignored. Use a distinct groupId for a different ack mode.`
+      )
+    }
     const entry: StickyHandlerEntry = {
       method,
       filter: options?.filter,
@@ -721,6 +736,7 @@ export class NevoKafkaClient implements OnModuleDestroy {
         this.boundDeliveryCounts(deliveryCounts)
 
         let retryScheduled = false
+        let redeliveryError: unknown
         for (const entry of entries) {
           if (entry.method && payload.method !== entry.method && payload.method?.split("@")[0] !== entry.method) continue
           if (!matchesFilter(entry.filter, payload.meta)) continue
@@ -755,9 +771,14 @@ export class NevoKafkaClient implements OnModuleDestroy {
               // Pause once for the whole batch of matching handlers.
               this.scheduleResume(pause, attempts)
               retryScheduled = true
+            } else if (!manualAck) {
+              redeliveryError = err
             }
           }
         }
+        // Rethrow so kafkajs does not resolve the offset and redelivers the message.
+        // Succeeded sibling handlers will run again; handlers are expected to be idempotent.
+        if (redeliveryError !== undefined) throw redeliveryError
         // Drop the per-offset counter unless a redelivery is pending.
         if (!retryScheduled) deliveryCounts.delete(msgKey)
       }

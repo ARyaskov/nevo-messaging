@@ -186,11 +186,21 @@ export abstract class BaseMessagingClient {
     return this.codec.decode<T>(data)
   }
 
+  private readonly inflightCounts = new Map<string, number>()
+
+  private bumpInflight(key: string, labels: Record<string, string>, delta: number): void {
+    const next = Math.max(0, (this.inflightCounts.get(key) ?? 0) + delta)
+    if (next === 0) this.inflightCounts.delete(key)
+    else this.inflightCounts.set(key, next)
+    this.metrics.setGauge(NEVO_METRIC_NAMES.inflight, labels, next)
+  }
+
   protected async withClientPipeline<T>(serviceName: string, method: string, fn: () => Promise<T>, resilience?: CompiledResilience): Promise<T> {
     const key = `${serviceName}:${method}`
     // Version-stripped label so `foo@v1`/`foo@v2` don't split into separate series.
     const methodName = methodLabel(method)
-    this.metrics.setGauge(NEVO_METRIC_NAMES.inflight, { service: serviceName, method: methodName }, 1)
+    const labels = { service: serviceName, method: methodName }
+    this.bumpInflight(key, labels, 1)
     try {
       return await runClientPipeline<T>(
         this.circuitBreaker,
@@ -203,7 +213,7 @@ export abstract class BaseMessagingClient {
         resilience
       )
     } finally {
-      this.metrics.setGauge(NEVO_METRIC_NAMES.inflight, { service: serviceName, method: methodName }, 0)
+      this.bumpInflight(key, labels, -1)
     }
   }
 

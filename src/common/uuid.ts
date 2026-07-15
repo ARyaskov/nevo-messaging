@@ -23,6 +23,8 @@ let monotonicCounter = 0
 
 export function uuidv7(): string {
   let ms = Date.now()
+  // Clock went backwards: stick to the last timestamp so ids stay monotonic.
+  if (ms < lastMs) ms = lastMs
   if (ms === lastMs) {
     monotonicCounter = (monotonicCounter + 1) & 0x0fff
     if (monotonicCounter === 0) ms = lastMs + 1

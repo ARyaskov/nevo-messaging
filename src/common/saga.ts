@@ -45,6 +45,8 @@ export interface SagaSnapshot<C = any> {
   type?: string
   steps: string[]
   executed: string[]
+  /** Steps whose compensation already completed, so a resume never re-runs them. */
+  compensated?: string[]
   ctx: C
   status: "pending" | "success" | "failed" | "compensating" | "compensated" | "compensation_failed"
   error?: { message: string }
@@ -56,10 +58,13 @@ export interface SagaStore {
   load(sagaId: string): Promise<SagaSnapshot | null>
   listPending(): Promise<SagaSnapshot[]>
   delete(sagaId: string): Promise<void>
+  /** Optional recovery lease: single winner per saga until `leaseMs` expires. */
+  claim?(sagaId: string, workerId: string, leaseMs: number): Promise<boolean>
 }
 
 export class InMemorySagaStore implements SagaStore {
   private readonly data = new Map<string, SagaSnapshot>()
+  private readonly claims = new Map<string, { by: string; at: number }>()
   async save(s: SagaSnapshot): Promise<void> {
     this.data.set(s.sagaId, structuredClone(s))
   }
@@ -75,6 +80,14 @@ export class InMemorySagaStore implements SagaStore {
   }
   async delete(id: string): Promise<void> {
     this.data.delete(id)
+    this.claims.delete(id)
+  }
+  async claim(sagaId: string, workerId: string, leaseMs: number): Promise<boolean> {
+    const now = Date.now()
+    const existing = this.claims.get(sagaId)
+    if (existing && existing.by !== workerId && now - existing.at < leaseMs) return false
+    this.claims.set(sagaId, { by: workerId, at: now })
+    return true
   }
 }
 
@@ -126,6 +139,9 @@ export interface SagaResumeOptions {
   dlq?: DlqSink
   metrics?: MetricsRegistry
   logger?: NevoLogger
+  /** Lease identity to renew during the resume (defaults to a fresh one). */
+  leaseOwner?: string
+  leaseMs?: number
 }
 
 export class Saga<C = any> {
@@ -136,9 +152,30 @@ export class Saga<C = any> {
   private dlq: DlqSink | null = null
   private metrics: MetricsRegistry | null = null
   private logger: NevoLogger | null = null
+  private leaseOwner = `saga-${uuidv7().slice(0, 12)}`
+  private leaseMs = 60_000
 
   constructor(type: string = DEFAULT_SAGA_TYPE) {
     this.type = type
+  }
+
+  /** Recovery-lease duration; keep it aligned with SagaRecovery's staleAfterMs. */
+  withLease(leaseMs: number): this {
+    this.leaseMs = Math.max(1_000, leaseMs)
+    return this
+  }
+
+  // Renews the store lease while the saga runs so a recovery worker never
+  // resumes a saga that is still alive, even during steps longer than the lease.
+  private startLeaseHeartbeat(): () => void {
+    const store = this.store
+    const sagaId = this.sagaId
+    if (!store || typeof store.claim !== "function" || !sagaId) return () => {}
+    const renew = () => void store.claim!(sagaId, this.leaseOwner, this.leaseMs).catch(() => {})
+    renew()
+    const timer = setInterval(renew, Math.max(1_000, Math.floor(this.leaseMs / 3)))
+    if (typeof timer.unref === "function") timer.unref()
+    return () => clearInterval(timer)
   }
 
   withStore(store: SagaStore, sagaId?: string): this {
@@ -169,13 +206,14 @@ export class Saga<C = any> {
     return this
   }
 
-  private async persist(ctx: C, executed: string[], status: SagaSnapshot["status"], error?: unknown): Promise<void> {
+  private async persist(ctx: C, executed: string[], status: SagaSnapshot["status"], error?: unknown, compensated: string[] = []): Promise<void> {
     if (!this.store || !this.sagaId) return
     await this.store.save({
       sagaId: this.sagaId,
       type: this.type,
       steps: this.steps.map((s) => s.name),
       executed,
+      compensated,
       ctx,
       status,
       error: error ? { message: error instanceof Error ? error.message : String(error) } : undefined,
@@ -185,8 +223,13 @@ export class Saga<C = any> {
 
   async run(ctx: C): Promise<SagaResult> {
     if (!this.sagaId) this.sagaId = uuidv7()
-    await this.persist(ctx, [], "pending")
-    return await this.forward(ctx, [])
+    const stopHeartbeat = this.startLeaseHeartbeat()
+    try {
+      await this.persist(ctx, [], "pending")
+      return await this.forward(ctx, [])
+    } finally {
+      stopHeartbeat()
+    }
   }
 
   // Execute steps not yet in `alreadyExecuted`, in order. Shared by run() and resume().
@@ -210,21 +253,26 @@ export class Saga<C = any> {
   }
 
   // Compensate `executed` in reverse, then settle the saga's terminal status.
-  private async fail(ctx: C, executed: string[], err: unknown): Promise<SagaResult> {
+  private async fail(ctx: C, executed: string[], err: unknown, alreadyCompensated: string[] = []): Promise<SagaResult> {
     const sagaId = this.sagaId as string
-    await this.persist(ctx, executed, "compensating", err)
-    const { compensated, failed } = await this.compensate(ctx, executed, err)
+    await this.persist(ctx, executed, "compensating", err, alreadyCompensated)
+    const { compensated, failed } = await this.compensate(ctx, executed, err, alreadyCompensated)
     if (failed.length > 0) {
       // Distinct terminal status excludes it from listPending() and keeps it visible for manual intervention.
-      await this.persist(ctx, executed, "compensation_failed", err)
+      await this.persist(ctx, executed, "compensation_failed", err, compensated)
       return { status: "failed", error: err, executed, compensated, compensationFailed: failed, sagaId }
     }
-    await this.persist(ctx, executed, "compensated", err)
+    await this.persist(ctx, executed, "compensated", err, compensated)
     return { status: "failed", error: err, executed, compensated, sagaId }
   }
 
-  private async compensate(ctx: C, executed: string[], lastErr: unknown): Promise<{ compensated: string[]; failed: string[] }> {
-    const compensated: string[] = []
+  private async compensate(
+    ctx: C,
+    executed: string[],
+    lastErr: unknown,
+    alreadyCompensated: string[] = []
+  ): Promise<{ compensated: string[]; failed: string[] }> {
+    const compensated: string[] = [...alreadyCompensated]
     const failed: string[] = []
     let snapshot: C
     try {
@@ -234,6 +282,7 @@ export class Saga<C = any> {
     }
     for (let i = executed.length - 1; i >= 0; i--) {
       const name = executed[i]
+      if (compensated.includes(name)) continue
       const original = this.steps.find((s) => s.name === name)
       if (!original?.compensate) continue
       const cAttempts = (original.compensateRetries ?? 0) + 1
@@ -242,6 +291,10 @@ export class Saga<C = any> {
           Promise.resolve(original.compensate!(snapshot, lastErr, signal))
         )
         compensated.push(name)
+        // Persist progress so a crash mid-compensation never re-runs finished undos.
+        try {
+          await this.persist(ctx, executed, "compensating", lastErr, compensated)
+        } catch {}
       } catch (compErr) {
         failed.push(name)
         await this.reportCompensationFailure(name, snapshot, lastErr, compErr, cAttempts)
@@ -297,20 +350,27 @@ export class Saga<C = any> {
     if (opts.dlq) saga.dlq = opts.dlq
     if (opts.metrics) saga.metrics = opts.metrics
     if (opts.logger) saga.logger = opts.logger
+    if (opts.leaseOwner) saga.leaseOwner = opts.leaseOwner
+    if (opts.leaseMs) saga.leaseMs = Math.max(1_000, opts.leaseMs)
 
     const ctx = snapshot.ctx as C
-    // Crashed mid-compensation: don't re-run forward steps, just finish undoing.
-    if (snapshot.status === "compensating") {
-      return await saga.fail(ctx, snapshot.executed, snapshot.error)
+    const stopHeartbeat = saga.startLeaseHeartbeat()
+    try {
+      // Crashed mid-compensation: don't re-run forward steps, just finish undoing.
+      if (snapshot.status === "compensating") {
+        return await saga.fail(ctx, snapshot.executed, snapshot.error, snapshot.compensated ?? [])
+      }
+      if (snapshot.status !== "pending") {
+        throw new MessagingError(ErrorCode.BAD_REQUEST, {
+          message: `Saga ${sagaId} is terminal (status "${snapshot.status}") and cannot be resumed`,
+          sagaId,
+          status: snapshot.status
+        })
+      }
+      return await saga.forward(ctx, snapshot.executed)
+    } finally {
+      stopHeartbeat()
     }
-    if (snapshot.status !== "pending") {
-      throw new MessagingError(ErrorCode.BAD_REQUEST, {
-        message: `Saga ${sagaId} is terminal (status "${snapshot.status}") and cannot be resumed`,
-        sagaId,
-        status: snapshot.status
-      })
-    }
-    return await saga.forward(ctx, snapshot.executed)
   }
 }
 
@@ -380,6 +440,7 @@ export class SagaRecovery<C = any> {
   private readonly metrics?: MetricsRegistry
   private readonly logger?: NevoLogger
   private readonly onError?: SagaRecoveryOptions["onError"]
+  private readonly workerId = `saga-recovery-${uuidv7().slice(0, 12)}`
   private timer?: NodeJS.Timeout
   private stopped = false
   private running = false
@@ -441,12 +502,22 @@ export class SagaRecovery<C = any> {
           )
           continue
         }
+        // Lease so concurrent recovery workers never resume the same saga.
+        if (typeof this.store.claim === "function") {
+          const owned = await this.store.claim(snapshot.sagaId, this.workerId, this.staleAfterMs)
+          if (!owned) {
+            result.skipped++
+            continue
+          }
+        }
         try {
           const r = await Saga.resume<C>(this.store, snapshot.sagaId, steps, {
             type,
             dlq: this.dlq,
             metrics: this.metrics,
-            logger: this.logger
+            logger: this.logger,
+            leaseOwner: this.workerId,
+            leaseMs: this.staleAfterMs
           })
           result.recovered++
           this.logger?.info(

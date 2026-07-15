@@ -29,7 +29,9 @@ export async function hedge<T>(fn: (attempt: number, signal: AbortSignal) => Pro
   const fireOne = (i: number) => {
     const ctrl = new AbortController()
     controllers.push(ctrl)
-    const p = fn(i + 1, ctrl.signal)
+    // Wrap so a synchronous throw from `fn` becomes a rejection instead of an
+    // uncaught exception when fired from a timer callback.
+    const p = (async () => fn(i + 1, ctrl.signal))()
     promises.push(p)
     p.then((v) => {
       if (resolved) return

@@ -33,6 +33,8 @@ export interface JwksVerifierOptions {
   requireAud?: boolean
   // On a `kid` miss, throttle JWKS refetches to at most one per this interval.
   refetchMinIntervalMs?: number
+  // Abort a JWKS fetch after this long (default 5s) so a hung IdP cannot stall request processing.
+  fetchTimeoutMs?: number
 }
 
 export interface VerifiedClaims {
@@ -155,7 +157,7 @@ export function createJwksVerifier(opts: JwksVerifierOptions): (token: string) =
   }
 
   async function fetchJwks(): Promise<JwksKey[]> {
-    const res = await fetchImpl(opts.jwksUri)
+    const res = await fetchImpl(opts.jwksUri, { signal: AbortSignal.timeout(opts.fetchTimeoutMs ?? 5_000) })
     if (!res.ok) throw new Error(`JWKS fetch failed: ${res.status}`)
     const json = (await res.json()) as JwksKeySet
     cached = { fetchedAt: Date.now(), keys: json.keys ?? [] }

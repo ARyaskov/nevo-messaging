@@ -48,26 +48,9 @@ export class JsonCodec implements Codec {
   }
 }
 
-export class JsonCodecFast implements Codec {
-  readonly name: CodecName = "json-fast"
-  readonly contentType = "application/json"
-
-  encode(value: unknown): Uint8Array {
-    const str = JSON.stringify(normalizeWireValue(value))
-    const byteLen = Buffer.byteLength(str, "utf8")
-    const buf = Buffer.allocUnsafe(byteLen)
-    buf.write(str, 0, byteLen, "utf8")
-    return buf
-  }
-
-  decode<T = unknown>(data: Uint8Array | string): T {
-    const str = typeof data === "string" ? data : textDecoder.decode(data)
-    try {
-      return JSON.parse(str, bigintReviver) as T
-    } catch (err: any) {
-      throw new MessagingError(ErrorCode.PARSE_ERROR, { message: `JSON parse error: ${err.message}` })
-    }
-  }
+/** @deprecated Identical to {@link JsonCodec}; kept as a named alias for backward compatibility. For an actually faster JSON codec use `FastJsonStringifyCodec` from `fast-json-codec`. */
+export class JsonCodecFast extends JsonCodec {
+  override readonly name: CodecName = "json-fast"
 }
 
 export class MessagePackCodec implements Codec {

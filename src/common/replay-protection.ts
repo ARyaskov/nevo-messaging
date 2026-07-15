@@ -1,6 +1,7 @@
 import { MessagingError } from "./errors"
 import { ErrorCode } from "./error-code"
 import { LruIdempotencyCache } from "./idempotency"
+import { getDefaultLogger } from "./logger"
 
 export interface ReplayGuardOptions {
   enabled?: boolean
@@ -13,16 +14,19 @@ export class ReplayGuard {
   private readonly windowMs: number
   private readonly enabled: boolean
   private readonly seen: LruIdempotencyCache<unknown>
+  private readonly maxEntries: number
+  private capacityWarned = false
 
   constructor(opts?: ReplayGuardOptions) {
     this.enabled = opts?.enabled !== false
     this.windowMs = opts?.windowMs ?? 5 * 60_000
+    this.maxEntries = opts?.maxEntries ?? 50_000
     if (opts?.sharedCache) {
       this.seen = opts.sharedCache
     } else {
       this.seen = new LruIdempotencyCache<unknown>({
         enabled: this.enabled,
-        maxEntries: opts?.maxEntries ?? 50_000,
+        maxEntries: this.maxEntries,
         ttlMs: this.windowMs
       })
     }
@@ -57,5 +61,14 @@ export class ReplayGuard {
       })
     }
     this.seen.set(uuid, true)
+    // At capacity the LRU evicts uuids that are still inside the window,
+    // silently shrinking the effective protection — surface that once.
+    if (!this.capacityWarned && this.seen.size() >= this.maxEntries) {
+      this.capacityWarned = true
+      getDefaultLogger().warn(
+        { event: "replay.capacity_reached", maxEntries: this.maxEntries, windowMs: this.windowMs },
+        "ReplayGuard cache is full; effective replay window is now shorter than configured. Increase maxEntries."
+      )
+    }
   }
 }

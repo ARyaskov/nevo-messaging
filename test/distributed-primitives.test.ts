@@ -244,12 +244,24 @@ test("PgOutboxStore.markPublished sets status=published", async () => {
 // PgInboxStore
 // ---------------------------------------------------------------------------
 
-test("PgInboxStore.markSeen uses ON CONFLICT DO NOTHING", async () => {
+test("PgInboxStore.markSeen completes a pending claim, never overwrites a done row", async () => {
   const pg = fakePg()
   const inbox = new PgInboxStore({ client: pg })
   await inbox.markSeen("u-1", { ok: true })
   const text = pg.sql.join(" ").toLowerCase()
-  assert.match(text, /on conflict \(uuid\) do nothing/)
+  assert.match(text, /on conflict \(uuid\) do update set result = excluded\.result, status = 'done'/)
+  assert.match(text, /where t\.status = 'pending'/)
+})
+
+test("PgInboxStore.claim inserts a pending row and steals only stale claims", async () => {
+  const pg = fakePg()
+  const inbox = new PgInboxStore({ client: pg })
+  await inbox.claim("u-1")
+  const text = pg.sql.join(" ").toLowerCase()
+  assert.match(text, /values \(\$1, null, 'pending'\)/)
+  assert.match(text, /on conflict \(uuid\) do update set seen_at = now\(\)/)
+  assert.match(text, /t\.status = 'pending' and t\.seen_at </)
+  assert.match(text, /returning uuid/)
 })
 
 test("PgInboxStore.prune deletes by ttl interval", async () => {

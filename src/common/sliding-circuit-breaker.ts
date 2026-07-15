@@ -1,12 +1,5 @@
-import { createRequire } from "node:module"
-import { CircuitOpenError, MessagingError } from "./errors"
-import { ErrorCode } from "./error-code"
 import type { CircuitBreakerOptions } from "./types"
-import type { CircuitState } from "./circuit-breaker"
-import { getDevToolsBus, DevToolsBus } from "./devtools"
-import type { DevToolsRegistry } from "./devtools-registry"
-
-const nodeRequire = createRequire(__filename)
+import { CircuitRegistryBase, type BaseCircuitData, type CircuitRegistryDeps, type CircuitState } from "./circuit-breaker"
 
 export interface SlidingCircuitOptions extends CircuitBreakerOptions {
   windowMs?: number
@@ -21,73 +14,27 @@ interface Bucket {
   failure: number
 }
 
-interface CircuitData {
-  state: CircuitState
+interface SlidingCircuitData extends BaseCircuitData {
   buckets: Bucket[]
-  openedAt: number
   halfOpenSuccesses: number
-  halfOpenInFlight: boolean
 }
 
-export class SlidingCircuitBreakerRegistry {
-  private readonly circuits = new Map<string, CircuitData>()
-  private readonly enabled: boolean
+/** Error-rate circuit breaker over a sliding time window. */
+export class SlidingCircuitBreakerRegistry extends CircuitRegistryBase<SlidingCircuitData> {
   private readonly windowMs: number
   private readonly bucketMs: number
   private readonly errorRateThreshold: number
   private readonly minSampleSize: number
-  private readonly resetTimeoutMs: number
-  private readonly halfOpenSuccessThreshold: number
-  private readonly maxKeys: number
-  private readonly bus: DevToolsBus
-  private readonly registry: DevToolsRegistry
 
-  constructor(opts?: SlidingCircuitOptions, deps?: { bus?: DevToolsBus; registry?: DevToolsRegistry }) {
-    this.enabled = opts?.enabled === true
+  constructor(opts?: SlidingCircuitOptions, deps?: CircuitRegistryDeps) {
+    super(opts?.enabled === true, opts?.resetTimeoutMs ?? 10_000, opts?.halfOpenSuccessThreshold ?? 1, opts?.maxKeys ?? 10_000, deps)
     this.windowMs = opts?.windowMs ?? 10_000
     this.bucketMs = opts?.bucketMs ?? 1_000
     this.errorRateThreshold = opts?.errorRateThreshold ?? 0.5
     this.minSampleSize = opts?.minSampleSize ?? 20
-    this.resetTimeoutMs = opts?.resetTimeoutMs ?? 10_000
-    this.halfOpenSuccessThreshold = opts?.halfOpenSuccessThreshold ?? 1
-    this.maxKeys = opts?.maxKeys ?? 10_000
-    this.bus = deps?.bus ?? getDevToolsBus()
-    if (deps?.registry) {
-      this.registry = deps.registry
-    } else {
-      const { getDevToolsRegistry } = nodeRequire("./devtools-registry") as typeof import("./devtools-registry")
-      this.registry = getDevToolsRegistry()
-    }
   }
 
-  isEnabled(): boolean {
-    return this.enabled
-  }
-
-  private getOrCreate(key: string): CircuitData {
-    let c = this.circuits.get(key)
-    if (!c) {
-      this.evictIfFull()
-      c = { state: "closed", buckets: [], openedAt: 0, halfOpenSuccesses: 0, halfOpenInFlight: false }
-      this.circuits.set(key, c)
-    }
-    return c
-  }
-
-  private evictIfFull(): void {
-    if (this.circuits.size < this.maxKeys) return
-    let fallback: string | undefined
-    for (const [k, v] of this.circuits) {
-      if (fallback === undefined) fallback = k
-      if (v.state === "closed") {
-        this.circuits.delete(k)
-        return
-      }
-    }
-    if (fallback !== undefined) this.circuits.delete(fallback)
-  }
-
-  private currentBucket(c: CircuitData): Bucket {
+  private currentBucket(c: SlidingCircuitData): Bucket {
     const now = Date.now()
     const last = c.buckets.length > 0 ? c.buckets[c.buckets.length - 1] : null
     if (last && now - last.startedAt < this.bucketMs) return last
@@ -98,7 +45,7 @@ export class SlidingCircuitBreakerRegistry {
     return next
   }
 
-  private aggregate(c: CircuitData): { success: number; failure: number; total: number; rate: number } {
+  private aggregate(c: SlidingCircuitData): { success: number; failure: number; total: number; rate: number } {
     const cutoff = Date.now() - this.windowMs
     let success = 0
     let failure = 0
@@ -111,85 +58,38 @@ export class SlidingCircuitBreakerRegistry {
     return { success, failure, total, rate: total > 0 ? failure / total : 0 }
   }
 
-  private emitTransition(key: string, prev: CircuitState, next: CircuitState, agg: { failure: number; success: number }): void {
-    if (prev === next) return
-    const [service = "unknown", method = "unknown"] = key.split(":")
-    this.registry.recordCircuit(key, next, { failures: agg.failure, successes: agg.success })
-    this.bus.publish({
-      ts: Date.now(),
-      type: "circuit",
-      service,
-      method,
-      extra: { key, from: prev, to: next, failures: agg.failure, successes: agg.success, mode: "sliding-window" }
-    })
+  protected newCircuit(): SlidingCircuitData {
+    return { state: "closed", buckets: [], openedAt: 0, halfOpenInFlight: false, halfOpenProbeAt: 0, halfOpenSuccesses: 0 }
   }
 
-  before(key: string): void {
-    if (!this.enabled) return
-    const c = this.getOrCreate(key)
-    if (c.state === "open") {
-      if (Date.now() - c.openedAt >= this.resetTimeoutMs) {
-        const prev = c.state
-        c.state = "half-open"
-        c.halfOpenSuccesses = 0
-        c.halfOpenInFlight = false
-        this.emitTransition(key, prev, c.state, this.aggregate(c))
-      } else {
-        const [service, method] = key.split(":")
-        throw new CircuitOpenError(service ?? "unknown", method ?? "unknown")
-      }
-    }
-    if (c.state === "half-open") {
-      if (c.halfOpenInFlight) {
-        const [service, method] = key.split(":")
-        throw new CircuitOpenError(service ?? "unknown", method ?? "unknown")
-      }
-      c.halfOpenInFlight = true
-    }
-  }
-
-  onSuccess(key: string): void {
-    if (!this.enabled) return
-    const c = this.getOrCreate(key)
-    this.currentBucket(c).success++
-    if (c.state === "half-open") {
-      c.halfOpenInFlight = false
-      c.halfOpenSuccesses++
-      if (c.halfOpenSuccesses >= this.halfOpenSuccessThreshold) {
-        const prev = c.state
-        c.state = "closed"
-        c.buckets = []
-        c.halfOpenSuccesses = 0
-        c.halfOpenInFlight = false
-        this.emitTransition(key, prev, c.state, { failure: 0, success: 0 })
-      }
-    }
-  }
-
-  onFailure(key: string, err: unknown): void {
-    if (!this.enabled) return
-    if (err instanceof MessagingError && (err.code === ErrorCode.VALIDATION_FAILED || err.code === ErrorCode.UNAUTHORIZED)) {
-      const current = this.circuits.get(key)
-      if (current?.state === "half-open") current.halfOpenInFlight = false
-      return
-    }
-    const c = this.getOrCreate(key)
-    this.currentBucket(c).failure++
-    if (c.state === "half-open") {
-      c.halfOpenInFlight = false
-      const prev = c.state
-      c.state = "open"
-      c.openedAt = Date.now()
-      this.emitTransition(key, prev, c.state, this.aggregate(c))
-      return
-    }
+  protected transitionStats(c: SlidingCircuitData): { failures: number; successes: number; extra?: Record<string, unknown> } {
     const agg = this.aggregate(c)
-    if (agg.total >= this.minSampleSize && agg.rate >= this.errorRateThreshold) {
-      const prev = c.state
-      c.state = "open"
-      c.openedAt = Date.now()
-      this.emitTransition(key, prev, c.state, agg)
-    }
+    return { failures: agg.failure, successes: agg.success, extra: { mode: "sliding-window" } }
+  }
+
+  protected recordOutcome(c: SlidingCircuitData, ok: boolean): void {
+    const bucket = this.currentBucket(c)
+    if (ok) bucket.success++
+    else bucket.failure++
+  }
+
+  protected shouldOpen(c: SlidingCircuitData): boolean {
+    const agg = this.aggregate(c)
+    return agg.total >= this.minSampleSize && agg.rate >= this.errorRateThreshold
+  }
+
+  protected onEnterHalfOpen(c: SlidingCircuitData): void {
+    c.halfOpenSuccesses = 0
+  }
+
+  protected onProbeSuccess(c: SlidingCircuitData): boolean {
+    c.halfOpenSuccesses++
+    return c.halfOpenSuccesses >= this.halfOpenSuccessThreshold
+  }
+
+  protected resetOnClose(c: SlidingCircuitData): void {
+    c.buckets = []
+    c.halfOpenSuccesses = 0
   }
 
   snapshot(): Record<string, { state: CircuitState; errorRate: number; sampleSize: number }> {

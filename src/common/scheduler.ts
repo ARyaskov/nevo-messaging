@@ -2,6 +2,7 @@ import "reflect-metadata"
 import { uuidv7 } from "./uuid"
 import { getDefaultLogger, type NevoLogger } from "./logger"
 import { nextCronTick, isValidCron, type CronOptions } from "./cron"
+import { mapLimit } from "./concurrency"
 
 export interface ScheduledTask {
   id: string
@@ -29,6 +30,8 @@ export interface ScheduledTaskStore {
   reschedule(id: string, nextRunAt: number, workerId: string, error?: string): Promise<void>
   cancel(id: string): Promise<void>
   list(filter?: { status?: ScheduledTask["status"]; limit?: number }): Promise<ScheduledTask[]>
+  /** Optional heartbeat: refresh the lease of tasks this worker is still executing. */
+  extendLease?(ids: string[], workerId: string): Promise<void>
 }
 
 export class InMemoryScheduledTaskStore implements ScheduledTaskStore {
@@ -107,6 +110,14 @@ export class InMemoryScheduledTaskStore implements ScheduledTaskStore {
     return t !== undefined && t.status === "running" && t.claimedBy === workerId
   }
 
+  async extendLease(ids: string[], workerId: string): Promise<void> {
+    const now = Date.now()
+    for (const id of ids) {
+      const t = this.map.get(id)
+      if (this.owns(t, workerId)) t.claimedAt = now
+    }
+  }
+
   async cancel(id: string): Promise<void> {
     const t = this.map.get(id)
     if (!t) return
@@ -151,6 +162,8 @@ export interface SchedulerOptions {
   maxAttempts?: number
   workerId?: string
   logger?: NevoLogger
+  /** Max handlers running at once per flush. Default min(batchSize, 8). */
+  concurrency?: number
 }
 
 export class Scheduler {
@@ -162,6 +175,7 @@ export class Scheduler {
   private readonly maxAttempts: number
   private readonly workerId: string
   private readonly logger: NevoLogger
+  private readonly concurrency: number
   private timer?: NodeJS.Timeout
   private stopped = false
 
@@ -173,6 +187,7 @@ export class Scheduler {
     this.maxAttempts = Math.max(1, opts.maxAttempts ?? 5)
     this.workerId = opts.workerId ?? `worker-${uuidv7().slice(0, 12)}`
     this.logger = (opts.logger ?? getDefaultLogger()).child({ component: "scheduler" })
+    this.concurrency = Math.max(1, opts.concurrency ?? Math.min(this.batchSize, 8))
   }
 
   registerHandler(name: string, handler: ScheduledHandler): void {
@@ -249,53 +264,77 @@ export class Scheduler {
   async flushOnce(): Promise<{ executed: number; failed: number; rescheduled: number }> {
     const now = Date.now()
     const claimed = await this.store.claimDue(this.workerId, now, this.batchSize, this.claimTtlMs)
-    let executed = 0
-    let failed = 0
-    let rescheduled = 0
-    for (const task of claimed) {
-      const handler = this.handlers.get(task.name)
-      if (!handler) {
-        await this.store.markFailed(task.id, `No handler registered for "${task.name}"`, this.workerId)
-        failed++
-        continue
-      }
-      try {
-        await handler(task.payload)
-        if (task.cron) {
-          const cronOpts = task.timezone ? { timezone: task.timezone } : undefined
-          // Next tick from the SCHEDULED runAt so a slow handler doesn't drift the cadence.
-          let next = nextCronTick(task.cron, task.runAt, cronOpts)
-          // Missed-run policy: SKIP — jump to the next tick after now.
-          const now = Date.now()
-          if (next > 0 && next <= now) next = nextCronTick(task.cron, now, cronOpts)
-          if (next > 0) {
-            await this.store.reschedule(task.id, next, this.workerId)
-            rescheduled++
-          } else {
-            await this.store.markCompleted(task.id, this.workerId)
-            executed++
-          }
+    const counters = { executed: 0, failed: 0, rescheduled: 0 }
+    if (claimed.length === 0) return counters
+
+    // Heartbeat so long handlers keep their lease instead of being reclaimed mid-run.
+    const inflightIds = new Set(claimed.map((t) => t.id))
+    let heartbeat: NodeJS.Timeout | undefined
+    if (typeof this.store.extendLease === "function") {
+      heartbeat = setInterval(() => {
+        void this.store.extendLease!([...inflightIds], this.workerId).catch((err: unknown) => {
+          this.logger.warn({ event: "scheduler.lease.extend_failed", err: (err as Error)?.message })
+        })
+      }, Math.max(1000, Math.floor(this.claimTtlMs / 2)))
+      if (typeof heartbeat.unref === "function") heartbeat.unref()
+    }
+
+    try {
+      await mapLimit(claimed, this.concurrency, async (task) => {
+        try {
+          await this.runClaimedTask(task, counters)
+        } finally {
+          inflightIds.delete(task.id)
+        }
+      })
+    } finally {
+      if (heartbeat) clearInterval(heartbeat)
+    }
+    return counters
+  }
+
+  private async runClaimedTask(task: ScheduledTask, counters: { executed: number; failed: number; rescheduled: number }): Promise<void> {
+    const handler = this.handlers.get(task.name)
+    if (!handler) {
+      await this.store.markFailed(task.id, `No handler registered for "${task.name}"`, this.workerId)
+      counters.failed++
+      return
+    }
+    try {
+      await handler(task.payload)
+      if (task.cron) {
+        const cronOpts = task.timezone ? { timezone: task.timezone } : undefined
+        // Next tick from the SCHEDULED runAt so a slow handler doesn't drift the cadence.
+        let next = nextCronTick(task.cron, task.runAt, cronOpts)
+        // Missed-run policy: SKIP — jump to the next tick after now.
+        const now = Date.now()
+        if (next > 0 && next <= now) next = nextCronTick(task.cron, now, cronOpts)
+        if (next > 0) {
+          await this.store.reschedule(task.id, next, this.workerId)
+          counters.rescheduled++
         } else {
           await this.store.markCompleted(task.id, this.workerId)
-          executed++
+          counters.executed++
         }
-      } catch (err) {
-        const error = (err as Error)?.message ?? String(err)
-        if (task.cron && task.attempts + 1 >= task.maxAttempts) {
-          const cronOpts = task.timezone ? { timezone: task.timezone } : undefined
-          const next = nextCronTick(task.cron, Date.now(), cronOpts)
-          if (next > 0) {
-            await this.store.reschedule(task.id, next, this.workerId, error)
-            failed++
-            rescheduled++
-            continue
-          }
-        }
-        await this.store.markFailed(task.id, error, this.workerId)
-        failed++
+      } else {
+        await this.store.markCompleted(task.id, this.workerId)
+        counters.executed++
       }
+    } catch (err) {
+      const error = (err as Error)?.message ?? String(err)
+      if (task.cron && task.attempts + 1 >= task.maxAttempts) {
+        const cronOpts = task.timezone ? { timezone: task.timezone } : undefined
+        const next = nextCronTick(task.cron, Date.now(), cronOpts)
+        if (next > 0) {
+          await this.store.reschedule(task.id, next, this.workerId, error)
+          counters.failed++
+          counters.rescheduled++
+          return
+        }
+      }
+      await this.store.markFailed(task.id, error, this.workerId)
+      counters.failed++
     }
-    return { executed, failed, rescheduled }
   }
 
   private async enqueue(

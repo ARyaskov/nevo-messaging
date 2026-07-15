@@ -23,6 +23,8 @@ export function resolveRetryOptions(opts?: RetryOptions): ResolvedRetryOptions {
   }
 }
 
+const RETRYABLE_SYSCALL_CODES = new Set(["ECONNRESET", "ENOTFOUND", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "EAI_AGAIN", "ECONNABORTED"])
+
 export function shouldRetry(err: unknown, opts: ResolvedRetryOptions): boolean {
   if (!opts.enabled) return false
   if (err instanceof MessagingError) {
@@ -31,11 +33,23 @@ export function shouldRetry(err: unknown, opts: ResolvedRetryOptions): boolean {
     if (err.retryable) return true
     return isRetryable(err.code)
   }
+  const sysCode = (err as { code?: unknown })?.code
+  if (typeof sysCode === "string" && RETRYABLE_SYSCALL_CODES.has(sysCode)) return true
   if (err instanceof Error && /timeout|ECONNRESET|ENOTFOUND|ECONNREFUSED/i.test(err.message)) return true
   return false
 }
 
-export function computeDelay(attempt: number, opts: ResolvedRetryOptions): number {
+// A server-provided retry-after hint (e.g. rate limiting) overrides the exponential backoff.
+export function retryAfterHintMs(err: unknown): number | null {
+  if (!(err instanceof MessagingError)) return null
+  const hint = err.details["retryAfterMs"]
+  if (typeof hint !== "number" || !Number.isFinite(hint) || hint <= 0) return null
+  return Math.min(hint, 30_000)
+}
+
+export function computeDelay(attempt: number, opts: ResolvedRetryOptions, err?: unknown): number {
+  const hint = retryAfterHintMs(err)
+  if (hint !== null) return hint
   const exp = Math.min(opts.maxMs, opts.baseMs * Math.pow(2, attempt - 1))
   if (!opts.jitter) return exp
   return Math.floor(Math.random() * exp)
@@ -51,7 +65,7 @@ export async function withRetry<T>(fn: (attempt: number) => Promise<T>, opts: Re
     } catch (err) {
       lastErr = err
       if (attempt >= opts.maxAttempts || !shouldRetry(err, opts)) throw err
-      const delay = computeDelay(attempt, opts)
+      const delay = computeDelay(attempt, opts, err)
       await sleep(delay, undefined, { signal })
     }
   }

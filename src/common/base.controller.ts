@@ -15,7 +15,6 @@ import {
   MetricsOptions,
   TracingOptions
 } from "./types"
-import { createAccessDeniedError, extractCallerService, isAccessAllowed, logAccessDenied } from "./access-control"
 import { suggestClosestMethod } from "./levenshtein"
 import { getDefaultLogger, NevoLogger } from "./logger"
 import { LruIdempotencyCache } from "./idempotency"
@@ -23,8 +22,8 @@ import type { IdempotencyStore } from "./idempotency-store"
 import { TwoTierIdempotency } from "./idempotency-runtime"
 import { ReplayGuard } from "./replay-protection"
 import { getSchemaFor, toValidator } from "./schema"
-import { parseMethod, isVersionCompatible, DEFAULT_METHOD_VERSION } from "./version"
-import { getDefaultMetrics, NEVO_METRIC_NAMES, methodLabel } from "./metrics"
+import { isVersionCompatible, parseMethod, DEFAULT_METHOD_VERSION } from "./version"
+import { getDefaultMetrics, methodLabel } from "./metrics"
 import { getDefaultTracer, NevoTracer, runWithSpan, SpanLike } from "./tracing"
 import { DlqRouter } from "./dlq"
 import { RateLimiter, resolveRateLimiter, RateLimiterOptions } from "./rate-limit"
@@ -33,7 +32,13 @@ import { NEVO_HEALTH_METHOD, NEVO_LIVENESS_METHOD, NEVO_READINESS_METHOD, Health
 import { getDevToolsBus, DevToolsBus } from "./devtools"
 import { runInChain, resolveInboundChainId } from "./chain-context"
 import { AuditLog } from "./audit-log"
-import { assertTenantAllowed } from "./tenant-policy"
+import {
+  runDispatchPipeline,
+  shapeDispatchError,
+  type DispatchPipelineConfig,
+  type DispatchStrategyArgs,
+  type DispatchStrategyResult
+} from "./dispatch-pipeline"
 
 export abstract class BaseMessageController {
   protected readonly methodRegistry: ServiceMethodMapping = {}
@@ -71,6 +76,7 @@ export abstract class BaseMessageController {
   protected readonly devtoolsBus: DevToolsBus | null
   /** Optional append-only audit log. */
   protected readonly auditLog?: AuditLog
+  private _pipelineCfg: DispatchPipelineConfig | null = null
 
   protected constructor(
     serviceName: string,
@@ -263,229 +269,114 @@ export abstract class BaseMessageController {
     return null
   }
 
+  private pipelineCfg(): DispatchPipelineConfig {
+    if (!this._pipelineCfg) {
+      this._pipelineCfg = {
+        serviceName: this.serviceName,
+        topic: this.serviceName,
+        logger: this.logger,
+        metrics: getDefaultMetrics(),
+        devtoolsBus: this.devtoolsBus,
+        auditLog: this.auditLog,
+        replayGuard: this.replayGuard,
+        rateLimiter: this.rateLimiter,
+        idem: this.idem,
+        dlq: this.dlq,
+        accessControl: this.accessControl,
+        before: this.beforeHook,
+        after: this.afterHook,
+        disableBuiltinHandlers: this.disableBuiltinHandlers,
+        methodLabelFor: (m) => this.metricMethodLabel(m ?? ""),
+        builtin: (_parsedName, method, uuid, meta) => this.handleBuiltinMethod(method, uuid, meta)
+      }
+    }
+    return this._pipelineCfg
+  }
+
+  // Registry-based dispatch strategy for the shared pipeline.
+  private async dispatchRegistered(args: DispatchStrategyArgs): Promise<DispatchStrategyResult> {
+    const { parsed, processedParams, uuid, method, meta } = args
+
+    const handler = this.methodRegistry[parsed.name] ?? this.methodRegistry[method]
+    if (!handler) {
+      const suggestion = suggestClosestMethod(parsed.name, Object.keys(this.methodRegistry))
+      const message = suggestion
+        ? `Invalid method name '${parsed.name}', did you mean '${suggestion}'?`
+        : `Method handler not found: ${parsed.name}`
+      return { response: shapeDispatchError(this.serviceName, uuid, method, new MessagingError(ErrorCode.METHOD_NOT_FOUND, { message }), meta) }
+    }
+
+    if (handler.version && parsed.version && !isVersionCompatible(parsed.version, handler.version)) {
+      const message = `Version mismatch for ${parsed.name}: requested ${parsed.version}, available ${handler.version}`
+      return { response: shapeDispatchError(this.serviceName, uuid, method, new MessagingError(ErrorCode.UNSUPPORTED_VERSION, { message }), meta) }
+    }
+
+    const invokeWithSpan = async (span: SpanLike | null): Promise<unknown> => {
+      try {
+        const value = await this.executeHandler(handler, processedParams)
+        span?.setStatus({ code: 1 })
+        return value
+      } catch (err) {
+        span?.recordException(err)
+        span?.setStatus({ code: 2, message: (err as Error)?.message })
+        throw err
+      }
+    }
+
+    const result: unknown = this.tracer
+      ? await runWithSpan(
+          this.tracer,
+          `nevo.serve ${this.serviceName}.${parsed.name}`,
+          {
+            "nevo.method": method,
+            "nevo.service": this.serviceName
+          },
+          meta,
+          invokeWithSpan
+        )
+      : await invokeWithSpan(null)
+    const formattedResult = await this.formatResult(result)
+
+    return { response: { uuid, method, params: { result: formattedResult as any }, meta }, result: formattedResult }
+  }
+
   async processMessage(data: any): Promise<MessageResponse> {
-    const metrics = getDefaultMetrics()
-    const nowMs = Date.now()
-    const startMs = nowMs
-    const { method, uuid, params, meta } = this.extractMessageData(data)
-    const success = true
+    const startMs = Date.now()
+    let method = ""
+    let uuid = ""
+    let params: any
+    let meta: MessageMeta | undefined
+    let malformed = false
+    try {
+      ;({ method, uuid, params, meta } = this.extractMessageData(data))
+    } catch {
+      malformed = true
+      method = String((data as any)?.method ?? "")
+      uuid = String((data as any)?.uuid ?? "")
+    }
 
     // Establish a chain context so outbound calls inherit the same chain id.
     const chainId = resolveInboundChainId(meta?.nevoChainId)
-    return runInChain({ chainId, parentUuid: uuid }, () =>
-      this.runProcessMessage(data, method, uuid, params, meta, nowMs, startMs, success, chainId, metrics)
-    )
-  }
-
-  private async runProcessMessage(
-    data: any,
-    method: string,
-    uuid: string,
-    params: any,
-    meta: MessageMeta | undefined,
-    nowMs: number,
-    startMs: number,
-    successInit: boolean,
-    chainId: string,
-    metrics: ReturnType<typeof getDefaultMetrics>
-  ): Promise<MessageResponse> {
-    let success = successInit
-    let idemKey: string | undefined
-    let idemBegan = false
-    let idemCommitted = false
-
-    const baseContext = { method, serviceName: this.serviceName, uuid, rawData: data, meta }
-    const requestContext = { ...baseContext, params }
-    let capturedError: any = null
-    let finalResponse: MessageResponse | null = null
-    let auditCaller: string | null = null
-
-    try {
-      await this.systemBeforeHook(requestContext)
-
-      try {
-        this.replayGuard.check(uuid, meta?.ts)
-      } catch (err: any) {
-        success = false
-        await this.dlq.route({
-          topic: this.serviceName,
-          reason: "replay",
-          error: err instanceof MessagingError ? err.toJSON() : { message: err?.message ?? String(err) },
-          meta,
-          rawPayload: data,
-          ts: nowMs
-        })
-        return this.createErrorResponse(uuid, method, err, meta)
-      }
-
-      const callerService = await extractCallerService(meta, this.accessControl?.jwtVerifier)
-      auditCaller = callerService ?? null
-      const parsed = parseMethod(method)
-      const topic = this.serviceName
-
-      if (this.rateLimiter.isEnabled()) {
-        this.rateLimiter.check({ topic, method: parsed.name, callerService, tenantId: meta?.tenantId, meta })
-      }
-
-      // Tenant kill-switch — checked after rate-limit.
-      assertTenantAllowed(this.serviceName, meta?.tenantId)
-
-      if (!isAccessAllowed(this.accessControl, topic, parsed.name, callerService)) {
-        logAccessDenied(this.accessControl, { topic, method, serviceName: this.serviceName, callerService })
-        success = false
-        finalResponse = {
-          uuid,
-          method,
-          params: { result: "error", error: createAccessDeniedError(method, this.serviceName, callerService) },
-          meta
-        }
-        return finalResponse
-      }
-
-      if (!this.disableBuiltinHandlers) {
-        const builtin = await this.handleBuiltinMethod(method, uuid, meta)
-        if (builtin) {
-          finalResponse = builtin
-          return builtin
-        }
-      }
-
-      // Idempotency (claim-before-execute): dedup on idempotencyKey, else uuid,
-      // scoped by caller identity so one caller's key never serves another's cache.
-      const baseIdemKey = meta?.idempotencyKey || uuid
-      idemKey = baseIdemKey ? `${callerService ?? "anon"}::${meta?.tenantId ?? ""}::${baseIdemKey}` : undefined
-      if (idemKey && this.idem.isEnabled()) {
-        const began = await this.idem.begin(idemKey)
-        if (began.status === "hit") return { ...began.value, uuid, meta }
-        idemBegan = true
-      }
-
-      let processedParams = params
-      if (this.beforeHook) {
-        const hookResult = await this.beforeHook(requestContext)
-        if (hookResult !== undefined) processedParams = hookResult
-      }
-
-      const handler = this.methodRegistry[parsed.name] ?? this.methodRegistry[method]
-      if (!handler) {
-        const suggestion = suggestClosestMethod(parsed.name, Object.keys(this.methodRegistry))
-        const message = suggestion
-          ? `Invalid method name '${parsed.name}', did you mean '${suggestion}'?`
-          : `Method handler not found: ${parsed.name}`
-        throw new MessagingError(ErrorCode.METHOD_NOT_FOUND, { message })
-      }
-
-      if (handler.version && parsed.version && !isVersionCompatible(parsed.version, handler.version)) {
-        throw new MessagingError(ErrorCode.UNSUPPORTED_VERSION, {
-          message: `Version mismatch for ${parsed.name}: requested ${parsed.version}, available ${handler.version}`
-        })
-      }
-
-      const invokeWithSpan = async (span: SpanLike | null): Promise<unknown> => {
-        try {
-          const value = await this.executeHandler(handler, processedParams)
-          span?.setStatus({ code: 1 })
-          return value
-        } catch (err) {
-          span?.recordException(err)
-          span?.setStatus({ code: 2, message: (err as Error)?.message })
-          throw err
-        }
-      }
-
-      const result: unknown = this.tracer
-        ? await runWithSpan(
-            this.tracer,
-            `nevo.serve ${this.serviceName}.${parsed.name}`,
-            {
-              "nevo.method": method,
-              "nevo.service": this.serviceName
-            },
-            meta,
-            invokeWithSpan
-          )
-        : await invokeWithSpan(null)
-      const formattedResult = await this.formatResult(result)
-
-      let response: MessageResponse = { uuid, method, params: { result: formattedResult }, meta }
-
-      const responseContext = { ...baseContext, params: processedParams, result: formattedResult, response }
-
-      if (this.afterHook) {
-        const hookResponse = await this.afterHook(responseContext)
-        if (hookResponse !== undefined) response = hookResponse
-      }
-
-      await this.systemAfterHook({ ...responseContext, response })
-
-      // Commit the idempotency result (errors are not cached).
-      if (idemKey && idemBegan && response.params.result !== "error") {
-        await this.idem.commit(idemKey, response)
-        idemCommitted = true
-      }
-      finalResponse = response
+    return runInChain({ chainId, parentUuid: uuid }, async () => {
+      await this.systemBeforeHook({ method, serviceName: this.serviceName, uuid, rawData: data, meta, params })
+      const response = await runDispatchPipeline(
+        this.pipelineCfg(),
+        // A malformed envelope dispatches with an empty method → BAD_REQUEST.
+        { data, method: malformed ? "" : method, uuid, params, meta, chainId, startMs },
+        (strategyArgs) => this.dispatchRegistered(strategyArgs)
+      )
+      await this.systemAfterHook({
+        method,
+        serviceName: this.serviceName,
+        uuid,
+        rawData: data,
+        meta,
+        params,
+        result: response.params.result === "error" ? undefined : response.params.result,
+        response
+      })
       return response
-    } catch (error: any) {
-      success = false
-      capturedError = error
-      if (this.debug) this.logger.debug({ event: "ctl.error", err: error?.message }, "Handler raised")
-      try {
-        await this.dlq.route({
-          topic: this.serviceName,
-          reason: "handler-error",
-          error: error instanceof MessagingError ? error.toJSON() : { message: error?.message ?? String(error) },
-          meta,
-          rawPayload: data,
-          ts: nowMs
-        })
-      } catch {}
-      finalResponse = this.createErrorResponse(uuid, method, error, meta)
-      return finalResponse
-    } finally {
-      const durationMs = Date.now() - startMs
-      const labels = { service: this.serviceName, method: this.metricMethodLabel(method), status: success ? "ok" : "error" }
-      metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, labels)
-      if (!success) metrics.incCounter(NEVO_METRIC_NAMES.requestErrors, labels)
-      metrics.observeHistogram(NEVO_METRIC_NAMES.requestDuration, labels, durationMs / 1000)
-      if (this.devtoolsBus) {
-        try {
-          const err = capturedError
-          this.devtoolsBus.publish({
-            ts: nowMs,
-            type: success ? "response" : "error",
-            service: this.serviceName,
-            method,
-            uuid,
-            chainId: meta?.nevoChainId ?? chainId,
-            parentUuid: meta?.nevoParentUuid,
-            durationMs,
-            status: success ? "ok" : "error",
-            error: err ? { code: err instanceof MessagingError ? err.code : err?.code, message: err?.message ?? String(err) } : undefined
-          })
-        } catch {}
-      }
-      if (this.auditLog?.isEnabled() && finalResponse) {
-        // Fire-and-forget.
-        Promise.resolve(
-          this.auditLog.recordFromResponse({
-            service: this.serviceName,
-            method,
-            uuid,
-            startedAt: startMs,
-            params,
-            response: finalResponse,
-            meta,
-            caller: auditCaller
-          })
-        ).catch(() => {})
-      }
-      // Release a still-held claim when no result was committed.
-      if (idemKey && idemBegan && !idemCommitted) {
-        try {
-          await this.idem.release(idemKey)
-        } catch {}
-      }
-    }
+    })
   }
 
   protected abstract extractMessageData(data: any): { method: string; uuid: string; params: any; meta?: MessageMeta }

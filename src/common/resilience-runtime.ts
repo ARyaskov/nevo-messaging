@@ -77,8 +77,30 @@ export function readMethodResilience(target: any, propertyKey: string): Compiled
   }
 }
 
+// Bounded: with keyBy tenant/caller dimensions the key space is caller-controlled.
+const MAX_RUNTIME_KEYS = 10_000
 const adaptiveByKey = new Map<string, AdaptiveTuner>()
 const backpressureByKey = new Map<string, BackpressureLimiter>()
+
+// Map insertion order doubles as the LRU list: refresh on hit, evict oldest on overflow.
+function lruGet<V>(map: Map<string, V>, key: string): V | undefined {
+  const v = map.get(key)
+  if (v !== undefined) {
+    map.delete(key)
+    map.set(key, v)
+  }
+  return v
+}
+
+function lruEvict<V>(map: Map<string, V>, canEvict?: (v: V) => boolean): void {
+  if (map.size < MAX_RUNTIME_KEYS) return
+  for (const [k, v] of map) {
+    if (!canEvict || canEvict(v)) {
+      map.delete(k)
+      return
+    }
+  }
+}
 
 // Keyed on `globalThis` so multiple imports share state across re-imports.
 // Registries are keyed per option-set: each distinct decorator config gets its
@@ -117,8 +139,9 @@ function getCountRegistry(opts: CircuitBreakerDecoratorOptions): CircuitBreakerR
 }
 
 function getAdaptive(key: string, opts: AdaptiveOptions): AdaptiveTuner {
-  let t = adaptiveByKey.get(key)
+  let t = lruGet(adaptiveByKey, key)
   if (!t) {
+    lruEvict(adaptiveByKey)
     t = new AdaptiveTuner({ enabled: true, ...opts })
     adaptiveByKey.set(key, t)
   }
@@ -126,8 +149,9 @@ function getAdaptive(key: string, opts: AdaptiveOptions): AdaptiveTuner {
 }
 
 function getBackpressureLimiter(key: string, opts: BackpressureOptions, subscription?: PausableSubscription): BackpressureLimiter {
-  let l = backpressureByKey.get(key)
+  let l = lruGet(backpressureByKey, key)
   if (!l) {
+    lruEvict(backpressureByKey, (limiter) => limiter.getInflight() === 0)
     l = new BackpressureLimiter(opts, {
       onPause: () => subscription?.pause?.(),
       onResume: () => subscription?.resume?.()

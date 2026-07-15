@@ -15,7 +15,7 @@
     "emitDecoratorMetadata": true,
     "resolveJsonModule": true,
     "noEmitOnError": true,
-    "noImplicitAny": false
+    "noImplicitAny": true
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist", "devtools", "test", "examples", "**/*.test.ts", "**/*.spec.ts"]

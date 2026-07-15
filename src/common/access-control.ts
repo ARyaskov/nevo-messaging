@@ -106,12 +106,25 @@ function compile(config: AccessControlConfig): CompiledAcl {
   const cached = COMPILED.get(config)
   if (cached) return cached
 
+  // Secure default: once any rule exists, unmatched methods are DENIED unless
+  // allowAllByDefault is explicitly true. A config with no rules stays open.
+  const hasRules = (config.rules?.length ?? 0) > 0
+  const allowAllByDefault = config.allowAllByDefault ?? !hasRules
+  if (hasRules && config.allowAllByDefault === undefined) {
+    try {
+      getDefaultLogger().warn(
+        { event: "acl.implicit_default_deny" },
+        "[NevoMessaging][ACL] rules are configured without allowAllByDefault; methods not matched by any rule are DENIED. Set allowAllByDefault: true to opt out."
+      )
+    } catch {}
+  }
+
   const compiled: CompiledAcl = {
     globalDefault: [],
     byTopic: new Map(),
     byMethod: new Map(),
     byTopicMethod: new Map(),
-    allowAllByDefault: config.allowAllByDefault !== false,
+    allowAllByDefault,
     logDenied: config.logDenied !== false,
     jwtVerifier: config.jwtVerifier
   }
@@ -171,7 +184,9 @@ export function isAccessAllowed(config: AccessControlConfig | undefined, topic: 
   if (mRules) candidates.push(...mRules)
   if (compiled.globalDefault.length) candidates.push(...compiled.globalDefault)
 
-  if (candidates.length === 0) return compiled.allowAllByDefault
+  // Built-in introspection methods (contract, health) stay reachable under the
+  // deny-default; an explicit matching rule still overrides this.
+  if (candidates.length === 0) return compiled.allowAllByDefault || method.startsWith("nevo.")
 
   // Deny is authoritative: a matching deny in any candidate rule wins over any allow.
   for (const rule of candidates) {

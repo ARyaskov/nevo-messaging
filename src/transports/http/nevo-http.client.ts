@@ -27,7 +27,7 @@ import {
   ResolvedRetryOptions,
   ResolvedCompressionOptions,
   resolveRetryOptions,
-  withRetry,
+  runClientPipeline,
   resolveCompressionOptions,
   maybeCompress,
   maybeCompressAsync,
@@ -70,6 +70,19 @@ export interface NevoHttpClientOptions extends TransportClientOptions {
   socketKeepAliveMs?: number
   recvBufferSize?: number
   cacheableDns?: boolean | { ttl?: number; maxTtl?: number }
+  /** Reconnect an SSE subscription if no frame (message or heartbeat) arrives within this window. Default 40s. */
+  sseIdleTimeoutMs?: number
+  /** TLS / mTLS material for https targets (client cert, custom CA, SNI). */
+  tls?: {
+    ca?: string | Buffer | Array<string | Buffer>
+    cert?: string | Buffer
+    key?: string | Buffer
+    passphrase?: string
+    /** Reject servers whose certificate can't be verified. Default true — do not disable in production. */
+    rejectUnauthorized?: boolean
+    servername?: string
+    minVersion?: import("node:tls").SecureVersion
+  }
 }
 
 export class NevoHttpClient {
@@ -106,6 +119,7 @@ export class NevoHttpClient {
   private readonly metaStaticPart: Pick<MessageMeta, "service" | "instanceId" | "auth" | "codec">
   private readonly tcpNoDelay: boolean = true
   private readonly recvBufferSize?: number
+  private readonly sseIdleTimeoutMs: number
   private readonly useUndici: boolean
   private readonly undiciDispatcher?: { close(): Promise<void> | void }
   private readonly undiciRequest?: (url: string, opts: Record<string, unknown>) => Promise<any>
@@ -152,8 +166,26 @@ export class NevoHttpClient {
     const maxSockets = options?.maxSockets ?? Infinity
     const maxFreeSockets = options?.maxFreeSockets ?? 256
     const keepAliveMsecs = options?.socketKeepAliveMs ?? 1000
+    const tls = options?.tls
+    this.sseIdleTimeoutMs = options?.sseIdleTimeoutMs ?? 40_000
     this.httpAgent = new http.Agent({ keepAlive, maxSockets, maxFreeSockets, keepAliveMsecs })
-    this.httpsAgent = new https.Agent({ keepAlive, maxSockets, maxFreeSockets, keepAliveMsecs })
+    this.httpsAgent = new https.Agent({
+      keepAlive,
+      maxSockets,
+      maxFreeSockets,
+      keepAliveMsecs,
+      ...(tls
+        ? {
+            ca: tls.ca,
+            cert: tls.cert,
+            key: tls.key,
+            passphrase: tls.passphrase,
+            rejectUnauthorized: tls.rejectUnauthorized,
+            servername: tls.servername,
+            minVersion: tls.minVersion
+          }
+        : {})
+    })
     this.useUndici = options?.useUndici === true
     if (this.useUndici) {
       try {
@@ -164,7 +196,20 @@ export class NevoHttpClient {
         this.undiciDispatcher = new undici.Agent({
           connections: Number.isFinite(maxSockets) ? maxSockets : undefined,
           keepAliveTimeout: keepAliveMsecs,
-          keepAliveMaxTimeout: Math.max(keepAliveMsecs, 10_000)
+          keepAliveMaxTimeout: Math.max(keepAliveMsecs, 10_000),
+          ...(tls
+            ? {
+                connect: {
+                  ca: tls.ca,
+                  cert: tls.cert,
+                  key: tls.key,
+                  passphrase: tls.passphrase,
+                  rejectUnauthorized: tls.rejectUnauthorized,
+                  servername: tls.servername,
+                  minVersion: tls.minVersion
+                }
+              }
+            : {})
         })
         this.undiciRequest = undici.request
       } catch (err: any) {
@@ -327,6 +372,8 @@ export class NevoHttpClient {
     }
 
     const { promise, resolve, reject } = Promise.withResolvers<{ status: number; body: Uint8Array; headers: Record<string, string> }>()
+    // Cap the raw download so a broken/hostile server can't OOM the client.
+    const wireCap = this.maxPayloadBytes
     const req = lib.request(reqOpts, (res) => {
       if (this.recvBufferSize) {
         try {
@@ -334,11 +381,25 @@ export class NevoHttpClient {
         } catch {}
       }
       const expected = Number(res.headers["content-length"])
+      if (Number.isFinite(expected) && expected > wireCap) {
+        clearTimeout(deadline)
+        req.destroy()
+        reject(new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, { message: `Response content-length ${expected}B exceeds ${wireCap}B`, size: expected, limit: wireCap }))
+        return
+      }
       const knownLen = Number.isFinite(expected) && expected > 0 ? expected : -1
       let preBuf: Buffer | null = knownLen > 0 ? Buffer.allocUnsafe(knownLen) : null
       let offset = 0
       const chunks: Buffer[] = []
+      let received = 0
       res.on("data", (c: Buffer) => {
+        received += c.length
+        if (received > wireCap) {
+          clearTimeout(deadline)
+          req.destroy()
+          reject(new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, { message: `Response body exceeds ${wireCap}B`, limit: wireCap }))
+          return
+        }
         if (preBuf) {
           if (offset + c.length > preBuf.length) {
             const grown = Buffer.allocUnsafe(offset + c.length)
@@ -416,17 +477,34 @@ export class NevoHttpClient {
         },
         body
       })
-      const arrayBuffer = await response.body.arrayBuffer()
       const responseHeaders: Record<string, string> = {}
       for (const [key, value] of Object.entries(response.headers ?? {})) {
         responseHeaders[key] = Array.isArray(value) ? value.join(",") : String(value)
       }
+      // Stream the body under a cap so a broken/hostile server can't OOM the client.
+      const wireCap = this.maxPayloadBytes
+      const declared = Number(responseHeaders["content-length"])
+      if (Number.isFinite(declared) && declared > wireCap) {
+        controller.abort()
+        throw new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, { message: `Response content-length ${declared}B exceeds ${wireCap}B`, size: declared, limit: wireCap })
+      }
+      const parts: Buffer[] = []
+      let received = 0
+      for await (const chunk of response.body as AsyncIterable<Buffer>) {
+        received += chunk.length
+        if (received > wireCap) {
+          controller.abort()
+          throw new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, { message: `Response body exceeds ${wireCap}B`, limit: wireCap })
+        }
+        parts.push(chunk)
+      }
       return {
         status: Number(response.statusCode) || 0,
-        body: new Uint8Array(arrayBuffer),
+        body: new Uint8Array(Buffer.concat(parts, received)),
         headers: responseHeaders
       }
     } catch (err) {
+      if (err instanceof MessagingError) throw err
       if (controller.signal.aborted) throw new Error("timeout")
       throw err
     } finally {
@@ -450,16 +528,17 @@ export class NevoHttpClient {
           return this.idempotencyCache.get(opts.idempotencyKey) as T
         }
 
-        const requestUuid = uuidv7()
-        const result = await withRetry(async (attempt) => {
-          this.circuitBreaker.before(cbKey)
+        // Fresh envelope uuid per attempt keeps replay protection intact; a stable
+        // idempotency key dedupes retries server-side instead.
+        const retryIdemKey = opts?.idempotencyKey ?? uuidv7()
+        const result = await runClientPipeline<T>(this.circuitBreaker, this.retryOptions, cbKey, async (attempt) => {
           const startMs = Date.now()
           let lastUuid: string | undefined
           let lastChainId: string | undefined
           try {
             const { buf, encoding, uuid, meta } = await this.createBody(method, params, "query", {
               ...opts,
-              uuid: requestUuid,
+              idempotencyKey: retryIdemKey,
               headers: { ...(opts?.headers || {}), "nevo-attempt": String(attempt) }
             })
             lastUuid = uuid
@@ -495,7 +574,6 @@ export class NevoHttpClient {
               }
               // Non-envelope error status must not count as success.
               if (res.status >= 400) throw httpStatusToError(res.status, serviceName)
-              this.circuitBreaker.onSuccess(cbKey)
               span.setStatus({ code: 1 })
               publishClientEvent(this.devtoolsBus, {
                 service: serviceName,
@@ -525,7 +603,6 @@ export class NevoHttpClient {
                 this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "http", service: serviceName, method: methodLabel(method) })
             }
           } catch (err: any) {
-            this.circuitBreaker.onFailure(cbKey, err)
             publishClientEvent(this.devtoolsBus, {
               service: serviceName,
               method,
@@ -539,7 +616,7 @@ export class NevoHttpClient {
             })
             throw err
           }
-        }, this.retryOptions)
+        })
 
         if (opts?.idempotencyKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(opts.idempotencyKey, result)
         return result
@@ -554,10 +631,16 @@ export class NevoHttpClient {
     opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }
   ): Promise<void> {
     const url = this.getServiceUrl(serviceName)
-    const endpoint = `${url}/${normalizeServiceName(serviceName)}${DEFAULT_EVENTS_SUFFIX}`
-    const { buf, encoding } = await this.createBody(method, params, "emit", opts)
-    const res = await this.sendBuffer(endpoint, buf, this.codec.contentType, encoding)
-    if (res.status >= 400) throw httpStatusToError(res.status, serviceName)
+    const normalized = normalizeServiceName(serviceName)
+    const endpoint = `${url}/${normalized}${DEFAULT_EVENTS_SUFFIX}`
+    const idemKey = opts?.idempotencyKey ?? uuidv7()
+    return this.shutdown.trackInflight(
+      runClientPipeline<void>(this.circuitBreaker, this.retryOptions, `${normalized}:${method}`, async () => {
+        const { buf, encoding } = await this.createBody(method, params, "emit", { ...opts, idempotencyKey: idemKey })
+        const res = await this.sendBuffer(endpoint, buf, this.codec.contentType, encoding)
+        if (res.status >= 400) throw httpStatusToError(res.status, serviceName)
+      })
+    )
   }
 
   async publish(serviceName: string, method: string, params: unknown, opts?: { version?: string; headers?: Record<string, string> }): Promise<void> {
@@ -610,11 +693,34 @@ export class NevoHttpClient {
       return response.body.getReader()
     }
 
+    // No frame (message or heartbeat) within this window means the connection is
+    // dead (half-open TCP); tear it down so readLoop reconnects.
+    const idleMs = this.sseIdleTimeoutMs
+    type ReadResult = Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]>>
+    const readWithIdle = (reader: ReadableStreamDefaultReader<Uint8Array>): Promise<ReadResult> =>
+      new Promise((resolve, reject) => {
+        const t = setTimeout(() => {
+          void reader.cancel().catch(() => {})
+          reject(new MessagingError(ErrorCode.TIMEOUT, { message: `SSE idle timeout after ${idleMs}ms`, retryable: true }))
+        }, idleMs)
+        if (typeof t.unref === "function") t.unref()
+        reader.read().then(
+          (r) => {
+            clearTimeout(t)
+            resolve(r)
+          },
+          (e) => {
+            clearTimeout(t)
+            reject(e)
+          }
+        )
+      })
+
     const consume = async (reader: ReadableStreamDefaultReader<Uint8Array>) => {
       const decoder = new TextDecoder()
       let buffer = ""
       for (;;) {
-        const { value, done } = await reader.read()
+        const { value, done } = await readWithIdle(reader)
         if (done) break
         buffer += decoder.decode(value, { stream: true })
         const parts = buffer.split("\n\n")

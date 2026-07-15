@@ -1,5 +1,6 @@
 import type { OutboxStore, OutboxRecord, OutboxMarkResult } from "./outbox"
 import type { InboxStore } from "./inbox"
+import type { IdempotencyClaim } from "./idempotency-store"
 import type { SagaStore, SagaSnapshot } from "./saga"
 import type { EventStore, DomainEvent, EventStoreReadRange } from "./event-store"
 import type { DlqStore, DlqEntry, DlqQuery, DlqStats } from "./dlq"
@@ -78,6 +79,11 @@ export class PgOutboxStore implements OutboxStore {
     await this.client.query(`
       CREATE INDEX IF NOT EXISTS nevo_outbox_pending_idx ON ${this.table} (status, created_at)
         WHERE status = 'pending';
+    `)
+    // Backs the correlated partition-ordering subqueries in listPending().
+    await this.client.query(`
+      CREATE INDEX IF NOT EXISTS nevo_outbox_partition_idx ON ${this.table} (partition_key, status, created_at, id)
+        WHERE partition_key IS NOT NULL;
     `)
   }
 
@@ -205,19 +211,23 @@ export interface PgInboxStoreOptions extends PgStoreOptions {
   table?: string
   /** TTL after which dedup state is purged. Default 24h. */
   ttlMs?: number
+  /** How long a `pending` claim is honoured before another worker may steal it. Default 60s. */
+  claimTtlMs?: number
 }
 
-/** Postgres inbox (dedup) store. */
+/** Postgres inbox (dedup) store with an atomic cross-replica claim. */
 export class PgInboxStore implements InboxStore {
   private readonly client: PgClient
   private readonly table: string
   private readonly ttlMs: number
+  private readonly claimTtlMs: number
 
   constructor(opts: PgInboxStoreOptions) {
     if (!opts.client) throw new Error("PgInboxStore: `client` is required")
     this.client = opts.client
     this.table = qident(opts.schema, opts.table ?? "nevo_inbox")
     this.ttlMs = opts.ttlMs ?? 24 * 60 * 60_000
+    this.claimTtlMs = opts.claimTtlMs ?? 60_000
   }
 
   async migrate(): Promise<void> {
@@ -225,29 +235,58 @@ export class PgInboxStore implements InboxStore {
       CREATE TABLE IF NOT EXISTS ${this.table} (
         uuid    TEXT PRIMARY KEY,
         result  JSONB,
+        status  TEXT NOT NULL DEFAULT 'done',
         seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `)
+    await this.client.query(`ALTER TABLE ${this.table} ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'done';`)
     await this.client.query(`
       CREATE INDEX IF NOT EXISTS nevo_inbox_seen_at_idx ON ${this.table} (seen_at);
     `)
   }
 
   async hasSeen(uuid: string): Promise<boolean> {
-    const res = await this.client.query<{ exists: boolean }>(`SELECT EXISTS(SELECT 1 FROM ${this.table} WHERE uuid = $1) AS exists`, [uuid])
+    const res = await this.client.query<{ exists: boolean }>(
+      `SELECT EXISTS(SELECT 1 FROM ${this.table} WHERE uuid = $1 AND status = 'done') AS exists`,
+      [uuid]
+    )
     return Boolean(res.rows[0]?.exists)
+  }
+
+  /** Single-winner reservation; a stale `pending` claim (crashed peer) is stolen after `claimTtlMs`. */
+  async claim(uuid: string, opts?: { ttlMs?: number }): Promise<IdempotencyClaim<unknown>> {
+    const ttl = opts?.ttlMs ?? this.claimTtlMs
+    const res = await this.client.query<{ uuid: string }>(
+      `INSERT INTO ${this.table} AS t (uuid, result, status) VALUES ($1, NULL, 'pending')
+       ON CONFLICT (uuid) DO UPDATE SET seen_at = NOW()
+         WHERE t.status = 'pending' AND t.seen_at < NOW() - ($2 || ' milliseconds')::interval
+       RETURNING uuid`,
+      [uuid, String(ttl)]
+    )
+    if (res.rows.length > 0) return { acquired: true }
+    const existing = await this.client.query<{ result: unknown; status: string }>(`SELECT result, status FROM ${this.table} WHERE uuid = $1`, [uuid])
+    const row = existing.rows[0]
+    if (row?.status === "done" && row.result !== null && row.result !== undefined) {
+      return { acquired: false, existing: deserializeBigInt(row.result) }
+    }
+    return { acquired: false }
+  }
+
+  async isDone(uuid: string): Promise<boolean> {
+    return this.hasSeen(uuid)
   }
 
   async markSeen(uuid: string, result?: unknown): Promise<void> {
     await this.client.query(
-      `INSERT INTO ${this.table} (uuid, result) VALUES ($1, $2::jsonb)
-       ON CONFLICT (uuid) DO NOTHING`,
+      `INSERT INTO ${this.table} AS t (uuid, result, status) VALUES ($1, $2::jsonb, 'done')
+       ON CONFLICT (uuid) DO UPDATE SET result = EXCLUDED.result, status = 'done', seen_at = NOW()
+         WHERE t.status = 'pending'`,
       [uuid, result === undefined ? null : stringifyWithBigInt(result)]
     )
   }
 
   async getResult(uuid: string): Promise<unknown | undefined> {
-    const res = await this.client.query<{ result: unknown }>(`SELECT result FROM ${this.table} WHERE uuid = $1`, [uuid])
+    const res = await this.client.query<{ result: unknown }>(`SELECT result FROM ${this.table} WHERE uuid = $1 AND status = 'done'`, [uuid])
     const stored = res.rows[0]?.result
     return stored === undefined || stored === null ? undefined : deserializeBigInt(stored)
   }
@@ -294,6 +333,9 @@ export class PgSagaStore implements SagaStore {
     await this.client.query(`
       ALTER TABLE ${this.table} ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'default';
     `)
+    await this.client.query(`ALTER TABLE ${this.table} ADD COLUMN IF NOT EXISTS compensated JSONB NOT NULL DEFAULT '[]'::jsonb;`)
+    await this.client.query(`ALTER TABLE ${this.table} ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;`)
+    await this.client.query(`ALTER TABLE ${this.table} ADD COLUMN IF NOT EXISTS claimed_by TEXT;`)
     await this.client.query(`
       CREATE INDEX IF NOT EXISTS nevo_saga_pending_idx ON ${this.table} (status)
         WHERE status IN ('pending', 'compensating');
@@ -302,27 +344,43 @@ export class PgSagaStore implements SagaStore {
 
   async save(s: SagaSnapshot): Promise<void> {
     await this.client.query(
-      `INSERT INTO ${this.table} (saga_id, type, status, steps, executed, ctx, error, updated_at)
-       VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, to_timestamp($8 / 1000.0))
+      `INSERT INTO ${this.table} (saga_id, type, status, steps, executed, compensated, ctx, error, updated_at)
+       VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, $8, to_timestamp($9 / 1000.0))
        ON CONFLICT (saga_id) DO UPDATE SET
-         type       = EXCLUDED.type,
-         status     = EXCLUDED.status,
-         steps      = EXCLUDED.steps,
-         executed   = EXCLUDED.executed,
-         ctx        = EXCLUDED.ctx,
-         error      = EXCLUDED.error,
-         updated_at = EXCLUDED.updated_at`,
+         type        = EXCLUDED.type,
+         status      = EXCLUDED.status,
+         steps       = EXCLUDED.steps,
+         executed    = EXCLUDED.executed,
+         compensated = EXCLUDED.compensated,
+         ctx         = EXCLUDED.ctx,
+         error       = EXCLUDED.error,
+         updated_at  = EXCLUDED.updated_at`,
       [
         s.sagaId,
         s.type ?? "default",
         s.status,
         stringifyWithBigInt(s.steps),
         stringifyWithBigInt(s.executed),
+        stringifyWithBigInt(s.compensated ?? []),
         stringifyWithBigInt(s.ctx),
         s.error?.message ?? null,
         s.updatedAt
       ]
     )
+  }
+
+  /** Recovery lease: single winner per saga until the lease expires. */
+  async claim(sagaId: string, workerId: string, leaseMs: number): Promise<boolean> {
+    const res = await this.client.query<{ saga_id: string }>(
+      `UPDATE ${this.table}
+          SET claimed_at = NOW(), claimed_by = $2
+        WHERE saga_id = $1
+          AND status IN ('pending', 'compensating')
+          AND (claimed_at IS NULL OR claimed_by = $2 OR claimed_at < NOW() - ($3 || ' milliseconds')::interval)
+       RETURNING saga_id`,
+      [sagaId, workerId, String(leaseMs)]
+    )
+    return res.rows.length > 0
   }
 
   async load(sagaId: string): Promise<SagaSnapshot | null> {
@@ -332,11 +390,12 @@ export class PgSagaStore implements SagaStore {
       status: string
       steps: string[]
       executed: string[]
+      compensated: string[] | null
       ctx: unknown
       error: string | null
       updated_at: Date
     }>(
-      `SELECT saga_id, type, status, steps, executed, ctx, error, updated_at
+      `SELECT saga_id, type, status, steps, executed, compensated, ctx, error, updated_at
          FROM ${this.table} WHERE saga_id = $1`,
       [sagaId]
     )
@@ -348,6 +407,7 @@ export class PgSagaStore implements SagaStore {
       status: row.status as SagaSnapshot["status"],
       steps: row.steps,
       executed: row.executed,
+      compensated: row.compensated ?? [],
       ctx: deserializeBigInt(row.ctx),
       error: row.error ? { message: row.error } : undefined,
       updatedAt: row.updated_at instanceof Date ? row.updated_at.getTime() : Number(row.updated_at)
@@ -361,11 +421,12 @@ export class PgSagaStore implements SagaStore {
       status: string
       steps: string[]
       executed: string[]
+      compensated: string[] | null
       ctx: unknown
       error: string | null
       updated_at: Date
     }>(
-      `SELECT saga_id, type, status, steps, executed, ctx, error, updated_at
+      `SELECT saga_id, type, status, steps, executed, compensated, ctx, error, updated_at
          FROM ${this.table}
         WHERE status IN ('pending', 'compensating')`
     )
@@ -375,6 +436,7 @@ export class PgSagaStore implements SagaStore {
       status: row.status as SagaSnapshot["status"],
       steps: row.steps,
       executed: row.executed,
+      compensated: row.compensated ?? [],
       ctx: deserializeBigInt(row.ctx),
       error: row.error ? { message: row.error } : undefined,
       updatedAt: row.updated_at instanceof Date ? row.updated_at.getTime() : Number(row.updated_at)
@@ -427,6 +489,13 @@ export class PgEventStore implements EventStore {
     `)
   }
 
+  /**
+   * Appends one event. A per-table advisory lock serialises appends so the
+   * `sequence` column is strictly gap-free (required by the poll-based
+   * `subscribe`/`read` cursor). This caps append throughput to one writer at a
+   * time for the whole store; if you need higher write concurrency, shard the
+   * store per aggregate or switch consumers to a gap-tolerant cursor.
+   */
   async append(input: Omit<DomainEvent, "id" | "sequence" | "ts">): Promise<DomainEvent> {
     const id = uuidv7()
     const res = await this.client.query<{ sequence: string | number; ts: Date }>(
@@ -860,6 +929,15 @@ export class PgScheduledTaskStore implements ScheduledTaskStore {
         WHERE id = $1 AND claimed_by = $3 AND status = 'running'`,
       [id, nextRunAt, workerId, error?.slice(0, 4000) ?? null]
     )
+  }
+
+  /** Heartbeat: refresh the lease of tasks this worker is still executing. */
+  async extendLease(ids: string[], workerId: string): Promise<void> {
+    if (ids.length === 0) return
+    await this.client.query(`UPDATE ${this.table} SET claimed_at = NOW() WHERE id = ANY($1::text[]) AND claimed_by = $2 AND status = 'running'`, [
+      ids,
+      workerId
+    ])
   }
 
   async cancel(id: string): Promise<void> {

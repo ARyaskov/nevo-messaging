@@ -48,9 +48,22 @@ function decodeBinaryPayload(payload: unknown): any {
   }
 }
 
+// Sentinel pushed periodically so clients can tell a live-but-idle stream from a
+// dead (half-open) connection. Empty-data SSE frames are ignored by the client parser.
+const SSE_HEARTBEAT = ""
+const SSE_HEARTBEAT_MS = 15_000
+
 @Injectable()
 export class HttpSseBroker {
   private readonly channels = new Map<string, Subject<string>>()
+  private heartbeat?: NodeJS.Timeout
+
+  constructor() {
+    this.heartbeat = setInterval(() => {
+      for (const subject of this.channels.values()) subject.next(SSE_HEARTBEAT)
+    }, SSE_HEARTBEAT_MS)
+    if (typeof this.heartbeat.unref === "function") this.heartbeat.unref()
+  }
 
   stream(channel: string): Observable<{ data: string }> {
     return this.getChannel(channel)
@@ -60,6 +73,11 @@ export class HttpSseBroker {
 
   publish(channel: string, payload: unknown) {
     this.getChannel(channel).next(stringifyWithBigInt(payload))
+  }
+
+  onModuleDestroy(): void {
+    if (this.heartbeat) clearInterval(this.heartbeat)
+    this.heartbeat = undefined
   }
 
   private getChannel(channel: string): Subject<string> {

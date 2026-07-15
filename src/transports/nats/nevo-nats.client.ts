@@ -44,6 +44,7 @@ import {
   ResolvedRetryOptions,
   ResolvedCompressionOptions,
   formatMethod,
+  parseMethod,
   DEFAULT_METHOD_VERSION,
   TransportClientOptions,
   DevToolsBus,
@@ -356,7 +357,9 @@ export class NevoNatsClient implements OnModuleDestroy {
           return this.idempotencyCache.get(idempotencyKey) as T
         }
 
-        const requestUuid = uuidv7()
+        // Fresh envelope uuid per attempt keeps replay protection intact; a stable
+        // idempotency key dedupes retries server-side instead.
+        const retryIdemKey = idempotencyKey ?? uuidv7()
         const result = await runClientPipeline<T>(this.circuitBreaker, this.retryOptions, cbKey, async (attempt) => {
           const startMs = Date.now()
           let lastUuid: string | undefined
@@ -365,8 +368,8 @@ export class NevoNatsClient implements OnModuleDestroy {
             const nc = await this.ensureConnection()
             const { payload, meta, uuid, encoding } = await this.encodeRequest(method, params, "query", {
               ...opts,
-              headers: { ...(opts?.headers || {}), "nevo-attempt": String(attempt) },
-              uuid: requestUuid
+              idempotencyKey: retryIdemKey,
+              headers: { ...(opts?.headers || {}), "nevo-attempt": String(attempt) }
             })
             lastUuid = uuid
             lastChainId = meta.nevoChainId
@@ -458,14 +461,19 @@ export class NevoNatsClient implements OnModuleDestroy {
   ): Promise<void> {
     const normalized = this.ensureServiceRegistered(serviceName)
     const subject = `${normalized}-events`
-    const nc = await this.ensureConnection()
-    const { payload, meta, encoding } = await this.encodeRequest(method, params, "emit", opts)
-    nc.publish(subject, payload, { headers: this.toNatsHeaders(meta.headers, encoding) })
+    const idemKey = opts?.idempotencyKey ?? uuidv7()
+    return this.shutdown.trackInflight(
+      runClientPipeline<void>(this.circuitBreaker, this.retryOptions, `${normalized}:${method}`, async () => {
+        const nc = await this.ensureConnection()
+        const { payload, meta, encoding } = await this.encodeRequest(method, params, "emit", { ...opts, idempotencyKey: idemKey })
+        nc.publish(subject, payload, { headers: this.toNatsHeaders(meta.headers, encoding) })
+      })
+    )
   }
 
   async publish(serviceName: string, method: string, params: unknown, opts?: { version?: string; headers?: Record<string, string> }): Promise<void> {
     const normalized = this.ensureServiceRegistered(serviceName)
-    const subject = `${normalized}${DEFAULT_SUBSCRIPTION_SUFFIX}`
+    const subject = methodSubject(`${normalized}${DEFAULT_SUBSCRIPTION_SUFFIX}`, method)
     const nc = await this.ensureConnection()
     const { payload, meta, encoding } = await this.encodeRequest(method, params, "sub", opts)
     nc.publish(subject, payload, { headers: this.toNatsHeaders(meta.headers, encoding) })
@@ -474,7 +482,7 @@ export class NevoNatsClient implements OnModuleDestroy {
   async broadcast(method: string, params: unknown, opts?: { version?: string; headers?: Record<string, string> }): Promise<void> {
     const nc = await this.ensureConnection()
     const { payload, meta, encoding } = await this.encodeRequest(method, params, "broadcast", opts)
-    nc.publish(DEFAULT_BROADCAST_TOPIC, payload, { headers: this.toNatsHeaders(meta.headers, encoding) })
+    nc.publish(methodSubject(DEFAULT_BROADCAST_TOPIC, method), payload, { headers: this.toNatsHeaders(meta.headers, encoding) })
   }
 
   async requestMany<T = unknown>(
@@ -548,7 +556,7 @@ export class NevoNatsClient implements OnModuleDestroy {
     method: string,
     params: unknown,
     onChunk: (chunk: T) => Promise<void> | void,
-    onEnd?: (summary: { count: number; durationMs: number }) => void,
+    onEnd?: (summary: { count: number; durationMs: number; error?: unknown }) => void,
     opts?: { version?: string; headers?: Record<string, string>; timeoutMs?: number }
   ): Promise<{ cancel: () => Promise<void> }> {
     const normalized = this.ensureServiceRegistered(serviceName)
@@ -567,17 +575,29 @@ export class NevoNatsClient implements OnModuleDestroy {
     })
     nc.publish(subject, payload, { reply: replySubject, headers: this.toNatsHeaders(meta.headers, encoding) })
 
+    // Idle timeout: reset on every chunk so a long, steadily-producing stream
+    // isn't cut off — only a gap longer than `timeoutMs` ends it.
     const timeoutMs = opts?.timeoutMs ?? this.timeoutMs
-    const idleTimer = setTimeout(() => {
-      if (!cancelled) {
-        void replySub.unsubscribe()
-      }
-    }, timeoutMs)
+    let timedOut = false
+    let idleTimer: NodeJS.Timeout | undefined
+    const armIdle = () => {
+      clearTimeout(idleTimer)
+      idleTimer = setTimeout(() => {
+        if (!cancelled) {
+          timedOut = true
+          void replySub.unsubscribe()
+        }
+      }, timeoutMs)
+      if (typeof idleTimer.unref === "function") idleTimer.unref()
+    }
+    armIdle()
 
     ;(async () => {
+      let streamError: unknown
       try {
         for await (const msg of replySub) {
           if (cancelled) break
+          armIdle()
           try {
             const encoding = getNatsHeader(msg.headers, "content-encoding")
             const response: any = await this.decodePayload(msg.data, encoding)
@@ -587,10 +607,11 @@ export class NevoNatsClient implements OnModuleDestroy {
             await onChunk(response.params.result as T)
           } catch {}
         }
+        if (timedOut && !cancelled) streamError = new TimeoutError(serviceName, method, timeoutMs)
       } finally {
         clearTimeout(idleTimer)
         this.subscriptions.delete(replySub)
-        onEnd?.({ count, durationMs: Date.now() - startMs })
+        onEnd?.({ count, durationMs: Date.now() - startMs, error: streamError })
       }
     })()
 
@@ -642,7 +663,7 @@ export class NevoNatsClient implements OnModuleDestroy {
     if (!(this.compression.async && this.compression.enabled)) {
       for (const item of items) {
         const normalized = this.ensureServiceRegistered(item.serviceName)
-        const subject = `${normalized}${DEFAULT_SUBSCRIPTION_SUFFIX}`
+        const subject = methodSubject(`${normalized}${DEFAULT_SUBSCRIPTION_SUFFIX}`, item.method)
         const { payload, meta, encoding } = this.encodeRequestSync(item.method, item.params, "sub", item.opts)
         const headers = this.toNatsHeaders(meta.headers, encoding)
         nc.publish(subject, payload, headers ? { headers } : undefined)
@@ -652,7 +673,7 @@ export class NevoNatsClient implements OnModuleDestroy {
     }
     const encoded = await mapLimit(items, BATCH_ENCODE_CONCURRENCY, async (item) => {
       const normalized = this.ensureServiceRegistered(item.serviceName)
-      const subject = `${normalized}${DEFAULT_SUBSCRIPTION_SUFFIX}`
+      const subject = methodSubject(`${normalized}${DEFAULT_SUBSCRIPTION_SUFFIX}`, item.method)
       const { payload, meta, encoding } = await this.encodeRequest(item.method, item.params, "sub", item.opts)
       return { subject, payload, headers: this.toNatsHeaders(meta.headers, encoding) }
     })
@@ -677,7 +698,10 @@ export class NevoNatsClient implements OnModuleDestroy {
     const isBroadcast = normalized === DEFAULT_BROADCAST_TOPIC
     if (!isBroadcast) this.ensureServiceRegistered(serviceName)
 
-    const subject = isBroadcast ? DEFAULT_BROADCAST_TOPIC : `${normalized}${DEFAULT_SUBSCRIPTION_SUFFIX}`
+    // Method-scoped subject: NATS filters server-side; the in-process method
+    // check below only refines version-suffixed subscriptions.
+    const subject = methodSubject(isBroadcast ? DEFAULT_BROADCAST_TOPIC : `${normalized}${DEFAULT_SUBSCRIPTION_SUFFIX}`, method, "subscribe")
+    const methodIsPattern = !!method && /[*>]/.test(method)
     const nc = await this.ensureConnection()
     const sub = nc.subscribe(subject, options?.groupId ? { queue: options.groupId } : undefined)
     this.subscriptions.add(sub)
@@ -696,7 +720,8 @@ export class NevoNatsClient implements OnModuleDestroy {
         try {
           const encoding = getNatsHeader(msg.headers, "content-encoding")
           const payload: any = await this.decodePayload(msg.data, encoding)
-          if (method && payload.method !== method && payload.method?.split("@")[0] !== method) continue
+          // Wildcard patterns are already filtered by the NATS subject itself.
+          if (method && !methodIsPattern && payload.method !== method && payload.method?.split("@")[0] !== method) continue
           if (!matchesFilter(options?.filter, payload.meta)) continue
           if (options?.room && payload.meta?.headers?.["room"] !== options.room) continue
 
@@ -797,4 +822,24 @@ function getNatsHeader(h: any, key: string): string | undefined {
   } catch {
     return undefined
   }
+}
+
+/**
+ * Pub/sub subjects are method-scoped (`<service>-events.sub.<method>`) so NATS
+ * filters server-side instead of every subscriber receiving and discarding the
+ * whole service stream. The version suffix is stripped: subscribers of a base
+ * method receive every version and refine in-process. In subscribe mode the
+ * NATS wildcards `*`/`>` pass through, so `user.*` patterns work natively.
+ */
+export function methodSubject(prefix: string, method: string | undefined | null, mode: "publish" | "subscribe" = "publish"): string {
+  if (!method) return `${prefix}.>`
+  const base = parseMethod(method).name
+  const token = base
+    .split(".")
+    .map((t) => {
+      if (mode === "subscribe" && (t === "*" || t === ">")) return t
+      return t.replace(/[\s*>]/g, "_") || "_"
+    })
+    .join(".")
+  return `${prefix}.${token}`
 }

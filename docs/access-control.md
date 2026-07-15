@@ -7,7 +7,9 @@ ACL restricts which callers can invoke which methods on which topics. It is eval
 ```ts
 interface AccessControlConfig {
   rules?: AccessRule[]
-  allowAllByDefault?: boolean        // default: true (when no rules match)
+  // Default: true with no rules, FALSE once any rule exists (secure default).
+  // Set explicitly to opt out.
+  allowAllByDefault?: boolean
   logDenied?: boolean
   jwtVerifier?: (token: string) => Promise<VerifiedClaims | null>
 }
@@ -37,7 +39,8 @@ export class UserController { ... }
 
 Semantics:
 
-- If `rules` is empty, `allowAllByDefault` (default `true`) decides
+- **Deny by default once rules exist.** When at least one rule is configured and `allowAllByDefault` is not set, any `(topic, method)` matched by no rule is **denied**. Set `allowAllByDefault: true` to restore the permissive behaviour. With no rules at all, everything is allowed.
+- Built-in `nevo.*` methods (contract, health probes) stay reachable under the deny-default; an explicit matching `deny` rule still blocks them.
 - Multiple rules can match a given `(topic, method)` — `deny` always wins over `allow`
 - Wildcards `"*"` match any value
 

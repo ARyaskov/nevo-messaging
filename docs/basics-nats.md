@@ -104,12 +104,17 @@ createNatsMicroservice({
 
 ## Subjects & wildcards
 
-Subjects use dot-separated names (`user.created`, `orders.paid.eu-west`). The `@Signal` value is sent verbatim as the subject. NATS wildcards `*` (one token) and `>` (rest) are supported in subscription patterns:
+Pub/sub messages travel on method-scoped subjects: `publish("user", "user.updated", …)` goes to `user-events.sub.user.updated`, and `subscribe("user", "user.updated", …)` subscribes to exactly that subject — NATS filters server-side, so subscribers no longer receive (and discard) the whole service stream. The `@vN` version suffix is stripped from the subject; a subscriber of the base method receives every version.
+
+NATS wildcards `*` (one token) and `>` (rest) work natively in the method position, and an empty method subscribes to everything the service publishes:
 
 ```ts
-await this.subscribe("user", "user.*", {}, (msg) => { ... })
-await this.subscribeWildcard("orders.>", (msg, ctx) => { ... })
+await this.subscribe("user", "user.*", {}, (msg) => { ... })   // user.created, user.updated, …
+await this.subscribe("user", "", {}, (msg) => { ... })          // every published method
+await this.subscribeWildcard("orders.>", (msg, ctx) => { ... }) // raw subject pattern
 ```
+
+> **Upgrading from ≤2.4:** publishers and subscribers must run the same version — older peers used the bare `<service>-events.sub` subject. JetStream streams capturing pub/sub traffic need their subject filter widened to `<service>-events.sub.>`.
 
 ## JetStream-backed `ack: true`
 

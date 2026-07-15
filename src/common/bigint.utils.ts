@@ -1,5 +1,11 @@
 export const BIGINT_SENTINEL = "@@nevo:bigint:"
+// Escape prefix for user strings that would otherwise be mistaken for an encoded BigInt.
+export const STRING_ESCAPE = "@@nevo:str:"
 const LEGACY_BIGINT_RE = /^(\d+)n$/
+
+function needsSentinelEscape(s: string): boolean {
+  return s.startsWith(BIGINT_SENTINEL) || s.startsWith(STRING_ESCAPE)
+}
 
 export interface BigIntSerializable {
   [key: string]: any
@@ -7,6 +13,7 @@ export interface BigIntSerializable {
 
 export const bigIntReplacer = function (_key: string, value: unknown): unknown {
   if (typeof value === "bigint") return `${BIGINT_SENTINEL}${value.toString()}`
+  if (typeof value === "string" && needsSentinelEscape(value)) return `${STRING_ESCAPE}${value}`
   return value
 }
 
@@ -20,11 +27,14 @@ const MAX_WIRE_DEPTH = 512
 export function normalizeWireValue(value: unknown): unknown {
   const seen = new WeakSet<object>()
 
+  // Copy-on-write: containers are only reallocated along paths that actually
+  // change, so a payload with no BigInt/Date/undefined passes through untouched.
   const visit = (input: unknown, depth: number, inArray: boolean): unknown => {
     if (input === undefined || typeof input === "function" || typeof input === "symbol") {
       return inArray ? null : undefined
     }
     if (typeof input === "bigint") return `${BIGINT_SENTINEL}${input.toString()}`
+    if (typeof input === "string") return needsSentinelEscape(input) ? `${STRING_ESCAPE}${input}` : input
     if (input === null || typeof input !== "object") return input
     if (input instanceof Date) return input.toISOString()
     if (depth >= MAX_WIRE_DEPTH) {
@@ -34,15 +44,31 @@ export function normalizeWireValue(value: unknown): unknown {
     seen.add(input)
     try {
       if (Array.isArray(input)) {
-        return input.map((item) => visit(item, depth + 1, true))
+        let out: unknown[] | null = null
+        for (let i = 0; i < input.length; i++) {
+          const normalized = visit(input[i], depth + 1, true)
+          if (out) {
+            out.push(normalized)
+          } else if (normalized !== input[i]) {
+            out = input.slice(0, i)
+            out.push(normalized)
+          }
+        }
+        return out ?? input
       }
       if (ArrayBuffer.isView(input) || input instanceof ArrayBuffer) return input
-      const out: Record<string, unknown> = {}
-      for (const [key, item] of Object.entries(input as Record<string, unknown>)) {
+      const entries = Object.entries(input as Record<string, unknown>)
+      let out: Record<string, unknown> | null = null
+      for (let i = 0; i < entries.length; i++) {
+        const [key, item] = entries[i]
         const normalized = visit(item, depth + 1, false)
-        if (normalized !== undefined) setRebuiltKey(out, key, normalized)
+        if (!out && (normalized !== item || item === undefined)) {
+          out = {}
+          for (let j = 0; j < i; j++) setRebuiltKey(out, entries[j][0], entries[j][1])
+        }
+        if (out && normalized !== undefined) setRebuiltKey(out, key, normalized)
       }
-      return out
+      return out ?? input
     } finally {
       seen.delete(input)
     }
@@ -55,6 +81,7 @@ export function makeBigIntReviver(opts?: { acceptLegacy?: boolean }): (key: stri
   const acceptLegacy = opts?.acceptLegacy === true
   return function (_key, value) {
     if (typeof value !== "string") return value
+    if (value.startsWith(STRING_ESCAPE)) return value.slice(STRING_ESCAPE.length)
     if (value.length > BIGINT_SENTINEL.length && value.startsWith(BIGINT_SENTINEL)) {
       const digits = value.slice(BIGINT_SENTINEL.length)
       if (/^-?\d+$/.test(digits)) return BigInt(digits)
@@ -86,6 +113,7 @@ function setRebuiltKey(target: Record<string, unknown>, key: string, value: unkn
 function serializeBigIntInner(obj: any, depth: number, seen: WeakSet<object>): any {
   if (obj === null || obj === undefined) return obj
   if (typeof obj === "bigint") return `${BIGINT_SENTINEL}${obj.toString()}`
+  if (typeof obj === "string") return needsSentinelEscape(obj) ? `${STRING_ESCAPE}${obj}` : obj
   if (typeof obj !== "object") return obj
 
   if (depth >= MAX_BIGINT_DEPTH) {
@@ -113,6 +141,7 @@ function deserializeBigIntInner(obj: any, options: { acceptLegacy?: boolean } | 
   if (obj === null || obj === undefined) return obj
 
   if (typeof obj === "string") {
+    if (obj.startsWith(STRING_ESCAPE)) return obj.slice(STRING_ESCAPE.length)
     if (obj.startsWith(BIGINT_SENTINEL)) {
       const digits = obj.slice(BIGINT_SENTINEL.length)
       if (/^-?\d+$/.test(digits)) return BigInt(digits)
