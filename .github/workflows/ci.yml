@@ -38,36 +38,16 @@ jobs:
         run: pnpm lint
         continue-on-error: false
 
+      # Also builds the DevTools UI bundle — `build` runs `build:devtools-ui`.
       - name: Type-check
         run: pnpm build
+
+      # esbuild strips types without checking them, so the browser bundle needs
+      # its own gate; `pnpm build` would happily emit a broken dashboard.
+      - name: Type-check DevTools UI
+        run: pnpm typecheck:devtools-ui
 
       - name: Tests
         run: pnpm test
         env:
           NODE_OPTIONS: --experimental-vm-modules
-
-  devtools-build:
-    name: DevTools UI build
-    runs-on: ubuntu-latest
-    if: ${{ hashFiles('devtools/package.json') != '' }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          run_install: false
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-          cache: "pnpm"
-          cache-dependency-path: devtools/pnpm-lock.yaml
-
-      - name: Install
-        working-directory: devtools
-        run: pnpm install --frozen-lockfile
-
-      - name: Build
-        working-directory: devtools
-        run: pnpm run build --if-present

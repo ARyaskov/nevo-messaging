@@ -16,6 +16,8 @@ export interface EventStoreReadRange {
   type?: string
   aggregateId?: string
   limit?: number
+  /** Only events every concurrent writer has finished, so a cursor can't step over one. */
+  committedOnly?: boolean
 }
 
 export interface EventStore {
@@ -75,7 +77,9 @@ export class InMemoryEventStore implements EventStore {
       if (e.sequence >= from) {
         try {
           await handler(e)
-        } catch {}
+        } catch (err) {
+          console.error(`[nevo][event-store] backlog handler failed at sequence ${e.sequence} (${e.type}):`, err)
+        }
       }
     }
     return {

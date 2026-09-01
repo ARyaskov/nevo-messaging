@@ -1,7 +1,6 @@
 import {
   DEFAULT_BROADCAST_TOPIC,
   DiscoveryRegistry,
-  MessageMeta,
   MessageType,
   MessagingError,
   TimeoutError,
@@ -9,36 +8,13 @@ import {
   Subscription,
   SubscriptionContext,
   SubscriptionOptions,
-  Codec,
-  getCodec,
-  getDefaultCodec,
-  NevoLogger,
-  getDefaultLogger,
-  CircuitBreakerRegistry,
-  ResolvedRetryOptions,
-  ResolvedCompressionOptions,
-  resolveRetryOptions,
-  withRetry,
-  resolveCompressionOptions,
-  DEFAULT_MAX_PAYLOAD_BYTES,
-  getDefaultTracer,
-  NevoTracer,
-  getDefaultMetrics,
-  NEVO_METRIC_NAMES,
-  methodLabel,
-  MetricsRegistry,
-  GracefulShutdown,
-  LruIdempotencyCache,
   TransportClientOptions,
+  ClientRuntime,
+  type ClientCallOptions,
+  type EncodedRequest,
   matchesFilter,
-  DEFAULT_METHOD_VERSION,
-  formatMethod,
-  DevToolsBus,
-  getDevToolsBus,
-  publishClientEvent,
-  uuidv7,
   normalizeServiceName,
-  resolveOutboundChainId
+  parseMethod
 } from "../../common"
 
 export interface NevoWsClientOptions extends TransportClientOptions {
@@ -67,90 +43,34 @@ interface ServiceSocket {
 }
 
 export class NevoWsClient {
+  private readonly runtime: ClientRuntime
   private readonly serviceUrls: Map<string, string>
-  private readonly timeoutMs: number
-  private readonly serviceName?: string
-  private readonly instanceId: string
-  private readonly authToken?: string
-  private readonly logger: NevoLogger
-  private readonly codec: Codec
-  private readonly circuitBreaker: CircuitBreakerRegistry
-  private readonly retryOptions: ResolvedRetryOptions
-  private readonly compression: ResolvedCompressionOptions
-  private readonly tracer: NevoTracer
-  private readonly metrics: MetricsRegistry
-  private readonly shutdown = new GracefulShutdown()
-  private readonly maxPayloadBytes: number
-  private readonly idempotencyCache: LruIdempotencyCache<unknown>
   private readonly sockets = new Map<string, ServiceSocket>()
-  private readonly devtoolsBus: DevToolsBus | null
   private readonly reconnectIntervalMs: number
   private readonly maxReconnectAttempts: number
   private readonly protocols?: string | string[]
-  private readonly metaStaticPart: Pick<MessageMeta, "service" | "instanceId" | "auth" | "codec">
   private readonly discoveryRegistry = new DiscoveryRegistry()
   private readonly discoveryEnabled: boolean
   private readonly discoveryTtlMs: number
 
   constructor(serviceUrls: Record<string, string>, options?: NevoWsClientOptions) {
     this.serviceUrls = new Map(Object.entries(serviceUrls).map(([k, v]) => [k.toLowerCase(), v]))
-    this.timeoutMs = options?.timeoutMs ?? options?.timeout ?? 20000
-    this.serviceName = options?.serviceName
-    this.instanceId = options?.instanceId || uuidv7()
-    this.authToken = options?.authToken
-    this.logger = (options?.logger as NevoLogger) || getDefaultLogger().child({ component: "ws-client", service: this.serviceName })
-    this.codec = typeof options?.codec === "string" ? getCodec(options.codec) : (options?.codec as Codec) || getDefaultCodec()
-    this.circuitBreaker = new CircuitBreakerRegistry(options?.circuitBreaker)
-    this.retryOptions = resolveRetryOptions(options?.retry)
-    this.compression = resolveCompressionOptions(options?.compression)
-    this.tracer = getDefaultTracer()
-    this.metrics = getDefaultMetrics()
-    this.maxPayloadBytes = options?.security?.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES
-    this.idempotencyCache = new LruIdempotencyCache<unknown>(options?.idempotency)
-    this.devtoolsBus = options?.devtools === false ? null : options?.devtools instanceof Object ? (options.devtools as DevToolsBus) : getDevToolsBus()
+    // A raw ws frame has no header channel to carry a content-encoding marker.
+    this.runtime = new ClientRuntime(options, { transport: "ws", compressionCapable: false })
     this.reconnectIntervalMs = options?.reconnectIntervalMs ?? 1000
     this.maxReconnectAttempts = options?.maxReconnectAttempts ?? -1
     this.protocols = options?.protocols
     this.discoveryEnabled = options?.discovery?.enabled === true
     this.discoveryTtlMs = options?.discovery?.ttlMs || 30000
     if (this.discoveryEnabled) this.discoveryRegistry.startBackgroundPrune(this.discoveryTtlMs)
-    this.metaStaticPart = Object.freeze({
-      service: this.serviceName,
-      instanceId: this.instanceId,
-      auth: this.authToken ? { token: this.authToken } : undefined,
-      codec: this.codec.name
-    })
   }
 
   getInstanceId(): string {
-    return this.instanceId
+    return this.runtime.instanceId
   }
 
-  private buildMeta(type: MessageType, opts?: any): MessageMeta {
-    const baseMeta: MessageMeta = {
-      ...this.metaStaticPart,
-      type,
-      ts: Date.now(),
-      version: opts?.version || DEFAULT_METHOD_VERSION,
-      idempotencyKey: opts?.idempotencyKey,
-      tenantId: opts?.tenantId,
-      headers: opts?.headers,
-      nevoChainId: resolveOutboundChainId()
-    }
-    return this.tracer.inject(baseMeta)
-  }
-
-  private buildEnvelope(method: string, params: unknown, type: MessageType, opts?: any) {
-    const uuid = uuidv7()
-    const meta = this.buildMeta(type, opts)
-    const versioned = method.includes("@") ? method : formatMethod(method, opts?.version || DEFAULT_METHOD_VERSION)
-    const envelope = { uuid, method: versioned, params, meta }
-    const data = this.codec.encode(envelope)
-    if (data.byteLength > this.maxPayloadBytes) {
-      throw new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, { message: `Payload size ${data.byteLength}B exceeds ${this.maxPayloadBytes}B` })
-    }
-    this.metrics.observeHistogram(NEVO_METRIC_NAMES.payloadBytes, { direction: "out", service: this.serviceName ?? "unknown" }, data.byteLength)
-    return { envelope, uuid, data, meta }
+  private encode(method: string, params: unknown, type: MessageType, opts?: ClientCallOptions): EncodedRequest {
+    return this.runtime.encodeSync(method, params, type, opts)
   }
 
   private async getSocket(serviceName: string): Promise<ServiceSocket> {
@@ -204,26 +124,26 @@ export class NevoWsClient {
     const connectTimer = setTimeout(() => {
       settle(
         new MessagingError(ErrorCode.TIMEOUT, {
-          message: `WebSocket connect to "${serviceKey}" timed out after ${this.timeoutMs}ms`,
+          message: `WebSocket connect to "${serviceKey}" timed out after ${this.runtime.timeoutMs}ms`,
           retryable: true
         })
       )
       try {
         ws.close()
       } catch {}
-    }, this.timeoutMs)
+    }, this.runtime.timeoutMs)
     ws.addEventListener("open", () => {
       clearTimeout(connectTimer)
       entry.reconnectAttempt = 0
       for (const req of entry.subscribeRequests.values()) {
         try {
-          ws.send(this.buildEnvelope("__subscribe", req, "sub", {}).data)
+          ws.send(this.encode("__subscribe", req, "sub").payload)
         } catch {}
       }
       settle()
     })
     ws.addEventListener("error", (ev: any) => {
-      this.logger.warn({ event: "ws.error", err: ev?.message ?? "ws error", service: serviceKey })
+      this.runtime.logger.warn({ event: "ws.error", err: ev?.message ?? "ws error", service: serviceKey })
       clearTimeout(connectTimer)
       settle(new MessagingError(ErrorCode.CONNECTION_LOST, { message: ev?.message ?? "WebSocket connection failed", retryable: true }))
     })
@@ -232,7 +152,7 @@ export class NevoWsClient {
       settle(new MessagingError(ErrorCode.CONNECTION_LOST, { message: "WebSocket closed before open", retryable: true }))
       for (const [, p] of entry.pending) {
         clearTimeout(p.timer)
-        p.reject(new MessagingError(ErrorCode.CONNECTION_LOST, { message: "WebSocket closed before reply" }))
+        p.reject(new MessagingError(ErrorCode.CONNECTION_LOST, { message: "WebSocket closed before reply", retryable: true }))
       }
       entry.pending.clear()
       if (entry.closed) return
@@ -254,9 +174,9 @@ export class NevoWsClient {
   private handleMessage(entry: ServiceSocket, buf: Uint8Array): void {
     let envelope: any
     try {
-      envelope = this.codec.decode(buf)
+      envelope = this.runtime.decode(buf)
     } catch (err) {
-      this.logger.warn({ event: "ws.decode_error", err: (err as Error)?.message })
+      this.runtime.logger.warn({ event: "ws.decode_error", err: (err as Error)?.message })
       return
     }
     const uuid = envelope?.uuid
@@ -264,19 +184,12 @@ export class NevoWsClient {
       const pending = entry.pending.get(uuid)!
       entry.pending.delete(uuid)
       clearTimeout(pending.timer)
-      if (envelope?.params?.result === "error" && envelope?.params?.error) {
-        const err = envelope.params.error
-        pending.reject(new MessagingError(err.code, err.details ?? { message: err.message }, err.service))
-      } else {
-        pending.resolve(envelope?.params?.result)
-      }
+      pending.resolve(envelope)
       return
     }
 
-    const method: string = envelope?.method
-    if (!method) return
+    if (!envelope?.method) return
     for (const [, handlers] of entry.subscriptions) {
-      if (!matchesFilter(undefined, envelope.meta)) continue
       for (const h of handlers) {
         try {
           h(envelope)
@@ -285,101 +198,71 @@ export class NevoWsClient {
     }
   }
 
-  async query<T = unknown>(
-    serviceName: string,
-    method: string,
-    params: unknown,
-    opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; timeoutMs?: number; tenantId?: string }
-  ): Promise<T> {
-    const cbKey = `${normalizeServiceName(serviceName)}:${method}`
-    return this.shutdown.trackInflight(
-      (async () => {
-        if (opts?.idempotencyKey && this.idempotencyCache.isEnabled() && this.idempotencyCache.has(opts.idempotencyKey)) {
-          return this.idempotencyCache.get(opts.idempotencyKey) as T
-        }
-        const result = await withRetry(async (attempt) => {
-          this.circuitBreaker.before(cbKey)
-          const startMs = Date.now()
-          let lastUuid: string | undefined
-          let lastChainId: string | undefined
-          try {
-            const entry = await this.getSocket(serviceName)
-            const { uuid, data, meta } = this.buildEnvelope(method, params, "query", {
-              ...opts,
-              headers: { ...(opts?.headers || {}), "nevo-attempt": String(attempt) }
-            })
-            lastUuid = uuid
-            lastChainId = meta.nevoChainId
-            const { promise, resolve, reject } = Promise.withResolvers<T>()
-            const effectiveTimeout = opts?.timeoutMs ?? this.timeoutMs
-            const timer = setTimeout(() => {
-              entry.pending.delete(uuid)
-              reject(new TimeoutError(serviceName, method, effectiveTimeout))
-            }, effectiveTimeout)
-            entry.pending.set(uuid, { resolve: resolve as any, reject, timer })
-            entry.socket.send(data)
-            const value = await promise
-            this.circuitBreaker.onSuccess(cbKey)
-            publishClientEvent(this.devtoolsBus, {
-              service: serviceName,
-              method,
-              uuid,
-              chainId: lastChainId,
-              durationMs: Date.now() - startMs,
-              status: "ok",
-              transport: "ws",
-              origin: this.serviceName
-            })
-            return value
-          } catch (err: any) {
-            this.circuitBreaker.onFailure(cbKey, err)
-            publishClientEvent(this.devtoolsBus, {
-              service: serviceName,
-              method,
-              uuid: lastUuid,
-              chainId: lastChainId,
-              durationMs: Date.now() - startMs,
-              status: "error",
-              transport: "ws",
-              origin: this.serviceName,
-              error: { code: err instanceof MessagingError ? err.code : err?.code, message: err?.message ?? String(err) }
-            })
-            throw err
-          } finally {
-            this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, {
-              transport: "ws",
-              service: serviceName,
-              method: methodLabel(method),
-              role: "client"
-            })
-            if (attempt > 1)
-              this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "ws", service: serviceName, method: methodLabel(method) })
-          }
-        }, this.retryOptions)
-        if (opts?.idempotencyKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(opts.idempotencyKey, result)
-        return result
-      })()
-    )
+  async query<T = unknown>(serviceName: string, method: string, params: unknown, opts?: ClientCallOptions): Promise<T> {
+    const normalized = normalizeServiceName(serviceName)
+    return this.runtime.query<T>({
+      serviceName: normalized,
+      method,
+      params,
+      opts,
+      send: async (request) => {
+        const entry = await this.getSocket(serviceName)
+        const { promise, resolve, reject } = Promise.withResolvers<unknown>()
+        const timeout = opts?.timeoutMs ?? this.runtime.timeoutMs
+        const timer = setTimeout(() => {
+          entry.pending.delete(request.uuid)
+          reject(new TimeoutError(serviceName, method, timeout))
+        }, timeout)
+        entry.pending.set(request.uuid, { resolve, reject, timer })
+        entry.socket.send(request.payload)
+        return promise
+      }
+    })
   }
 
-  async emit(serviceName: string, method: string, params: unknown, opts?: any): Promise<void> {
-    const entry = await this.getSocket(serviceName)
-    const { data } = this.buildEnvelope(method, params, "emit", opts)
-    entry.socket.send(data)
+  async emit(serviceName: string, method: string, params: unknown, opts?: ClientCallOptions): Promise<void> {
+    const normalized = normalizeServiceName(serviceName)
+    return this.runtime.emit({
+      serviceName: normalized,
+      method,
+      params,
+      opts,
+      send: async (request) => {
+        const entry = await this.getSocket(serviceName)
+        entry.socket.send(request.payload)
+      }
+    })
   }
 
-  async publish(serviceName: string, method: string, params: unknown, opts?: any): Promise<void> {
-    const entry = await this.getSocket(serviceName)
-    const { data } = this.buildEnvelope(method, params, "sub", opts)
-    entry.socket.send(data)
+  async publish(serviceName: string, method: string, params: unknown, opts?: ClientCallOptions): Promise<void> {
+    const normalized = normalizeServiceName(serviceName)
+    return this.runtime.emit({
+      serviceName: normalized,
+      method,
+      params,
+      opts,
+      type: "sub",
+      send: async (request) => {
+        const entry = await this.getSocket(serviceName)
+        entry.socket.send(request.payload)
+      }
+    })
   }
 
-  async broadcast(method: string, params: unknown, opts?: any): Promise<void> {
+  async broadcast(method: string, params: unknown, opts?: ClientCallOptions): Promise<void> {
     const first = this.serviceUrls.keys().next().value
     if (!first) throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, { message: "No service URL configured" })
-    const entry = await this.getSocket(first)
-    const { data } = this.buildEnvelope(method, params, "broadcast", opts)
-    entry.socket.send(data)
+    return this.runtime.emit({
+      serviceName: DEFAULT_BROADCAST_TOPIC,
+      method,
+      params,
+      opts,
+      type: "broadcast",
+      send: async (request) => {
+        const entry = await this.getSocket(first)
+        entry.socket.send(request.payload)
+      }
+    })
   }
 
   async subscribe<T = unknown>(
@@ -400,7 +283,7 @@ export class NevoWsClient {
       entry.subscriptions.set(key, bag)
     }
     const wrapped = (envelope: any) => {
-      if (method && envelope.method !== method && envelope.method?.split("@")[0] !== method) return
+      if (method && envelope.method !== method && parseMethod(envelope.method ?? "").name !== method) return
       if (!matchesFilter(options?.filter, envelope.meta)) return
       const ctx: SubscriptionContext = {
         meta: envelope.meta || {},
@@ -412,8 +295,7 @@ export class NevoWsClient {
     bag.add(wrapped)
 
     entry.subscribeRequests.set(key, { serviceName, method })
-    const subscribeReq = this.buildEnvelope("__subscribe", { serviceName, method }, "sub", {})
-    entry.socket.send(subscribeReq.data)
+    entry.socket.send(this.encode("__subscribe", { serviceName, method }, "sub").payload)
 
     return {
       unsubscribe: async () => {
@@ -441,11 +323,16 @@ export class NevoWsClient {
     this.discoveryRegistry.stopBackgroundPrune()
     for (const [, entry] of this.sockets) {
       entry.closed = true
+      for (const [, p] of entry.pending) {
+        clearTimeout(p.timer)
+        p.reject(new MessagingError(ErrorCode.CONNECTION_LOST, { message: "Client closed before reply" }))
+      }
+      entry.pending.clear()
       try {
         entry.socket?.close?.()
       } catch {}
     }
     this.sockets.clear()
-    await this.shutdown.shutdown(timeoutMs)
+    await this.runtime.close(timeoutMs)
   }
 }

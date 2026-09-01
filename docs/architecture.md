@@ -41,7 +41,7 @@ All bases expose the same surface: `query`, `emit`, `publish`, `subscribe`, `bro
 
 Decorators like `@NatsSignalRouter([UserService])` register controller-level routing. The `@Signal("user.getById", "getById", paramMap)` decorator maps a wire signal to a service method.
 
-The router is also where cross-cutting features attach: `accessControl`, `before`/`after` hooks, `debug` mode, transport-specific options.
+The decorator carries routing metadata (`eventPattern`, `serviceName`, `debug`, `before`/`after` hooks) and transport options. Request-processing configuration — ACL, idempotency, rate limits, replay window, health, stores — comes from `NevoModule.forRoot` / `forRootAsync`, so it can be built from injected providers. See [migration-nevo-module.md](./migration-nevo-module.md).
 
 ### Envelope
 

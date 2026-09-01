@@ -48,21 +48,21 @@ export async function setupNevoTracing(opts: NevoTracingSetupOptions): Promise<N
           headers: opts.headers
         })
       } catch (err: any) {
-        throw new Error(`OTLP exporter requires @opentelemetry/exporter-trace-otlp-http: ${err?.message}`)
+        throw new Error(`OTLP exporter requires @opentelemetry/exporter-trace-otlp-http: ${err?.message}`, { cause: err })
       }
     } else if (opts.exporter === "jaeger") {
       try {
         const jaeger = nodeRequire("@opentelemetry/exporter-jaeger") as any
         exporter = new jaeger.JaegerExporter({ endpoint: opts.endpoint ?? "http://localhost:14268/api/traces" })
       } catch (err: any) {
-        throw new Error(`Jaeger exporter requires @opentelemetry/exporter-jaeger: ${err?.message}`)
+        throw new Error(`Jaeger exporter requires @opentelemetry/exporter-jaeger: ${err?.message}`, { cause: err })
       }
     } else if (opts.exporter === "zipkin") {
       try {
         const zipkin = nodeRequire("@opentelemetry/exporter-zipkin") as any
         exporter = new zipkin.ZipkinExporter({ url: opts.endpoint ?? "http://localhost:9411/api/v2/spans", serviceName: opts.serviceName })
       } catch (err: any) {
-        throw new Error(`Zipkin exporter requires @opentelemetry/exporter-zipkin: ${err?.message}`)
+        throw new Error(`Zipkin exporter requires @opentelemetry/exporter-zipkin: ${err?.message}`, { cause: err })
       }
     } else if (opts.exporter === "console") {
       exporter = new sdkTrace.ConsoleSpanExporter()
@@ -83,7 +83,8 @@ export async function setupNevoTracing(opts: NevoTracingSetupOptions): Promise<N
   } catch (err: any) {
     throw new Error(
       `Failed to initialize OpenTelemetry tracing: ${err?.message ?? err}. ` +
-        `Install @opentelemetry/api @opentelemetry/sdk-trace-node @opentelemetry/resources @opentelemetry/semantic-conventions plus your exporter.`
+        `Install @opentelemetry/api @opentelemetry/sdk-trace-node @opentelemetry/resources @opentelemetry/semantic-conventions plus your exporter.`,
+      { cause: err }
     )
   }
 

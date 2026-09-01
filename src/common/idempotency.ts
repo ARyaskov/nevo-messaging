@@ -1,4 +1,38 @@
+import { createHash } from "node:crypto"
 import type { IdempotencyOptions } from "./types"
+import { stringifyWithBigInt } from "./bigint.utils"
+
+export function clientIdempotencyKey(serviceName: string, method: string, idempotencyKey: string): string {
+  return `${serviceName.length}:${serviceName}|${method.length}:${method}|${idempotencyKey}`
+}
+
+export function payloadFingerprint(params: unknown): string {
+  let serialized: string
+  try {
+    serialized = stringifyWithBigInt(params ?? null) ?? "null"
+  } catch {
+    return "unserializable"
+  }
+  return createHash("sha256").update(serialized).digest("base64url").slice(0, 22)
+}
+
+export interface ServerIdempotencyKeyInput {
+  callerService?: string
+  tenantId?: string
+  method: string
+  suppliedKey?: string
+  envelopeUuid?: string
+}
+
+/** Scoped by caller, tenant and method; the payload is compared via {@link payloadFingerprint}. */
+export function serverIdempotencyKey(input: ServerIdempotencyKeyInput): string | undefined {
+  const base = input.suppliedKey || input.envelopeUuid
+  if (!base) return undefined
+  // Empty, not a placeholder: an absent caller must not alias one named "anon".
+  const caller = input.callerService ?? ""
+  const tenant = input.tenantId ?? ""
+  return `${caller.length}:${caller}|${tenant.length}:${tenant}|${input.method.length}:${input.method}|${base}`
+}
 
 function detachBuffers(value: unknown, depth = 0): unknown {
   if (depth > 4 || value == null) return value

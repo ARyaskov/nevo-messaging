@@ -1,14 +1,16 @@
 import { Type, Post, Body } from "@nestjs/common"
 import { createSignalRouterDecorator, SignalRouterOptions } from "../../signal-router.utils"
-import { getCodec } from "../../common"
+import { getCodec, enforcePayloadLimit } from "../../common"
 
 export type HttpSignalRouterOptions = SignalRouterOptions
 
 const decodedBodies = new WeakMap<object, any>()
 
-function decodeBinaryBody(data: Uint8Array): any {
+function decodeBinaryBody(data: Uint8Array, maxPayloadBytes: number): any {
   const cached = decodedBodies.get(data)
   if (cached !== undefined) return cached
+  // Cap before the codec can pre-allocate from a crafted header.
+  enforcePayloadLimit(data, maxPayloadBytes)
   let decoded: any
   try {
     decoded = getCodec("msgpack").decode(data)
@@ -22,9 +24,9 @@ function decodeBinaryBody(data: Uint8Array): any {
 export function HttpSignalRouter(serviceType: Type<any> | Type<any>[], options?: HttpSignalRouterOptions) {
   return createSignalRouterDecorator(
     serviceType,
-    options,
-    (data) => {
-      const messageData: any = (data instanceof Uint8Array ? decodeBinaryBody(data) : data) || {}
+    options ?? {},
+    (data, ctx) => {
+      const messageData: any = (data instanceof Uint8Array ? decodeBinaryBody(data, ctx.maxPayloadBytes) : data) || {}
       return {
         method: messageData.method,
         params: messageData.params,

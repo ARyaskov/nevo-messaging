@@ -1,16 +1,12 @@
 import * as http from "node:http"
 import * as https from "node:https"
-import { randomUUID } from "node:crypto"
 import { createRequire } from "node:module"
-import { uuidv7 } from "../../common/uuid"
 import {
   DEFAULT_BROADCAST_TOPIC,
   DEFAULT_DISCOVERY_TOPIC,
   DEFAULT_EVENTS_SUFFIX,
   DiscoveryRegistry,
   DiscoveryAnnouncement,
-  MessageMeta,
-  MessageType,
   MessagingError,
   TimeoutError,
   ErrorCode,
@@ -20,41 +16,25 @@ import {
   Codec,
   JsonCodec,
   MessagePackCodec,
-  getCodec,
   NevoLogger,
-  getDefaultLogger,
-  CircuitBreakerRegistry,
-  ResolvedRetryOptions,
-  ResolvedCompressionOptions,
-  resolveRetryOptions,
-  runClientPipeline,
-  resolveCompressionOptions,
-  maybeCompress,
-  maybeCompressAsync,
+  getCodec,
+  ClientRuntime,
+  type ClientCallOptions,
+  httpStatusToError,
   maybeDecompress,
   maybeDecompressAsync,
   shouldDecompressAsync,
   enforcePayloadLimit,
-  DEFAULT_MAX_PAYLOAD_BYTES,
-  getDefaultTracer,
-  NevoTracer,
-  getDefaultMetrics,
   NEVO_METRIC_NAMES,
-  methodLabel,
-  MetricsRegistry,
-  GracefulShutdown,
-  LruIdempotencyCache,
   TransportClientOptions,
   matchesFilter,
-  DEFAULT_METHOD_VERSION,
-  formatMethod,
+  parseMethod,
   parseWithBigInt,
-  DevToolsBus,
-  getDevToolsBus,
-  publishClientEvent,
-  normalizeServiceName,
-  resolveOutboundChainId
+  normalizeServiceName
 } from "../../common"
+
+// Ceiling on trusting a server-declared content-length for pre-allocation.
+const PREALLOC_CEILING_BYTES = 64 * 1024
 
 const nodeRequire = createRequire(__filename)
 
@@ -86,22 +66,15 @@ export interface NevoHttpClientOptions extends TransportClientOptions {
 }
 
 export class NevoHttpClient {
+  private readonly runtime: ClientRuntime
   private readonly serviceUrls: Map<string, string>
   private readonly timeoutMs: number
-  private readonly debug: boolean
   private readonly serviceName?: string
   private readonly instanceId: string
-  private readonly authToken?: string
   private readonly logger: NevoLogger
   private readonly codec: Codec
-  private readonly circuitBreaker: CircuitBreakerRegistry
-  private readonly retryOptions: ResolvedRetryOptions
-  private readonly compression: ResolvedCompressionOptions
-  private readonly tracer: NevoTracer
-  private readonly metrics: MetricsRegistry
-  private readonly shutdown = new GracefulShutdown()
   private readonly maxPayloadBytes: number
-  private readonly idempotencyCache: LruIdempotencyCache<unknown>
+  private readonly streamAborts = new Set<AbortController>()
   private readonly discoveryRegistry = new DiscoveryRegistry()
   private readonly discoveryEnabled: boolean
   private readonly discoveryHeartbeatIntervalMs: number
@@ -115,8 +88,6 @@ export class NevoHttpClient {
   private readonly host?: string
   private readonly port?: number
   private readonly version?: string
-  private readonly devtoolsBus: DevToolsBus | null
-  private readonly metaStaticPart: Pick<MessageMeta, "service" | "instanceId" | "auth" | "codec">
   private readonly tcpNoDelay: boolean = true
   private readonly recvBufferSize?: number
   private readonly sseIdleTimeoutMs: number
@@ -126,26 +97,16 @@ export class NevoHttpClient {
 
   constructor(serviceUrls: Record<string, string>, options?: NevoHttpClientOptions) {
     this.serviceUrls = new Map(Object.entries(serviceUrls).map(([k, v]) => [k.toLowerCase(), v]))
-    this.timeoutMs = options?.timeoutMs ?? options?.timeout ?? 20000
-    this.debug = options?.debug || false
-    this.serviceName = options?.serviceName
-    this.instanceId = options?.instanceId || randomUUID()
-    this.authToken = options?.authToken
-    this.logger = (options?.logger as NevoLogger) || getDefaultLogger().child({ component: "http-client", service: this.serviceName })
-    this.codec = options?.codec
-      ? typeof options.codec === "string"
-        ? getCodec(options.codec)
-        : (options.codec as Codec)
-      : options?.useMessagePack === false
-        ? new JsonCodec()
-        : tryMsgpackOrJson()
-    this.circuitBreaker = new CircuitBreakerRegistry(options?.circuitBreaker)
-    this.retryOptions = resolveRetryOptions(options?.retry)
-    this.compression = resolveCompressionOptions(options?.compression)
-    this.tracer = getDefaultTracer()
-    this.metrics = getDefaultMetrics()
-    this.maxPayloadBytes = options?.security?.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES
-    this.idempotencyCache = new LruIdempotencyCache<unknown>(options?.idempotency)
+    this.runtime = new ClientRuntime(options, {
+      transport: "http",
+      fallbackCodec: () => (options?.useMessagePack === false ? new JsonCodec() : tryMsgpackOrJson())
+    })
+    this.timeoutMs = this.runtime.timeoutMs
+    this.serviceName = this.runtime.serviceName
+    this.instanceId = this.runtime.instanceId
+    this.logger = this.runtime.logger
+    this.codec = this.runtime.codec
+    this.maxPayloadBytes = this.runtime.maxPayloadBytes
     this.discoveryEnabled = options?.discovery?.enabled === true && !!options?.discoveryUrl
     this.discoveryHeartbeatIntervalMs = options?.discovery?.heartbeatIntervalMs || 10000
     this.discoveryTtlMs = options?.discovery?.ttlMs || 30000
@@ -154,13 +115,6 @@ export class NevoHttpClient {
     this.host = options?.discovery?.host
     this.port = options?.discovery?.port
     this.version = options?.discovery?.version
-    this.devtoolsBus = options?.devtools === false ? null : options?.devtools instanceof Object ? (options.devtools as DevToolsBus) : getDevToolsBus()
-    this.metaStaticPart = Object.freeze({
-      service: this.serviceName,
-      instanceId: this.instanceId,
-      auth: this.authToken ? { token: this.authToken } : undefined,
-      codec: this.codec.name
-    })
 
     const keepAlive = options?.keepAlive !== false
     const maxSockets = options?.maxSockets ?? Infinity
@@ -244,83 +198,6 @@ export class NevoHttpClient {
     return this.instanceId
   }
 
-  private buildMeta(
-    type: MessageType,
-    opts?: { idempotencyKey?: string; version?: string; headers?: Record<string, string>; tenantId?: string }
-  ): MessageMeta {
-    const baseMeta: MessageMeta = {
-      ...this.metaStaticPart,
-      type,
-      ts: Date.now(),
-      version: opts?.version || DEFAULT_METHOD_VERSION,
-      idempotencyKey: opts?.idempotencyKey,
-      tenantId: opts?.tenantId,
-      headers: opts?.headers,
-      nevoChainId: resolveOutboundChainId()
-    }
-    return this.tracer.inject(baseMeta)
-  }
-
-  private createBodySync(
-    method: string,
-    params: unknown,
-    type: MessageType,
-    opts?: any
-  ): { buf: Uint8Array; meta: MessageMeta; uuid: string; encoding: "gzip" | "deflate" | "zstd" | "identity"; versionedMethod: string } {
-    const uuid = opts?.uuid ?? uuidv7()
-    const meta = this.buildMeta(type, opts)
-    const versionedMethod = method.includes("@") ? method : formatMethod(method, opts?.version || DEFAULT_METHOD_VERSION)
-    const envelope = { uuid, method: versionedMethod, params, meta }
-    const raw = this.codec.encode(envelope)
-    if (raw.byteLength > this.maxPayloadBytes) {
-      throw new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, { message: `Payload size ${raw.byteLength}B exceeds ${this.maxPayloadBytes}B` })
-    }
-    const compressed = maybeCompress(raw, this.compression)
-    meta.contentEncoding = compressed.encoding
-    this.metrics.observeHistogram(
-      NEVO_METRIC_NAMES.payloadBytes,
-      { direction: "out", service: this.serviceName ?? "unknown" },
-      compressed.data.byteLength
-    )
-    return { buf: compressed.data, meta, uuid, encoding: compressed.encoding, versionedMethod }
-  }
-
-  private createBody(
-    method: string,
-    params: unknown,
-    type: MessageType,
-    opts?: any
-  ):
-    | { buf: Uint8Array; meta: MessageMeta; uuid: string; encoding: "gzip" | "deflate" | "zstd" | "identity"; versionedMethod: string }
-    | Promise<{ buf: Uint8Array; meta: MessageMeta; uuid: string; encoding: "gzip" | "deflate" | "zstd" | "identity"; versionedMethod: string }> {
-    if (this.compression.async && this.compression.enabled) return this.createBodyAsync(method, params, type, opts)
-    return this.createBodySync(method, params, type, opts)
-  }
-
-  private async createBodyAsync(
-    method: string,
-    params: unknown,
-    type: MessageType,
-    opts?: any
-  ): Promise<{ buf: Uint8Array; meta: MessageMeta; uuid: string; encoding: "gzip" | "deflate" | "zstd" | "identity"; versionedMethod: string }> {
-    const uuid = opts?.uuid ?? uuidv7()
-    const meta = this.buildMeta(type, opts)
-    const versionedMethod = method.includes("@") ? method : formatMethod(method, opts?.version || DEFAULT_METHOD_VERSION)
-    const envelope = { uuid, method: versionedMethod, params, meta }
-    const raw = this.codec.encode(envelope)
-    if (raw.byteLength > this.maxPayloadBytes) {
-      throw new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, { message: `Payload size ${raw.byteLength}B exceeds ${this.maxPayloadBytes}B` })
-    }
-    const compressed = await maybeCompressAsync(raw, this.compression)
-    meta.contentEncoding = compressed.encoding
-    this.metrics.observeHistogram(
-      NEVO_METRIC_NAMES.payloadBytes,
-      { direction: "out", service: this.serviceName ?? "unknown" },
-      compressed.data.byteLength
-    )
-    return { buf: compressed.data, meta, uuid, encoding: compressed.encoding, versionedMethod }
-  }
-
   private getServiceUrl(serviceName: string): string {
     const normalized = normalizeServiceName(serviceName)
     const url = this.serviceUrls.get(normalized)
@@ -384,10 +261,16 @@ export class NevoHttpClient {
       if (Number.isFinite(expected) && expected > wireCap) {
         clearTimeout(deadline)
         req.destroy()
-        reject(new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, { message: `Response content-length ${expected}B exceeds ${wireCap}B`, size: expected, limit: wireCap }))
+        reject(
+          new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, {
+            message: `Response content-length ${expected}B exceeds ${wireCap}B`,
+            size: expected,
+            limit: wireCap
+          })
+        )
         return
       }
-      const knownLen = Number.isFinite(expected) && expected > 0 ? expected : -1
+      const knownLen = Number.isFinite(expected) && expected > 0 ? Math.min(expected, PREALLOC_CEILING_BYTES) : -1
       let preBuf: Buffer | null = knownLen > 0 ? Buffer.allocUnsafe(knownLen) : null
       let offset = 0
       const chunks: Buffer[] = []
@@ -486,7 +369,11 @@ export class NevoHttpClient {
       const declared = Number(responseHeaders["content-length"])
       if (Number.isFinite(declared) && declared > wireCap) {
         controller.abort()
-        throw new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, { message: `Response content-length ${declared}B exceeds ${wireCap}B`, size: declared, limit: wireCap })
+        throw new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, {
+          message: `Response content-length ${declared}B exceeds ${wireCap}B`,
+          size: declared,
+          limit: wireCap
+        })
       }
       const parts: Buffer[] = []
       let received = 0
@@ -505,162 +392,98 @@ export class NevoHttpClient {
       }
     } catch (err) {
       if (err instanceof MessagingError) throw err
-      if (controller.signal.aborted) throw new Error("timeout")
+      if (controller.signal.aborted) throw new Error("timeout", { cause: err })
       throw err
     } finally {
       clearTimeout(timer)
     }
   }
 
-  async query<T = unknown>(
-    serviceName: string,
-    method: string,
-    params: unknown,
-    opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; timeoutMs?: number; tenantId?: string }
-  ): Promise<T> {
-    const cbKey = `${normalizeServiceName(serviceName)}:${method}`
-    const url = this.getServiceUrl(serviceName)
-    const endpoint = `${url}/${normalizeServiceName(serviceName)}${DEFAULT_EVENTS_SUFFIX}`
-
-    return this.shutdown.trackInflight(
-      (async () => {
-        if (opts?.idempotencyKey && this.idempotencyCache.isEnabled() && this.idempotencyCache.has(opts.idempotencyKey)) {
-          return this.idempotencyCache.get(opts.idempotencyKey) as T
-        }
-
-        // Fresh envelope uuid per attempt keeps replay protection intact; a stable
-        // idempotency key dedupes retries server-side instead.
-        const retryIdemKey = opts?.idempotencyKey ?? uuidv7()
-        const result = await runClientPipeline<T>(this.circuitBreaker, this.retryOptions, cbKey, async (attempt) => {
-          const startMs = Date.now()
-          let lastUuid: string | undefined
-          let lastChainId: string | undefined
-          try {
-            const { buf, encoding, uuid, meta } = await this.createBody(method, params, "query", {
-              ...opts,
-              idempotencyKey: retryIdemKey,
-              headers: { ...(opts?.headers || {}), "nevo-attempt": String(attempt) }
-            })
-            lastUuid = uuid
-            lastChainId = meta.nevoChainId
-            const span = this.tracer.startSpan(`nevo.client.query ${serviceName}.${method}`, {
-              "nevo.method": method,
-              "nevo.service": serviceName,
-              "nevo.attempt": attempt
-            })
-            try {
-              const res = await this.sendBuffer(endpoint, buf, this.codec.contentType, encoding, undefined, opts?.timeoutMs)
-              this.metrics.observeHistogram(
-                NEVO_METRIC_NAMES.payloadBytes,
-                { direction: "in", service: this.serviceName ?? "unknown" },
-                res.body.byteLength
-              )
-              const respEncoding = res.headers["content-encoding"]
-              const decompressed = shouldDecompressAsync(res.body.byteLength, respEncoding)
-                ? await maybeDecompressAsync(res.body, respEncoding, this.maxPayloadBytes)
-                : maybeDecompress(res.body, respEncoding, this.maxPayloadBytes)
-              enforcePayloadLimit(decompressed, this.maxPayloadBytes)
-              let payload: any
-              try {
-                payload = decompressed.byteLength === 0 ? undefined : this.decodeResponseBody(decompressed, res.headers["content-type"])
-              } catch (decodeErr) {
-                // Non-nevo error body may not decode; prefer the HTTP status.
-                if (res.status >= 400) throw httpStatusToError(res.status, serviceName)
-                throw decodeErr
-              }
-              if (payload?.params?.result === "error" && payload?.params?.error) {
-                const err = payload.params.error
-                throw new MessagingError(err.code, err.details ?? { message: err.message }, err.service || serviceName)
-              }
-              // Non-envelope error status must not count as success.
-              if (res.status >= 400) throw httpStatusToError(res.status, serviceName)
-              span.setStatus({ code: 1 })
-              publishClientEvent(this.devtoolsBus, {
-                service: serviceName,
-                method,
-                uuid,
-                chainId: lastChainId,
-                durationMs: Date.now() - startMs,
-                status: "ok",
-                transport: "http",
-                origin: this.serviceName
-              })
-              return payload?.params?.result as T
-            } catch (err: any) {
-              span.recordException(err)
-              span.setStatus({ code: 2, message: err?.message })
-              if (err?.message === "timeout") throw new TimeoutError(serviceName, method, opts?.timeoutMs ?? this.timeoutMs)
-              throw err
-            } finally {
-              span.end()
-              this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, {
-                transport: "http",
-                service: serviceName,
-                method: methodLabel(method),
-                role: "client"
-              })
-              if (attempt > 1)
-                this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "http", service: serviceName, method: methodLabel(method) })
-            }
-          } catch (err: any) {
-            publishClientEvent(this.devtoolsBus, {
-              service: serviceName,
-              method,
-              uuid: lastUuid,
-              chainId: lastChainId,
-              durationMs: Date.now() - startMs,
-              status: "error",
-              transport: "http",
-              origin: this.serviceName,
-              error: { code: err instanceof MessagingError ? err.code : err?.code, message: err?.message ?? String(err) }
-            })
-            throw err
-          }
-        })
-
-        if (opts?.idempotencyKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(opts.idempotencyKey, result)
-        return result
-      })()
-    )
-  }
-
-  async emit(
-    serviceName: string,
-    method: string,
-    params: unknown,
-    opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }
-  ): Promise<void> {
-    const url = this.getServiceUrl(serviceName)
+  async query<T = unknown>(serviceName: string, method: string, params: unknown, opts?: ClientCallOptions): Promise<T> {
     const normalized = normalizeServiceName(serviceName)
-    const endpoint = `${url}/${normalized}${DEFAULT_EVENTS_SUFFIX}`
-    const idemKey = opts?.idempotencyKey ?? uuidv7()
-    return this.shutdown.trackInflight(
-      runClientPipeline<void>(this.circuitBreaker, this.retryOptions, `${normalized}:${method}`, async () => {
-        const { buf, encoding } = await this.createBody(method, params, "emit", { ...opts, idempotencyKey: idemKey })
-        const res = await this.sendBuffer(endpoint, buf, this.codec.contentType, encoding)
-        if (res.status >= 400) throw httpStatusToError(res.status, serviceName)
-      })
-    )
-  }
-
-  async publish(serviceName: string, method: string, params: unknown, opts?: { version?: string; headers?: Record<string, string> }): Promise<void> {
-    const url = this.getServiceUrl(serviceName)
-    const endpoint = `${url}/__nevo/publish`
-    const { buf, encoding } = await this.createBody(method, params, "sub", {
-      ...opts,
-      headers: { ...(opts?.headers || {}), "nevo-service": serviceName }
+    const endpoint = `${this.getServiceUrl(serviceName)}/${normalized}${DEFAULT_EVENTS_SUFFIX}`
+    return this.runtime.query<T>({
+      serviceName: normalized,
+      method,
+      params,
+      opts,
+      mapError: (err: any) => (err?.message === "timeout" ? new TimeoutError(serviceName, method, opts?.timeoutMs ?? this.timeoutMs) : err),
+      send: async (request) => {
+        const res = await this.sendBuffer(endpoint, request.payload, this.codec.contentType, request.encoding, undefined, opts?.timeoutMs)
+        let envelope: unknown
+        try {
+          const decompressed = await this.decompressResponse(res)
+          envelope = decompressed.byteLength === 0 ? undefined : this.decodeResponseBody(decompressed, res.headers["content-type"])
+        } catch (decodeErr) {
+          if (res.status >= 400) throw httpStatusToError(res.status, serviceName, res.headers)
+          throw decodeErr
+        }
+        if (res.status >= 400 && !(envelope as any)?.params?.error) throw httpStatusToError(res.status, serviceName, res.headers)
+        return envelope
+      }
     })
-    const res = await this.sendBuffer(endpoint, buf, this.codec.contentType, encoding)
-    if (res.status >= 400) throw httpStatusToError(res.status, serviceName)
   }
 
-  async broadcast(method: string, params: unknown, opts?: { version?: string; headers?: Record<string, string> }): Promise<void> {
+  private async decompressResponse(res: { body: Uint8Array; headers: Record<string, string> }): Promise<Uint8Array> {
+    this.runtime.metrics.observeHistogram(
+      NEVO_METRIC_NAMES.payloadBytes,
+      { direction: "in", service: this.serviceName ?? "unknown" },
+      res.body.byteLength
+    )
+    const respEncoding = res.headers["content-encoding"]
+    const decompressed = shouldDecompressAsync(res.body.byteLength, respEncoding)
+      ? await maybeDecompressAsync(res.body, respEncoding, this.maxPayloadBytes)
+      : maybeDecompress(res.body, respEncoding, this.maxPayloadBytes)
+    enforcePayloadLimit(decompressed, this.maxPayloadBytes)
+    return decompressed
+  }
+
+  async emit(serviceName: string, method: string, params: unknown, opts?: ClientCallOptions): Promise<void> {
+    const normalized = normalizeServiceName(serviceName)
+    const endpoint = `${this.getServiceUrl(serviceName)}/${normalized}${DEFAULT_EVENTS_SUFFIX}`
+    return this.runtime.emit({
+      serviceName: normalized,
+      method,
+      params,
+      opts,
+      send: async (request) => {
+        const res = await this.sendBuffer(endpoint, request.payload, this.codec.contentType, request.encoding)
+        if (res.status >= 400) throw httpStatusToError(res.status, serviceName, res.headers)
+      }
+    })
+  }
+
+  async publish(serviceName: string, method: string, params: unknown, opts?: ClientCallOptions): Promise<void> {
+    const normalized = normalizeServiceName(serviceName)
+    const endpoint = `${this.getServiceUrl(serviceName)}/__nevo/publish`
+    return this.runtime.emit({
+      serviceName: normalized,
+      method,
+      params,
+      opts: { ...opts, headers: { ...(opts?.headers ?? {}), "nevo-service": serviceName } },
+      type: "sub",
+      send: async (request) => {
+        const res = await this.sendBuffer(endpoint, request.payload, this.codec.contentType, request.encoding)
+        if (res.status >= 400) throw httpStatusToError(res.status, serviceName, res.headers)
+      }
+    })
+  }
+
+  async broadcast(method: string, params: unknown, opts?: ClientCallOptions): Promise<void> {
     const url = this.discoveryUrl || this.serviceUrls.values().next().value
     if (!url) throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, { message: "No base URL available for broadcast" })
     const endpoint = `${url.replace(/\/+$/, "")}/${DEFAULT_BROADCAST_TOPIC}`
-    const { buf, encoding } = await this.createBody(method, params, "broadcast", opts)
-    const res = await this.sendBuffer(endpoint, buf, this.codec.contentType, encoding)
-    if (res.status >= 400) throw httpStatusToError(res.status, DEFAULT_BROADCAST_TOPIC)
+    return this.runtime.emit({
+      serviceName: DEFAULT_BROADCAST_TOPIC,
+      method,
+      params,
+      opts,
+      type: "broadcast",
+      send: async (request) => {
+        const res = await this.sendBuffer(endpoint, request.payload, this.codec.contentType, request.encoding)
+        if (res.status >= 400) throw httpStatusToError(res.status, DEFAULT_BROADCAST_TOPIC, res.headers)
+      }
+    })
   }
 
   async subscribe<T = unknown>(
@@ -680,6 +503,7 @@ export class NevoHttpClient {
 
     const controller = new AbortController()
     const signal = controller.signal
+    this.streamAborts.add(controller)
 
     const connect = async (): Promise<ReadableStreamDefaultReader<Uint8Array>> => {
       const response = await fetch(endpoint, {
@@ -735,7 +559,7 @@ export class NevoHttpClient {
           } catch {
             continue
           }
-          if (method && payload.method !== method && payload.method?.split("@")[0] !== method) continue
+          if (method && payload.method !== method && parseMethod(payload.method ?? "").name !== method) continue
           if (!matchesFilter(options?.filter, payload.meta)) continue
           const context: SubscriptionContext = {
             meta: payload.meta || {},
@@ -780,9 +604,14 @@ export class NevoHttpClient {
         }
       }
     }
-    void readLoop(initialReader)
+    readLoop(initialReader).catch((err) => this.logger.error({ event: "http.sub.loop_crashed", err: (err as Error)?.message }))
 
-    return { unsubscribe: async () => controller.abort() }
+    return {
+      unsubscribe: async () => {
+        this.streamAborts.delete(controller)
+        controller.abort()
+      }
+    }
   }
 
   getAvailableServices(): string[] {
@@ -869,12 +698,14 @@ export class NevoHttpClient {
     if (this.discoveryTimer) clearInterval(this.discoveryTimer)
     this.discoveryRegistry.stopBackgroundPrune()
     if (this.discoveryAbort) this.discoveryAbort.abort()
+    for (const controller of this.streamAborts) controller.abort()
+    this.streamAborts.clear()
     try {
       await this.undiciDispatcher?.close()
     } catch {}
     this.httpAgent.destroy()
     this.httpsAgent.destroy()
-    await this.shutdown.shutdown(timeoutMs)
+    await this.runtime.close(timeoutMs)
   }
 }
 
@@ -907,24 +738,5 @@ function tryMsgpackOrJson(): Codec {
     return codec
   } catch {
     return new JsonCodec()
-  }
-}
-
-// Maps an HTTP error status (>= 400) to a MessagingError; only 502/503/504 are retryable.
-function httpStatusToError(status: number, serviceName: string): MessagingError {
-  switch (status) {
-    case 413:
-      return new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, { message: `Remote returned HTTP ${status}`, httpStatus: status }, serviceName)
-    case 502:
-    case 503:
-      return new MessagingError(
-        ErrorCode.SERVICE_UNAVAILABLE,
-        { message: `Remote returned HTTP ${status}`, httpStatus: status, retryable: true },
-        serviceName
-      )
-    case 504:
-      return new MessagingError(ErrorCode.TIMEOUT, { message: `Remote returned HTTP ${status}`, httpStatus: status, retryable: true }, serviceName)
-    default:
-      return new MessagingError(ErrorCode.REMOTE_ERROR, { message: `Remote returned HTTP ${status}`, httpStatus: status }, serviceName)
   }
 }

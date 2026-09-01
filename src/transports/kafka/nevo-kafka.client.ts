@@ -1,7 +1,6 @@
 import { ClientKafka } from "@nestjs/microservices"
 import type { OnModuleDestroy } from "@nestjs/common"
 import { lastValueFrom, timeout, TimeoutError as RxTimeoutError } from "rxjs"
-import { randomUUID } from "node:crypto"
 import { uuidv7 } from "../../common/uuid"
 import type { Consumer, Producer, Kafka as KafkaType } from "kafkajs"
 import {
@@ -19,41 +18,15 @@ import {
   SubscriptionOptions,
   DiscoveryAnnouncement,
   Codec,
-  getCodec,
-  getDefaultCodec,
   NevoLogger,
-  getDefaultLogger,
-  CircuitBreakerRegistry,
-  ResolvedRetryOptions,
-  ResolvedCompressionOptions,
-  resolveRetryOptions,
-  runClientPipeline,
-  resolveCompressionOptions,
-  maybeCompress,
-  maybeCompressAsync,
-  maybeDecompress,
-  maybeDecompressAsync,
-  shouldDecompressAsync,
-  enforcePayloadLimit,
-  DEFAULT_MAX_PAYLOAD_BYTES,
-  getDefaultTracer,
-  NevoTracer,
-  getDefaultMetrics,
-  NEVO_METRIC_NAMES,
-  methodLabel,
-  MetricsRegistry,
-  GracefulShutdown,
-  LruIdempotencyCache,
+  ClientRuntime,
+  type ClientCallOptions,
+  type EncodedRequest,
+  parseMethod,
   TransportClientOptions,
   matchesFilter,
-  DEFAULT_METHOD_VERSION,
-  formatMethod,
   DlqRouter,
-  DevToolsBus,
-  getDevToolsBus,
-  publishClientEvent,
   normalizeServiceName,
-  resolveOutboundChainId,
   mapLimit
 } from "../../common"
 import { getKafkaModule } from "../optional-deps"
@@ -86,25 +59,26 @@ interface StickyGroup {
 // Defensive upper bound on a consumer's deliveryCounts map.
 const MAX_DELIVERY_COUNTS = 10_000
 
+interface KafkaEncodedRequest {
+  key: string
+  value: Uint8Array
+  meta: MessageMeta
+  uuid: string
+  method: string
+  encoding: string
+}
+
 export class NevoKafkaClient implements OnModuleDestroy {
   private readonly kafkaClient: ClientKafka
   private readonly serviceNames: string[]
   private readonly timeoutMs: number
-  private readonly debug: boolean
+  private readonly runtime: ClientRuntime
   private readonly serviceName?: string
   private readonly instanceId: string
-  private readonly authToken?: string
   private readonly brokers: string[]
   private readonly logger: NevoLogger
   private readonly codec: Codec
-  private readonly circuitBreaker: CircuitBreakerRegistry
-  private readonly retryOptions: ResolvedRetryOptions
-  private readonly compression: ResolvedCompressionOptions
-  private readonly tracer: NevoTracer
-  private readonly metrics: MetricsRegistry
-  private readonly shutdown = new GracefulShutdown()
   private readonly maxPayloadBytes: number
-  private readonly idempotencyCache: LruIdempotencyCache<unknown>
   private readonly discoveryRegistry = new DiscoveryRegistry()
   private readonly discoveryEnabled: boolean
   private readonly discoveryHeartbeatIntervalMs: number
@@ -124,28 +98,20 @@ export class NevoKafkaClient implements OnModuleDestroy {
   private readonly port?: number
   private readonly version?: string
   private readonly dlq: DlqRouter
-  private readonly devtoolsBus: DevToolsBus | null
-  private readonly metaStaticPart: Pick<MessageMeta, "service" | "instanceId" | "auth" | "codec">
 
   constructor(kafkaClient: ClientKafka, serviceNames: string[], options?: NevoKafkaClientOptions) {
     this.kafkaClient = kafkaClient
     this.serviceNames = serviceNames.map((n) => n.toLowerCase())
-    this.timeoutMs = options?.timeoutMs ?? options?.timeout ?? 20000
-    this.debug = options?.debug || false
-    this.serviceName = options?.serviceName
-    this.instanceId = options?.instanceId || randomUUID()
-    this.authToken = options?.authToken
+    this.runtime = new ClientRuntime(options, { transport: "kafka" })
+    this.timeoutMs = this.runtime.timeoutMs
+    this.serviceName = this.runtime.serviceName
+    this.instanceId = this.runtime.instanceId
+    this.logger = this.runtime.logger
+    this.codec = this.runtime.codec
+    this.maxPayloadBytes = this.runtime.maxPayloadBytes
     this.brokers = options?.brokers && options.brokers.length > 0 ? options.brokers : ["127.0.0.1:9092"]
-    this.logger = (options?.logger as NevoLogger) || getDefaultLogger().child({ component: "kafka-client", service: this.serviceName })
-    this.codec = typeof options?.codec === "string" ? getCodec(options.codec) : (options?.codec as Codec) || getDefaultCodec()
-    this.circuitBreaker = new CircuitBreakerRegistry(options?.circuitBreaker)
-    this.retryOptions = resolveRetryOptions(options?.retry)
-    this.compression = resolveCompressionOptions(options?.compression)
-    this.tracer = getDefaultTracer()
-    this.metrics = getDefaultMetrics()
-    this.maxPayloadBytes = options?.security?.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES
-    this.idempotencyCache = new LruIdempotencyCache<unknown>(options?.idempotency)
-    this.discoveryEnabled = options?.discovery?.enabled !== false
+    // Opt-in: announcements go to a shared, unauthenticated topic.
+    this.discoveryEnabled = options?.discovery?.enabled === true
     this.discoveryHeartbeatIntervalMs = options?.discovery?.heartbeatIntervalMs || 10000
     this.discoveryTtlMs = options?.discovery?.ttlMs || 30000
     this.capabilities = options?.discovery?.capabilities
@@ -154,13 +120,6 @@ export class NevoKafkaClient implements OnModuleDestroy {
     this.version = options?.discovery?.version
     this.dlq = new DlqRouter({ enabled: (options as any)?.dlq?.enabled === true })
     this.enableStickyRouter = (options as any)?.stickyRouter !== false
-    this.devtoolsBus = options?.devtools === false ? null : options?.devtools instanceof Object ? (options.devtools as DevToolsBus) : getDevToolsBus()
-    this.metaStaticPart = Object.freeze({
-      service: this.serviceName,
-      instanceId: this.instanceId,
-      auth: this.authToken ? { token: this.authToken } : undefined,
-      codec: this.codec.name
-    })
 
     const { Kafka } = getKafkaModule()
     this.sharedKafkaForSubs = new Kafka({
@@ -183,79 +142,38 @@ export class NevoKafkaClient implements OnModuleDestroy {
     return this.instanceId
   }
 
-  private buildMeta(
-    type: MessageType,
-    opts?: { idempotencyKey?: string; version?: string; headers?: Record<string, string>; tenantId?: string }
-  ): MessageMeta {
-    const baseMeta: MessageMeta = {
-      ...this.metaStaticPart,
-      type,
-      ts: Date.now(),
-      version: opts?.version || DEFAULT_METHOD_VERSION,
-      idempotencyKey: opts?.idempotencyKey,
-      tenantId: opts?.tenantId,
-      headers: opts?.headers,
-      nevoChainId: resolveOutboundChainId()
+  private toKafkaRequest(request: EncodedRequest): KafkaEncodedRequest {
+    return {
+      key: request.uuid,
+      value: request.payload,
+      meta: request.meta,
+      uuid: request.uuid,
+      method: request.method,
+      encoding: request.encoding
     }
-    return this.tracer.inject(baseMeta)
   }
 
-  private encodeRequestSync(
-    method: string,
-    params: unknown,
-    type: MessageType,
-    opts?: { idempotencyKey?: string; version?: string; headers?: Record<string, string>; tenantId?: string; uuid?: string }
-  ): { key: string; value: Uint8Array; meta: MessageMeta; uuid: string; method: string; encoding: string } {
-    const uuid = opts?.uuid ?? uuidv7()
-    const meta = this.buildMeta(type, opts)
-    const versioned = method.includes("@") ? method : formatMethod(method, opts?.version || DEFAULT_METHOD_VERSION)
-    const body = { uuid, method: versioned, params, meta }
-    const raw = this.codec.encode(body)
-    if (raw.byteLength > this.maxPayloadBytes) {
-      throw new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, { message: `Payload size ${raw.byteLength}B exceeds ${this.maxPayloadBytes}B` })
-    }
-    const compressed = maybeCompress(raw, this.compression)
-    this.metrics.observeHistogram(
-      NEVO_METRIC_NAMES.payloadBytes,
-      { direction: "out", service: this.serviceName ?? "unknown" },
-      compressed.data.byteLength
-    )
-    return { key: uuid, value: compressed.data, meta, uuid, method: versioned, encoding: compressed.encoding }
-  }
-
-  private encodeRequest(
-    method: string,
-    params: unknown,
-    type: MessageType,
-    opts?: { idempotencyKey?: string; version?: string; headers?: Record<string, string>; tenantId?: string; uuid?: string }
-  ):
-    | { key: string; value: Uint8Array; meta: MessageMeta; uuid: string; method: string; encoding: string }
-    | Promise<{ key: string; value: Uint8Array; meta: MessageMeta; uuid: string; method: string; encoding: string }> {
-    if (this.compression.async && this.compression.enabled) return this.encodeRequestAsync(method, params, type, opts)
-    return this.encodeRequestSync(method, params, type, opts)
+  private encodeRequestSync(method: string, params: unknown, type: MessageType, opts?: ClientCallOptions & { uuid?: string }): KafkaEncodedRequest {
+    return this.toKafkaRequest(this.runtime.encodeSync(method, params, type, opts))
   }
 
   private async encodeRequestAsync(
     method: string,
     params: unknown,
     type: MessageType,
-    opts?: { idempotencyKey?: string; version?: string; headers?: Record<string, string>; tenantId?: string; uuid?: string }
-  ): Promise<{ key: string; value: Uint8Array; meta: MessageMeta; uuid: string; method: string; encoding: string }> {
-    const uuid = opts?.uuid ?? uuidv7()
-    const meta = this.buildMeta(type, opts)
-    const versioned = method.includes("@") ? method : formatMethod(method, opts?.version || DEFAULT_METHOD_VERSION)
-    const body = { uuid, method: versioned, params, meta }
-    const raw = this.codec.encode(body)
-    if (raw.byteLength > this.maxPayloadBytes) {
-      throw new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, { message: `Payload size ${raw.byteLength}B exceeds ${this.maxPayloadBytes}B` })
-    }
-    const compressed = await maybeCompressAsync(raw, this.compression)
-    this.metrics.observeHistogram(
-      NEVO_METRIC_NAMES.payloadBytes,
-      { direction: "out", service: this.serviceName ?? "unknown" },
-      compressed.data.byteLength
-    )
-    return { key: uuid, value: compressed.data, meta, uuid, method: versioned, encoding: compressed.encoding }
+    opts?: ClientCallOptions & { uuid?: string }
+  ): Promise<KafkaEncodedRequest> {
+    return this.toKafkaRequest(await this.runtime.encodeAsync(method, params, type, opts))
+  }
+
+  private encodeRequest(
+    method: string,
+    params: unknown,
+    type: MessageType,
+    opts?: ClientCallOptions & { uuid?: string }
+  ): KafkaEncodedRequest | Promise<KafkaEncodedRequest> {
+    const encoded = this.runtime.encode(method, params, type, opts)
+    return encoded instanceof Promise ? encoded.then((r) => this.toKafkaRequest(r)) : this.toKafkaRequest(encoded)
   }
 
   private toKafkaHeaders(encoding: string): Record<string, string> | undefined {
@@ -264,20 +182,7 @@ export class NevoKafkaClient implements OnModuleDestroy {
 
   private decodePayload<T = any>(data: Uint8Array | Buffer | string, encoding?: string): T | Promise<T> {
     const buf = typeof data === "string" ? Buffer.from(data, "utf8") : Buffer.from(data as any)
-    this.metrics.observeHistogram(NEVO_METRIC_NAMES.payloadBytes, { direction: "in", service: this.serviceName ?? "unknown" }, buf.byteLength)
-    // Identity is synchronous; compressed payloads use async zlib or the worker pool.
-    if (!shouldDecompressAsync(buf.byteLength, encoding)) {
-      const decompressed = maybeDecompress(buf, encoding, this.maxPayloadBytes)
-      enforcePayloadLimit(decompressed, this.maxPayloadBytes)
-      return this.codec.decode<T>(decompressed)
-    }
-    return this.decodePayloadAsync<T>(buf, encoding)
-  }
-
-  private async decodePayloadAsync<T = any>(buf: Buffer, encoding?: string): Promise<T> {
-    const decompressed = await maybeDecompressAsync(buf, encoding, this.maxPayloadBytes)
-    enforcePayloadLimit(decompressed, this.maxPayloadBytes)
-    return this.codec.decode<T>(decompressed)
+    return this.runtime.decode<T>(buf, encoding)
   }
 
   private ensureServiceRegistered(serviceName: string): string {
@@ -291,119 +196,44 @@ export class NevoKafkaClient implements OnModuleDestroy {
     return normalized
   }
 
-  async query<T = unknown>(
-    serviceName: string,
-    method: string,
-    params: unknown,
-    opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; tenantId?: string; timeoutMs?: number }
-  ): Promise<T> {
+  async query<T = unknown>(serviceName: string, method: string, params: unknown, opts?: ClientCallOptions): Promise<T> {
     const normalized = this.ensureServiceRegistered(serviceName)
     const topic = `${normalized}-events`
-    const cbKey = `${normalized}:${method}`
-
-    return this.shutdown.trackInflight(
-      (async () => {
-        const idempotencyKey = opts?.idempotencyKey
-        if (idempotencyKey && this.idempotencyCache.isEnabled() && this.idempotencyCache.has(idempotencyKey)) {
-          return this.idempotencyCache.get(idempotencyKey) as T
-        }
-
-        // Fresh envelope uuid per attempt keeps replay protection intact; a stable
-        // idempotency key dedupes retries server-side instead.
-        const retryIdemKey = idempotencyKey ?? uuidv7()
-        const result = await runClientPipeline<T>(this.circuitBreaker, this.retryOptions, cbKey, async (attempt) => {
-          const startMs = Date.now()
-          let lastUuid: string | undefined
-          let lastChainId: string | undefined
-          try {
-            const { key, value, uuid, meta, encoding } = await this.encodeRequest(method, params, "query", {
-              ...opts,
-              idempotencyKey: retryIdemKey,
-              headers: { ...(opts?.headers || {}), "nevo-attempt": String(attempt) }
+    return this.runtime.query<T>({
+      serviceName: normalized,
+      method,
+      params,
+      opts,
+      mapError: (err) => (err instanceof RxTimeoutError ? new TimeoutError(serviceName, method, opts?.timeoutMs ?? this.timeoutMs) : err),
+      send: async (request) => {
+        const response: any = await lastValueFrom(
+          this.kafkaClient
+            .send<any>(topic, {
+              key: request.uuid,
+              value: Buffer.from(request.payload),
+              headers: this.toKafkaHeaders(request.encoding)
             })
-            lastUuid = uuid
-            lastChainId = meta.nevoChainId
-            const span = this.tracer.startSpan(`nevo.client.query ${normalized}.${method}`, {
-              "nevo.method": method,
-              "nevo.service": normalized,
-              "nevo.attempt": attempt
-            })
-            try {
-              const response: any = await lastValueFrom(
-                this.kafkaClient
-                  .send<any>(topic, { key, value: Buffer.from(value), headers: this.toKafkaHeaders(encoding) })
-                  .pipe(timeout(opts?.timeoutMs ?? this.timeoutMs))
-              )
-              const payload = typeof response === "string" || response instanceof Uint8Array ? await this.decodePayload(response as any) : response
-              if (payload?.params?.result === "error" && payload?.params?.error) {
-                const err = payload.params.error
-                throw new MessagingError(err.code, err.details ?? { message: err.message }, err.service || normalized)
-              }
-              span.setStatus({ code: 1 })
-              publishClientEvent(this.devtoolsBus, {
-                service: normalized,
-                method,
-                uuid,
-                chainId: lastChainId,
-                durationMs: Date.now() - startMs,
-                status: "ok",
-                transport: "kafka",
-                origin: this.serviceName
-              })
-              return payload?.params?.result as T
-            } catch (err: any) {
-              span.recordException(err)
-              span.setStatus({ code: 2, message: err?.message })
-              if (err instanceof RxTimeoutError) throw new TimeoutError(serviceName, method, opts?.timeoutMs ?? this.timeoutMs)
-              throw err
-            } finally {
-              span.end()
-              this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, {
-                transport: "kafka",
-                service: normalized,
-                method: methodLabel(method),
-                role: "client"
-              })
-              if (attempt > 1)
-                this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "kafka", service: normalized, method: methodLabel(method) })
-            }
-          } catch (err: any) {
-            publishClientEvent(this.devtoolsBus, {
-              service: normalized,
-              method,
-              uuid: lastUuid,
-              chainId: lastChainId,
-              durationMs: Date.now() - startMs,
-              status: "error",
-              transport: "kafka",
-              origin: this.serviceName,
-              error: { code: err instanceof MessagingError ? err.code : err?.code, message: err?.message ?? String(err) }
-            })
-            throw err
-          }
-        })
-
-        if (idempotencyKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(idempotencyKey, result)
-        return result
-      })()
-    )
+            .pipe(timeout(opts?.timeoutMs ?? this.timeoutMs))
+        )
+        return typeof response === "string" || response instanceof Uint8Array ? await this.decodePayload(response as any) : response
+      }
+    })
   }
 
-  async emit(
-    serviceName: string,
-    method: string,
-    params: unknown,
-    opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string> }
-  ): Promise<void> {
+  async emit(serviceName: string, method: string, params: unknown, opts?: ClientCallOptions): Promise<void> {
     const normalized = this.ensureServiceRegistered(serviceName)
     const topic = `${normalized}-events`
-    const idemKey = opts?.idempotencyKey ?? uuidv7()
-    return this.shutdown.trackInflight(
-      runClientPipeline<void>(this.circuitBreaker, this.retryOptions, `${normalized}:${method}`, async () => {
-        const { key, value, encoding } = await this.encodeRequest(method, params, "emit", { ...opts, idempotencyKey: idemKey })
-        await lastValueFrom(this.kafkaClient.emit(topic, { key, value: Buffer.from(value), headers: this.toKafkaHeaders(encoding) }))
-      })
-    )
+    return this.runtime.emit({
+      serviceName: normalized,
+      method,
+      params,
+      opts,
+      send: async (request) => {
+        await lastValueFrom(
+          this.kafkaClient.emit(topic, { key: request.uuid, value: Buffer.from(request.payload), headers: this.toKafkaHeaders(request.encoding) })
+        )
+      }
+    })
   }
 
   private ensureBatchProducer(): Promise<Producer> {
@@ -433,7 +263,7 @@ export class NevoKafkaClient implements OnModuleDestroy {
     if (items.length === 0) return
     const producer = await this.ensureBatchProducer()
     const byTopic = new Map<string, Array<{ key: string; value: Buffer; headers?: Record<string, string> }>>()
-    if (this.compression.async && this.compression.enabled) {
+    if (this.runtime.compression.async && this.runtime.compression.enabled) {
       // Encode under a concurrency cap, then group in input order to keep per-topic order deterministic.
       const encoded = await mapLimit(items, BATCH_ENCODE_CONCURRENCY, async (item) => {
         const normalized = this.ensureServiceRegistered(item.serviceName)
@@ -497,8 +327,8 @@ export class NevoKafkaClient implements OnModuleDestroy {
   }
 
   private resumeBackoffMs(attempts: number): number {
-    const exp = this.retryOptions.baseMs * Math.pow(2, Math.max(0, attempts - 1))
-    return Math.min(this.retryOptions.maxMs, exp)
+    const exp = this.runtime.retryOptions.baseMs * Math.pow(2, Math.max(0, attempts - 1))
+    return Math.min(this.runtime.retryOptions.maxMs, exp)
   }
 
   // Pause the partition and resume after a backoff so the failed message is redelivered.
@@ -536,7 +366,7 @@ export class NevoKafkaClient implements OnModuleDestroy {
       return this.subscribeSticky(topic, method, explicitGroupId, options, manualAck, maxAttempts, handler as any)
     }
 
-    const groupId = explicitGroupId || `nevo-sub-${this.serviceName || "client"}-${randomUUID()}`
+    const groupId = explicitGroupId || `nevo-sub-${this.serviceName || "client"}-${uuidv7()}`
     const consumer = this.sharedKafkaForSubs.consumer({ groupId, allowAutoTopicCreation: true })
     await consumer.connect()
     await consumer.subscribe({ topic, fromBeginning: options?.fromBeginning || false })
@@ -556,7 +386,7 @@ export class NevoKafkaClient implements OnModuleDestroy {
           await this.dlq.route({ topic, reason: "parse-error", error: { message: (err as Error)?.message }, ts: Date.now() })
           return
         }
-        if (method && payload.method !== method && payload.method?.split("@")[0] !== method) return
+        if (method && payload.method !== method && parseMethod(payload.method ?? "").name !== method) return
         if (!matchesFilter(options?.filter, payload.meta)) return
 
         const msgKey = `${topic}:${partition}:${message.offset}`
@@ -738,7 +568,7 @@ export class NevoKafkaClient implements OnModuleDestroy {
         let retryScheduled = false
         let redeliveryError: unknown
         for (const entry of entries) {
-          if (entry.method && payload.method !== entry.method && payload.method?.split("@")[0] !== entry.method) continue
+          if (entry.method && payload.method !== entry.method && parseMethod(payload.method ?? "").name !== entry.method) continue
           if (!matchesFilter(entry.filter, payload.meta)) continue
 
           const context: SubscriptionContext = {
@@ -873,7 +703,7 @@ export class NevoKafkaClient implements OnModuleDestroy {
       } catch {}
     }
     this.subscriptionConsumers.clear()
-    await this.shutdown.shutdown(timeoutMs)
+    await this.runtime.close(timeoutMs)
     try {
       await this.kafkaClient.close()
     } catch {}

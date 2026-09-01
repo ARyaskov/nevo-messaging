@@ -1,27 +1,54 @@
 import "reflect-metadata"
 import type { RateLimiterOptions } from "./rate-limit"
+import type { MessageMeta } from "./types"
 
 export const NEVO_METHOD_RATE_LIMIT = "nevo:method:rate-limit"
 export const NEVO_METHOD_CACHEABLE = "nevo:method:cacheable"
 
+export type RateLimitKeyDimension = "service" | "method" | "callerService" | "tenantId"
+
 export interface RateLimitConfig {
   capacity: number
   refillPerSec: number
-  keyBy?: ("service" | "method" | "callerService" | "tenantId")[]
+  keyBy?: RateLimitKeyDimension[]
+}
+
+export type CacheableScope = "tenantId" | "callerService"
+
+export interface CacheableKeyContext {
+  method: string
+  version?: string | null
+  tenantId?: string
+  callerService?: string
+  meta?: MessageMeta
 }
 
 export interface CacheableConfig {
   ttlMs?: number
   maxEntries?: number
-  keyBy?: (params: unknown) => string
+  /** Whatever you leave out of the key is shared across callers. */
+  keyBy?: (params: unknown, ctx: CacheableKeyContext) => string
+  scope?: CacheableScope[]
 }
 
-function defineOnCtor(metaKey: string, ctor: any, propertyKey: string | symbol, value: unknown): void {
+export const DEFAULT_CACHEABLE_SCOPE: readonly CacheableScope[] = ["tenantId", "callerService"]
+
+/** Copies an inherited map rather than mutating it: a subclass must not write into its base. */
+export function defineMethodMetadata(metaKey: string, ctor: any, propertyKey: string | symbol, value: unknown): void {
   const own = Reflect.getOwnMetadata(metaKey, ctor) as Map<string, unknown> | undefined
   const inherited = Reflect.getMetadata(metaKey, ctor) as Map<string, unknown> | undefined
   const map = new Map<string, unknown>(own ?? inherited)
   map.set(propertyKey as string, value)
   Reflect.defineMetadata(metaKey, map, ctor)
+}
+
+export function readMethodMetadataMap<T>(metaKey: string, target: any): Map<string, T> | undefined {
+  const ctor = target?.constructor ?? target
+  return Reflect.getMetadata(metaKey, ctor) as Map<string, T> | undefined
+}
+
+function defineOnCtor(metaKey: string, ctor: any, propertyKey: string | symbol, value: unknown): void {
+  defineMethodMetadata(metaKey, ctor, propertyKey, value)
 }
 
 // Detects the TC39 (stage-3) decorator context vs the legacy form.
@@ -66,13 +93,15 @@ export function getMethodCacheable(target: any, propertyKey: string): CacheableC
   return map?.get(propertyKey)
 }
 
+const DEFAULT_RATE_LIMIT_KEY_BY: readonly RateLimitKeyDimension[] = ["service", "method", "callerService"]
+
 export function rateLimitToOptions(rl: RateLimitConfig): RateLimiterOptions {
+  const keyBy: readonly RateLimitKeyDimension[] = rl.keyBy ?? DEFAULT_RATE_LIMIT_KEY_BY
   return {
     enabled: true,
     capacity: rl.capacity,
     refillPerSec: rl.refillPerSec,
     keyExtractor: (ctx) => {
-      const keyBy = rl.keyBy ?? ["topic", "method", "callerService"]
       const parts: string[] = []
       for (const k of keyBy) {
         if (k === "service") parts.push(ctx.topic)

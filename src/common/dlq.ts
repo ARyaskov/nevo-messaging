@@ -23,6 +23,7 @@ export interface DlqRouterOptions {
   enabled?: boolean
   sinks?: DlqSink[]
   redactPaths?: string[]
+  redact?: boolean
   replay?: DlqReplayOptions
   store?: DlqStore
 }
@@ -124,6 +125,7 @@ export class DlqRouter {
   private readonly sinks: DlqSink[] = []
   private readonly enabled: boolean
   private readonly redactPaths: string[] | undefined
+  private readonly redactEnabled: boolean
   private readonly store: DlqStore | null
   private readonly replayOpts?: DlqReplayOptions
   private replayTimer?: NodeJS.Timeout
@@ -134,6 +136,7 @@ export class DlqRouter {
     this.enabled = opts?.enabled !== false
     if (opts?.sinks) this.sinks.push(...opts.sinks)
     this.redactPaths = opts?.redactPaths
+    this.redactEnabled = opts?.redact !== false
     this.store = opts?.store ?? null
     this.replayOpts = opts?.replay
     if (this.store) {
@@ -150,8 +153,12 @@ export class DlqRouter {
   }
 
   private redact(entry: DlqEntry): DlqEntry {
-    if (!this.redactPaths || !entry.rawPayload) return entry
-    return { ...entry, rawPayload: redactObject(entry.rawPayload, this.redactPaths) }
+    if (!this.redactEnabled) return entry
+    const out: DlqEntry = { ...entry }
+    if (entry.rawPayload !== undefined) out.rawPayload = redactObject(entry.rawPayload, this.redactPaths)
+    // meta carries auth.token.
+    if (entry.meta !== undefined) out.meta = redactObject(entry.meta, this.redactPaths)
+    return out
   }
 
   async route(entry: DlqEntry): Promise<void> {

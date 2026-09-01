@@ -2,17 +2,11 @@ import { Controller, Get, Inject } from "@nestjs/common"
 import { HealthRegistry, HttpSignalRouter, Signal, contractToOpenApi } from "@riaskov/nevo-messaging"
 import { UserService } from "./user.service"
 
+// The router decorator now carries routing metadata only; request-processing
+// options (ACL, idempotency, rate limits, health) come from NevoModule — see
+// user.module.ts.
 @Controller()
-@HttpSignalRouter([UserService], {
-  accessControl: {
-    rules: [
-      { topic: "user-events", method: "*", allow: ["frontend", "coordinator"] },
-      { topic: "user-events", method: "user.delete", allow: ["coordinator"] }
-    ],
-    logDenied: true,
-    allowAllByDefault: false
-  }
-})
+@HttpSignalRouter([UserService])
 export class UserController {
   constructor(
     @Inject(UserService) private readonly userService: UserService,

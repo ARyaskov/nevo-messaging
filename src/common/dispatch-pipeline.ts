@@ -1,4 +1,4 @@
-import type { AccessControlConfig, AfterHook, BeforeHook, MessageMeta, MessageResponse } from "./types"
+import type { AccessControlConfig, AfterHook, BeforeHook, ErrorDetails, MessageMeta, MessageResponse } from "./types"
 import { ErrorCode } from "./error-code"
 import { MessagingError } from "./errors"
 import { IS_PROD } from "./env"
@@ -8,6 +8,7 @@ import { parseMethod, type ParsedMethod } from "./version"
 import { ReplayGuard } from "./replay-protection"
 import { RateLimiter } from "./rate-limit"
 import { TwoTierIdempotency } from "./idempotency-runtime"
+import { payloadFingerprint, serverIdempotencyKey } from "./idempotency"
 import { DlqRouter } from "./dlq"
 import { AuditLog } from "./audit-log"
 import { NEVO_METRIC_NAMES, type MetricsRegistry } from "./metrics"
@@ -77,6 +78,26 @@ export interface DispatchStrategyResult {
 
 export type DispatchStrategy = (args: DispatchStrategyArgs) => Promise<DispatchStrategyResult>
 
+// Detail keys a caller needs to act on; in production everything else is dropped.
+// `errors` stays because validation issues describe the caller's own input.
+const PUBLIC_ERROR_DETAIL_KEYS = ["retryable", "retryAfterMs", "size", "limit", "httpStatus", "maxPhysicalCalls", "errors"] as const
+
+function publicErrorDetails(details: Record<string, unknown> | undefined): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  if (!details) return out
+  for (const key of PUBLIC_ERROR_DETAIL_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(details, key)) out[key] = details[key]
+  }
+  return out
+}
+
+/** MessagingError → wire shape, with `details` reduced to the public set in production. */
+export function toWireError(error: MessagingError): ErrorDetails {
+  const shaped = error.toJSON()
+  if (IS_PROD) shaped.details = publicErrorDetails(shaped.details)
+  return shaped
+}
+
 /** Uniform error → wire response shaping; internal messages never leak in prod. */
 export function shapeDispatchError(
   serviceName: string,
@@ -86,12 +107,17 @@ export function shapeDispatchError(
   meta?: MessageMeta
 ): MessageResponse {
   if (error instanceof MessagingError) {
-    return { uuid: uuid as string, method: method as string, params: { result: "error", error: error.toJSON() }, meta }
+    return { uuid: uuid as string, method: method as string, params: { result: "error", error: toWireError(error) }, meta }
   }
   const err = error as { code?: unknown; message?: string } | undefined
   const code = typeof err?.code === "number" ? err.code : ErrorCode.INTERNAL
   const message = !IS_PROD ? (err?.message ?? String(error)) : "Internal server error"
-  return { uuid: uuid as string, method: method as string, params: { result: "error", error: { code, message, details: {}, service: serviceName } }, meta }
+  return {
+    uuid: uuid as string,
+    method: method as string,
+    params: { result: "error", error: { code, message, details: {}, service: serviceName } },
+    meta
+  }
 }
 
 export async function runDispatchPipeline(cfg: DispatchPipelineConfig, req: DispatchRequest, strategy: DispatchStrategy): Promise<MessageResponse> {
@@ -100,6 +126,7 @@ export async function runDispatchPipeline(cfg: DispatchPipelineConfig, req: Disp
   let finalResponse: MessageResponse | undefined
   let auditCaller: string | null = null
   let idemKey: string | undefined
+  let idemFingerprint: string | undefined
   let idemBegan = false
   let idemCommitted = false
   let capturedError: unknown = null
@@ -107,7 +134,13 @@ export async function runDispatchPipeline(cfg: DispatchPipelineConfig, req: Disp
   try {
     if (!method) {
       cfg.logger.error({ event: "dispatch.invalid", topic: cfg.topic }, "Missing 'method' field in message")
-      response = shapeDispatchError(cfg.serviceName, uuid, method, new MessagingError(ErrorCode.BAD_REQUEST, { message: "Invalid message format" }), meta)
+      response = shapeDispatchError(
+        cfg.serviceName,
+        uuid,
+        method,
+        new MessagingError(ErrorCode.BAD_REQUEST, { message: "Invalid message format" }),
+        meta
+      )
       return response
     }
     const parsed = parseMethod(method)
@@ -136,7 +169,7 @@ export async function runDispatchPipeline(cfg: DispatchPipelineConfig, req: Disp
       } catch (err) {
         // Load shedding is an expected outcome, not a dead letter.
         if (err instanceof MessagingError && err.code === ErrorCode.RATE_LIMITED) {
-          response = { uuid, method, params: { result: "error", error: err.toJSON() }, meta }
+          response = { uuid, method, params: { result: "error", error: toWireError(err) }, meta }
           return response
         }
         throw err
@@ -159,11 +192,30 @@ export async function runDispatchPipeline(cfg: DispatchPipelineConfig, req: Disp
       }
     }
 
-    // Claim-before-execute idempotency, scoped by caller identity.
-    const baseIdemKey = meta?.idempotencyKey || uuid
-    idemKey = baseIdemKey ? `${callerService ?? "anon"}::${meta?.tenantId ?? ""}::${baseIdemKey}` : undefined
+    const suppliedIdemKey = meta?.idempotencyKey
+    idemKey = serverIdempotencyKey({
+      callerService,
+      tenantId: meta?.tenantId,
+      method,
+      suppliedKey: suppliedIdemKey,
+      envelopeUuid: uuid
+    })
+    // Only a caller-supplied key can be reused across payloads; an envelope uuid can't.
+    idemFingerprint = suppliedIdemKey ? payloadFingerprint(params) : undefined
     if (idemKey && cfg.idem.isEnabled()) {
-      const began = await cfg.idem.begin(idemKey)
+      const began = await cfg.idem.begin(idemKey, idemFingerprint)
+      if (began.status === "conflict") {
+        response = shapeDispatchError(
+          cfg.serviceName,
+          uuid,
+          method,
+          new MessagingError(ErrorCode.IDEMPOTENCY_KEY_CONFLICT, {
+            message: `Idempotency key was already used for a different request payload on ${method}`
+          }),
+          meta
+        )
+        return response
+      }
       if (began.status === "hit") {
         response = { ...began.value, uuid, meta }
         return response
@@ -196,7 +248,7 @@ export async function runDispatchPipeline(cfg: DispatchPipelineConfig, req: Disp
 
     if (response.params.result !== "error") {
       if (idemKey && idemBegan) {
-        await cfg.idem.commit(idemKey, response)
+        await cfg.idem.commit(idemKey, response, idemFingerprint)
         idemCommitted = true
       }
       dispatched.onCommitted?.(response)
@@ -217,8 +269,19 @@ export async function runDispatchPipeline(cfg: DispatchPipelineConfig, req: Disp
         rawPayload: data,
         ts: req.startMs
       })
-    } catch {}
-    finalResponse = shapeDispatchError(cfg.serviceName, uuid ?? (data as { uuid?: string })?.uuid, method ?? (data as { method?: string })?.method, error, meta)
+    } catch (dlqErr) {
+      cfg.logger.error(
+        { event: "dispatch.dlq_failed", topic: cfg.topic, method, err: (dlqErr as Error)?.message ?? String(dlqErr) },
+        "Failed to route a dead letter; the payload is not recoverable from the DLQ"
+      )
+    }
+    finalResponse = shapeDispatchError(
+      cfg.serviceName,
+      uuid ?? (data as { uuid?: string })?.uuid,
+      method ?? (data as { method?: string })?.method,
+      error,
+      meta
+    )
     return finalResponse
   } finally {
     const durationMs = Date.now() - req.startMs
@@ -255,7 +318,12 @@ export async function runDispatchPipeline(cfg: DispatchPipelineConfig, req: Disp
     if (idemKey && idemBegan && !idemCommitted) {
       try {
         await cfg.idem.release(idemKey)
-      } catch {}
+      } catch (releaseErr) {
+        cfg.logger.warn(
+          { event: "dispatch.idem_release_failed", method, err: (releaseErr as Error)?.message },
+          "Could not release the idempotency claim; retries wait for its TTL"
+        )
+      }
     }
     if (cfg.auditLog?.isEnabled() && settled) {
       // Fire-and-forget.

@@ -4,6 +4,7 @@ import { MessagingError } from "./errors"
 import { ErrorCode } from "./error-code"
 import type { DlqSink } from "./dlq"
 import type { NevoLogger } from "./logger"
+import { mapLimit } from "./concurrency"
 import { NEVO_METRIC_NAMES, type MetricsRegistry } from "./metrics"
 
 /** Default saga type used when a saga is created without an explicit one. */
@@ -56,7 +57,8 @@ export interface SagaSnapshot<C = any> {
 export interface SagaStore {
   save(snapshot: SagaSnapshot): Promise<void>
   load(sagaId: string): Promise<SagaSnapshot | null>
-  listPending(): Promise<SagaSnapshot[]>
+  /** Unfinished sagas, oldest first. `limit` bounds what a recovery pass pulls into memory. */
+  listPending(limit?: number): Promise<SagaSnapshot[]>
   delete(sagaId: string): Promise<void>
   /** Optional recovery lease: single winner per saga until `leaseMs` expires. */
   claim?(sagaId: string, workerId: string, leaseMs: number): Promise<boolean>
@@ -71,11 +73,13 @@ export class InMemorySagaStore implements SagaStore {
   async load(id: string): Promise<SagaSnapshot | null> {
     return this.data.get(id) ? structuredClone(this.data.get(id)!) : null
   }
-  async listPending(): Promise<SagaSnapshot[]> {
+  async listPending(limit = 200): Promise<SagaSnapshot[]> {
     return this.data
       .values()
       .filter((s) => s.status === "pending" || s.status === "compensating")
       .toArray()
+      .sort((a, b) => a.updatedAt - b.updatedAt)
+      .slice(0, Math.max(1, limit))
       .map((s) => structuredClone(s))
   }
   async delete(id: string): Promise<void> {
@@ -294,7 +298,12 @@ export class Saga<C = any> {
         // Persist progress so a crash mid-compensation never re-runs finished undos.
         try {
           await this.persist(ctx, executed, "compensating", lastErr, compensated)
-        } catch {}
+        } catch (persistErr) {
+          this.logger?.error(
+            { event: "saga.compensation_progress_unsaved", sagaId: this.sagaId, step: name, err: (persistErr as Error)?.message },
+            "Compensation progress was not persisted; a crash here would re-run this step"
+          )
+        }
       } catch (compErr) {
         failed.push(name)
         await this.reportCompensationFailure(name, snapshot, lastErr, compErr, cAttempts)
@@ -422,6 +431,10 @@ export interface SagaRecoveryOptions {
   logger?: NevoLogger
   /** Called when resuming a specific saga throws (e.g. transient store error). */
   onError?: (err: unknown, snapshot: SagaSnapshot) => void
+  /** Sagas pulled per pass. Default 200. */
+  batchSize?: number
+  /** Sagas resumed in parallel within a pass. Default 4. */
+  concurrency?: number
 }
 
 export interface SagaRecoveryResult {
@@ -440,6 +453,8 @@ export class SagaRecovery<C = any> {
   private readonly metrics?: MetricsRegistry
   private readonly logger?: NevoLogger
   private readonly onError?: SagaRecoveryOptions["onError"]
+  private readonly batchSize: number
+  private readonly concurrency: number
   private readonly workerId = `saga-recovery-${uuidv7().slice(0, 12)}`
   private timer?: NodeJS.Timeout
   private stopped = false
@@ -454,6 +469,8 @@ export class SagaRecovery<C = any> {
     this.metrics = opts.metrics
     this.logger = opts.logger
     this.onError = opts.onError
+    this.batchSize = Math.max(1, opts.batchSize ?? 200)
+    this.concurrency = Math.max(1, opts.concurrency ?? 4)
   }
 
   start(): void {
@@ -488,62 +505,13 @@ export class SagaRecovery<C = any> {
     this.running = true
     const result: SagaRecoveryResult = { recovered: 0, skipped: 0, failed: 0 }
     try {
-      const pending = await this.store.listPending()
+      const pending = await this.store.listPending(this.batchSize)
       const staleBefore = Date.now() - this.staleAfterMs
-      for (const snapshot of pending) {
-        if (snapshot.updatedAt > staleBefore) continue
-        const type = snapshot.type ?? DEFAULT_SAGA_TYPE
-        const steps = this.registry.resolve(type, snapshot.steps)
-        if (!steps) {
-          result.skipped++
-          this.logger?.warn(
-            { event: "saga.recovery_skipped", sagaId: snapshot.sagaId, type, steps: snapshot.steps },
-            "Saga recovery skipped: step definitions are not registered for this saga type"
-          )
-          continue
-        }
-        // Lease so concurrent recovery workers never resume the same saga.
-        if (typeof this.store.claim === "function") {
-          const owned = await this.store.claim(snapshot.sagaId, this.workerId, this.staleAfterMs)
-          if (!owned) {
-            result.skipped++
-            continue
-          }
-        }
-        try {
-          const r = await Saga.resume<C>(this.store, snapshot.sagaId, steps, {
-            type,
-            dlq: this.dlq,
-            metrics: this.metrics,
-            logger: this.logger,
-            leaseOwner: this.workerId,
-            leaseMs: this.staleAfterMs
-          })
-          result.recovered++
-          this.logger?.info(
-            {
-              event: "saga.recovered",
-              sagaId: snapshot.sagaId,
-              type,
-              status: r.status,
-              compensationFailed: r.compensationFailed
-            },
-            "Saga resumed by recovery worker"
-          )
-        } catch (err) {
-          result.failed++
-          this.onError?.(err, snapshot)
-          this.logger?.error(
-            {
-              event: "saga.recovery_failed",
-              sagaId: snapshot.sagaId,
-              type,
-              err: err instanceof Error ? err.message : String(err)
-            },
-            "Saga recovery failed to resume a pending saga"
-          )
-        }
-      }
+      const due = pending.filter((s) => s.updatedAt <= staleBefore)
+      await mapLimit(due, this.concurrency, async (snapshot) => {
+        if (this.stopped) return
+        await this.recoverSaga(snapshot, result)
+      })
     } catch (err) {
       this.logger?.error(
         { event: "saga.recovery_error", err: err instanceof Error ? err.message : String(err) },
@@ -553,6 +521,48 @@ export class SagaRecovery<C = any> {
       this.running = false
     }
     return result
+  }
+
+  private async recoverSaga(snapshot: SagaSnapshot, result: SagaRecoveryResult): Promise<void> {
+    const type = snapshot.type ?? DEFAULT_SAGA_TYPE
+    const steps = this.registry.resolve(type, snapshot.steps)
+    if (!steps) {
+      result.skipped++
+      this.logger?.warn(
+        { event: "saga.recovery_skipped", sagaId: snapshot.sagaId, type, steps: snapshot.steps },
+        "Saga recovery skipped: step definitions are not registered for this saga type"
+      )
+      return
+    }
+    if (typeof this.store.claim === "function") {
+      const owned = await this.store.claim(snapshot.sagaId, this.workerId, this.staleAfterMs)
+      if (!owned) {
+        result.skipped++
+        return
+      }
+    }
+    try {
+      const r = await Saga.resume<C>(this.store, snapshot.sagaId, steps, {
+        type,
+        dlq: this.dlq,
+        metrics: this.metrics,
+        logger: this.logger,
+        leaseOwner: this.workerId,
+        leaseMs: this.staleAfterMs
+      })
+      result.recovered++
+      this.logger?.info(
+        { event: "saga.recovered", sagaId: snapshot.sagaId, type, status: r.status, compensationFailed: r.compensationFailed },
+        "Saga resumed by recovery worker"
+      )
+    } catch (err) {
+      result.failed++
+      this.onError?.(err, snapshot)
+      this.logger?.error(
+        { event: "saga.recovery_failed", sagaId: snapshot.sagaId, type, err: err instanceof Error ? err.message : String(err) },
+        "Saga recovery failed to resume a pending saga"
+      )
+    }
   }
 }
 

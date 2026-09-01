@@ -1,35 +1,75 @@
 # DevTools UI dashboard
 
-The Nevo DevTools dashboard is a Next.js 16 app that visualizes events flowing through the framework: requests, replies, errors, retries, circuit transitions, ACL denials, top-N slow methods. The dashboard lives in `devtools/` of the repo.
+The Nevo DevTools dashboard visualizes events flowing through the framework: requests, replies, errors, retries, circuit transitions, ACL denials, top-N slow methods.
+
+It ships **inside this package** as prebuilt static assets plus a tiny `node:http` server, so any project that already depends on `@riaskov/nevo-messaging` can open it with no extra install and no source checkout.
 
 ## Running it
 
 ```bash
-cd devtools
-npm install
-npm run dev
-# http://localhost:3000
+npx nevo-devtools
+# http://localhost:3499
 ```
+
+| Option | Default | Env |
+| --- | --- | --- |
+| `-p, --port <n>` | `3499` | `NEVO_DEVTOOLS_PORT` |
+| `--host <addr>` | `127.0.0.1` | `NEVO_DEVTOOLS_HOST` |
+| `-n, --nats <urls>` | `nats://127.0.0.1:4222` | `NEVO_DEVTOOLS_NATS_SERVERS`, then `NATS_URL` |
+| `--subject <s>` | `__nevo.devtools` | — |
+| `--no-nats` | — | — |
+
+It binds to loopback by default: the dashboard exposes service topology, ACL rules and event bodies.
 
 ## Connecting to a stack
 
-The dashboard reads events from a `DevToolsBus`. There are two ways to provide one:
+The dashboard reads events from a `DevToolsBus`. There are two ways to fill it.
+
+### Cluster (the usual case)
+
+Each service publishes to a NATS subject; `nevo-devtools` subscribes to it. Wire the bridge once per service, at startup:
+
+```ts
+import { wireDevToolsToNatsByConfig } from "@riaskov/nevo-messaging"
+
+await wireDevToolsToNatsByConfig({
+  servers: ["nats://127.0.0.1:4222"],
+  bridgeLocalEvents: true
+})
+```
+
+Then `npx nevo-devtools` against the same NATS. Events carry `origin = instanceId`, so replicas stay distinguishable.
+
+Registration events (`/services`) are emitted **once, at service startup**, and NATS core does not replay them. Starting the dashboard after your services leaves that page empty until a service restarts; live traffic pages fill in immediately either way. `GET /api/health` reports whether the NATS bridge attached.
 
 ### In-process (single Node app)
 
-Use the shared bus from the same process:
+Mount the same server inside your own process and it reads that process's bus directly — no NATS, no separate port to remember:
 
 ```ts
-import { getDevToolsBus, DevToolsBus } from "@riaskov/nevo-messaging"
+import { startDevToolsUiServer } from "@riaskov/nevo-messaging"
 
-const bus: DevToolsBus = getDevToolsBus()
+const devtools = await startDevToolsUiServer({ port: 3499 })
+// ... later
+await devtools.close()
 ```
 
-Mount your own HTTP endpoints over `bus.recent()`, `bus.size()`, and a Server-Sent Events stream that calls `bus.on(handler)`. There is no `mountDevToolsApi(app, ...)` helper today — you wire up endpoints in your transport controller.
+Prefer raw access? `getDevToolsBus()` gives you `recent()`, `size()` and `on(handler)` to build your own endpoints.
 
-### Cluster (multiple replicas)
+## HTTP API
 
-Run an adapter that publishes / ingests events over a transport. The framework exposes a `DevToolsAdapter` interface (`{ attach() }`) and you implement it for your transport. NATS, Kafka, and HTTP adapters live in transport-specific submodules; check `devtools-registry.ts` and the relevant transport for the attached adapter class.
+The UI is a static bundle talking to these endpoints; they are equally usable from `curl`.
+
+| Endpoint | Use |
+| --- | --- |
+| `GET /api/events` | Server-Sent Events stream of live `DevToolsEvent`s |
+| `GET /api/snapshot?limit=N` | Recent events buffer (default 500) |
+| `GET /api/registry` | `{ services, circuits }` snapshot |
+| `GET /api/circuits` | Circuit-breaker snapshot only |
+| `GET /api/config?service=` | Registered service info, or all services |
+| `POST /api/config` | Replace a service's ACL at runtime |
+| `POST /api/replay` | Record a `replay-requested` custom event |
+| `GET /api/health` | Whether the NATS bridge attached, and to which servers |
 
 ## `DevToolsBus` API
 

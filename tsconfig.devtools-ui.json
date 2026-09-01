@@ -1,0 +1,20 @@
+{
+  "//": "Type-checks the DevTools browser bundle — esbuild strips types without checking them, so this is the only gate on the client code. `types: [node]` and the relaxed indexed-access setting exist because client/types.ts re-exports from Node-typed framework source, which must check the same way it does under tsconfig.json.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    "jsx": "react-jsx",
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "noImplicitAny": true
+  },
+  "include": ["src/devtools-ui/client/**/*"]
+}

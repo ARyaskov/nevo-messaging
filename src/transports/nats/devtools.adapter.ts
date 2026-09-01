@@ -64,7 +64,7 @@ export class NatsDevToolsAdapter implements DevToolsAdapter {
       } catch (err) {
         logger.warn({ event: "devtools.subscription_error", err: (err as Error)?.message }, "devtools subscription iterator ended")
       }
-    })()
+    })().catch((err) => logger.error({ event: "devtools.listener_crashed", err: (err as Error)?.message }))
 
     if (this.bridgeLocalEvents) {
       this.localOff = this.bus.onLocal((event) => {

@@ -15,7 +15,7 @@ A microservices messaging framework for NestJS 11+ with multi-transport support 
 - 🧰 Reliable patterns: transactional outbox, effectively-once inbox (with a transactional store — e.g. `PgInboxStore`), saga with compensation, CQRS bridge, event store — in-memory + SQLite + **Postgres production stores**
 - 🧪 In-memory transport (`createMemoryTransport()`) + `MemoryHarness` for unit tests with no broker dependency
 - 📈 Observability: pino, Prometheus metrics, OpenTelemetry, structured DLQ
-- 🪟 DevTools UI — live Next.js 16 dashboard with circuits/methods/errors/trace/replay
+- 🪟 DevTools UI — live dashboard with circuits/methods/errors/trace/replay, shipped in the package: `npx nevo-devtools`
 - 🔐 Security: ACL, JWT/JWKS, mTLS, PII redaction
 - 🩺 Liveness + readiness probes with pluggable checks (pg/redis/nats/kafka/http)
 - 🌐 Service discovery — built-in heartbeat + pluggable Consul / Kubernetes DNS providers

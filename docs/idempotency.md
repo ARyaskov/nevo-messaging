@@ -75,6 +75,26 @@ The latter is dangerous on parameters that contain timestamps or nonces — be e
 
 The cache is checked on the server before the handler runs, on **both** the live signal-router path (`@NatsSignalRouter`/`@KafkaSignalRouter`/…) and `BaseMessageController`. The effective key is `meta.idempotencyKey` when the client stamped one, otherwise the envelope `uuid` — so timeout-retries (which carry a fresh `uuid` but the same `idempotencyKey`) collapse to a single execution.
 
+The stored key is scoped by **caller identity, tenant and target method**, so reusing one key against two different methods can't hand you the other method's response.
+
+### Same key, different payload
+
+Params are deliberately *not* part of the **key**. The key identifies the logical operation, so a retry must collapse onto the same entry even across replicas — folding the payload into the key would turn any serialization difference into a second execution and defeat the guarantee.
+
+Instead the payload's fingerprint is stored *beside* the entry, so reuse is detected rather than silently replayed. A request that presents a known key with a different payload is answered with `ErrorCode.IDEMPOTENCY_KEY_CONFLICT` and the handler does not run:
+
+```
+{ result: "error", error: { code: 20, message: "Idempotency key was already used for a different request payload on pay.charge" } }
+```
+
+Returning the first request's response would be worse: a client retrying a 5000-unit charge under the key of a 10-unit one would be told the 10-unit charge succeeded.
+
+The original entry is untouched by a conflict, so a genuine retry — same key, same payload — still replays it.
+
+The fingerprint is computed only when the client supplied `meta.idempotencyKey`. Without one the envelope `uuid` keys the entry, and a uuid is unique per message, so nothing can collide and no serialization cost is paid.
+
+Stored entries are `IdempotencyEnvelope` values (`{ f: fingerprint, v: response }`). A distributed store is therefore typed `IdempotencyStore<IdempotencyEnvelope<MessageResponse>>`.
+
 Dedupe is **claim-before-execute**, not check-then-act: the first caller atomically reserves the key (`SET NX` against the distributed store, plus an in-process leader election), runs the handler, then overwrites the reservation with the result. Concurrent duplicates — in the same process or across replicas — await the winner's result instead of re-running, so two handlers no longer both run under a race. The distributed write is awaited before the response is acked, closing the window where a peer re-executes before the result lands. On error / early-return the claim is released so a retry can re-execute.
 
 ## Interaction with hedging

@@ -3,6 +3,7 @@ import { uuidv7 } from "./uuid"
 import { getDefaultLogger, type NevoLogger } from "./logger"
 import { InMemoryEventStore, type EventStore, type DomainEvent } from "./event-store"
 import type { Scheduler } from "./scheduler"
+import { defineMethodMetadata, readMethodMetadataMap } from "./method-decorators"
 
 // Workflow engine — Temporal-style durable execution on top of EventStore.
 export const WORKFLOW_SUSPEND = Symbol.for("nevo.workflow.suspend")
@@ -68,10 +69,20 @@ interface WorkflowReplayState {
   status: WorkflowStatus
 }
 
+/** Cross-process mutual exclusion for one workflow run. */
+export interface WorkflowLock {
+  acquire(workflowId: string, owner: string, leaseMs: number): Promise<boolean>
+  release(workflowId: string, owner: string): Promise<void>
+  renew?(workflowId: string, owner: string, leaseMs: number): Promise<boolean>
+}
+
 export interface WorkflowEngineOptions {
   store?: EventStore
   scheduler?: Scheduler
   logger?: NevoLogger
+  /** Required for multi-replica deployments; omitting it leaves only the in-process queue. */
+  lock?: WorkflowLock
+  lockLeaseMs?: number
 }
 
 interface WorkflowRunResult {
@@ -93,10 +104,15 @@ export class WorkflowEngine {
   private readonly logger: NevoLogger
   private readonly workflows = new Map<string, WorkflowFn<any, any>>()
   private readonly executionQueues = new Map<string, Promise<void>>()
+  private readonly lock?: WorkflowLock
+  private readonly lockLeaseMs: number
+  private readonly ownerId = `workflow-${uuidv7().slice(0, 12)}`
 
   constructor(opts: WorkflowEngineOptions = {}) {
     this.store = opts.store ?? new InMemoryEventStore()
     this.scheduler = opts.scheduler
+    this.lock = opts.lock
+    this.lockLeaseMs = Math.max(1_000, opts.lockLeaseMs ?? 60_000)
     this.logger = (opts.logger ?? getDefaultLogger()).child({ component: "workflow" })
 
     if (this.scheduler) {
@@ -217,7 +233,7 @@ export class WorkflowEngine {
 
   private execute(workflowId: string): Promise<WorkflowRunResult> {
     const tail = this.executionQueues.get(workflowId) ?? Promise.resolve()
-    const run = tail.then(() => this.executeExclusive(workflowId))
+    const run = tail.then(() => this.executeUnderLock(workflowId))
     const next = run.then(
       () => undefined,
       () => undefined
@@ -227,6 +243,41 @@ export class WorkflowEngine {
       if (this.executionQueues.get(workflowId) === next) this.executionQueues.delete(workflowId)
     })
     return run
+  }
+
+  /** A run that cannot take the lease reports `suspended` without replaying. */
+  private async executeUnderLock(workflowId: string): Promise<WorkflowRunResult> {
+    if (!this.lock) return this.executeExclusive(workflowId)
+
+    const acquired = await this.lock.acquire(workflowId, this.ownerId, this.lockLeaseMs)
+    if (!acquired) {
+      this.logger.debug({ event: "workflow.lock_busy", workflowId }, "Another replica holds this workflow; skipping the run")
+      return { status: "suspended" }
+    }
+
+    const renew = this.lock.renew
+    const heartbeat = renew
+      ? setInterval(
+          () => {
+            void renew.call(this.lock, workflowId, this.ownerId, this.lockLeaseMs).catch((err: unknown) => {
+              this.logger.warn({ event: "workflow.lock_renew_failed", workflowId, err: (err as Error)?.message })
+            })
+          },
+          Math.max(1_000, Math.floor(this.lockLeaseMs / 3))
+        )
+      : undefined
+    if (heartbeat && typeof heartbeat.unref === "function") heartbeat.unref()
+
+    try {
+      return await this.executeExclusive(workflowId)
+    } finally {
+      if (heartbeat) clearInterval(heartbeat)
+      try {
+        await this.lock.release(workflowId, this.ownerId)
+      } catch (err) {
+        this.logger.warn({ event: "workflow.lock_release_failed", workflowId, err: (err as Error)?.message })
+      }
+    }
   }
 
   private async executeExclusive(workflowId: string): Promise<WorkflowRunResult> {
@@ -480,6 +531,30 @@ export class WorkflowEngine {
   }
 }
 
+export class InMemoryWorkflowLock implements WorkflowLock {
+  private readonly held = new Map<string, { owner: string; expiresAt: number }>()
+
+  async acquire(workflowId: string, owner: string, leaseMs: number): Promise<boolean> {
+    const now = Date.now()
+    const current = this.held.get(workflowId)
+    if (current && current.owner !== owner && current.expiresAt > now) return false
+    this.held.set(workflowId, { owner, expiresAt: now + leaseMs })
+    return true
+  }
+
+  async renew(workflowId: string, owner: string, leaseMs: number): Promise<boolean> {
+    const current = this.held.get(workflowId)
+    if (!current || current.owner !== owner) return false
+    current.expiresAt = Date.now() + leaseMs
+    return true
+  }
+
+  async release(workflowId: string, owner: string): Promise<void> {
+    const current = this.held.get(workflowId)
+    if (current?.owner === owner) this.held.delete(workflowId)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // @Workflow decorator + discovery
 // ---------------------------------------------------------------------------
@@ -498,15 +573,13 @@ interface WorkflowMeta extends WorkflowDecoratorOptions {
 export function Workflow(options: WorkflowDecoratorOptions = {}): MethodDecorator {
   return (target, propertyKey) => {
     const ctor = (target as any)?.constructor ?? target
-    const list = (Reflect.getMetadata(NEVO_METHOD_WORKFLOW, ctor) as WorkflowMeta[] | undefined) ?? []
-    list.push({ ...options, propertyKey: propertyKey as string })
-    Reflect.defineMetadata(NEVO_METHOD_WORKFLOW, list, ctor)
+    defineMethodMetadata(NEVO_METHOD_WORKFLOW, ctor, propertyKey, { ...options, propertyKey: propertyKey as string })
   }
 }
 
 export function getWorkflowMethods(target: any): WorkflowMeta[] {
-  const ctor = target?.constructor ?? target
-  return (Reflect.getMetadata(NEVO_METHOD_WORKFLOW, ctor) as WorkflowMeta[] | undefined) ?? []
+  const map = readMethodMetadataMap<WorkflowMeta>(NEVO_METHOD_WORKFLOW, target)
+  return map ? [...map.values()] : []
 }
 
 /** Walk through `instances`, find any `@Workflow` methods, register with the engine. */

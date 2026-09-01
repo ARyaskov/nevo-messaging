@@ -3,6 +3,7 @@ import { uuidv7 } from "./uuid"
 import { getDefaultLogger, type NevoLogger } from "./logger"
 import { nextCronTick, isValidCron, type CronOptions } from "./cron"
 import { mapLimit } from "./concurrency"
+import { defineMethodMetadata, readMethodMetadataMap } from "./method-decorators"
 
 export interface ScheduledTask {
   id: string
@@ -34,14 +35,74 @@ export interface ScheduledTaskStore {
   extendLease?(ids: string[], workerId: string): Promise<void>
 }
 
+/** Binary min-heap over `(runAt, id)`, so a backlog of far-future tasks costs nothing to skip. */
+class DueHeap {
+  private readonly items: { runAt: number; id: string }[] = []
+
+  get size(): number {
+    return this.items.length
+  }
+
+  push(runAt: number, id: string): void {
+    this.items.push({ runAt, id })
+    let i = this.items.length - 1
+    while (i > 0) {
+      const parent = (i - 1) >> 1
+      if (this.items[parent].runAt <= this.items[i].runAt) break
+      ;[this.items[parent], this.items[i]] = [this.items[i], this.items[parent]]
+      i = parent
+    }
+  }
+
+  peekRunAt(): number | undefined {
+    return this.items[0]?.runAt
+  }
+
+  pop(): { runAt: number; id: string } | undefined {
+    const top = this.items[0]
+    if (top === undefined) return undefined
+    const last = this.items.pop()!
+    if (this.items.length > 0) {
+      this.items[0] = last
+      let i = 0
+      for (;;) {
+        const left = 2 * i + 1
+        const right = left + 1
+        let smallest = i
+        if (left < this.items.length && this.items[left].runAt < this.items[smallest].runAt) smallest = left
+        if (right < this.items.length && this.items[right].runAt < this.items[smallest].runAt) smallest = right
+        if (smallest === i) break
+        ;[this.items[smallest], this.items[i]] = [this.items[i], this.items[smallest]]
+        i = smallest
+      }
+    }
+    return top
+  }
+
+  clear(): void {
+    this.items.length = 0
+  }
+}
+
 export class InMemoryScheduledTaskStore implements ScheduledTaskStore {
   private readonly map = new Map<string, ScheduledTask>()
+  // Entries can be stale; `claimDue` validates each against `map` and drops it.
+  private readonly due = new DueHeap()
+  private readonly terminal: string[] = []
   private readonly terminalRetentionMs: number
   private readonly maxTerminalTasks: number
 
   constructor(opts: { terminalRetentionMs?: number; maxTerminalTasks?: number } = {}) {
     this.terminalRetentionMs = Math.max(0, opts.terminalRetentionMs ?? 60 * 60_000)
     this.maxTerminalTasks = Math.max(0, opts.maxTerminalTasks ?? 10_000)
+  }
+
+  private markClaimable(task: ScheduledTask): void {
+    this.due.push(task.runAt, task.id)
+  }
+
+  private markTerminal(task: ScheduledTask): void {
+    this.terminal.push(task.id)
   }
 
   async enqueue(task: ScheduledTask): Promise<void> {
@@ -51,27 +112,44 @@ export class InMemoryScheduledTaskStore implements ScheduledTaskStore {
     // no-op, while a changed expression/timezone replaces the old schedule.
     if (existing) {
       if (task.cron && (existing.cron !== task.cron || existing.timezone !== task.timezone || existing.name !== task.name)) {
-        this.map.set(task.id, { ...task, createdAt: existing.createdAt })
+        const replaced = { ...task, createdAt: existing.createdAt }
+        this.map.set(task.id, replaced)
+        this.markClaimable(replaced)
       }
       return
     }
-    this.map.set(task.id, { ...task })
+    const stored = { ...task }
+    this.map.set(task.id, stored)
+    if (stored.status === "pending") this.markClaimable(stored)
   }
 
   async claimDue(workerId: string, now: number, limit: number, claimTtlMs: number): Promise<ScheduledTask[]> {
     this.pruneTerminal(now)
     const claimed: ScheduledTask[] = []
-    for (const task of this.map.values()) {
-      if (claimed.length >= limit) break
-      if (task.runAt > now) continue
-      // Claimable when pending, or when a prior claim's lease has expired.
+    const requeue: ScheduledTask[] = []
+
+    while (claimed.length < limit) {
+      const nextDue = this.due.peekRunAt()
+      if (nextDue === undefined || nextDue > now) break
+      const entry = this.due.pop()!
+      const task = this.map.get(entry.id)
+      if (!task || task.runAt !== entry.runAt) continue
+
       const leaseExpired = task.status === "running" && task.claimedAt !== undefined && now - task.claimedAt >= claimTtlMs
-      if (task.status !== "pending" && !leaseExpired) continue
+      if (task.status !== "pending" && !leaseExpired) {
+        // A live lease may still expire; a terminal task never becomes claimable.
+        if (task.status === "running") requeue.push(task)
+        continue
+      }
+
       task.claimedAt = now
       task.claimedBy = workerId
       task.status = "running"
       claimed.push({ ...task })
+      requeue.push(task)
     }
+
+    for (const task of requeue) this.markClaimable(task)
     return claimed
   }
 
@@ -80,6 +158,7 @@ export class InMemoryScheduledTaskStore implements ScheduledTaskStore {
     if (!this.owns(t, workerId)) return
     t.status = "completed"
     t.completedAt = Date.now()
+    this.markTerminal(t)
   }
 
   async markFailed(id: string, error: string, workerId: string): Promise<void> {
@@ -90,7 +169,12 @@ export class InMemoryScheduledTaskStore implements ScheduledTaskStore {
     t.claimedAt = undefined
     t.claimedBy = undefined
     t.status = t.attempts >= t.maxAttempts ? "failed" : "pending"
-    if (t.status === "failed") t.completedAt = Date.now()
+    if (t.status === "failed") {
+      t.completedAt = Date.now()
+      this.markTerminal(t)
+    } else {
+      this.markClaimable(t)
+    }
   }
 
   async reschedule(id: string, nextRunAt: number, workerId: string, error?: string): Promise<void> {
@@ -103,6 +187,7 @@ export class InMemoryScheduledTaskStore implements ScheduledTaskStore {
     t.claimedAt = undefined
     t.claimedBy = undefined
     t.completedAt = undefined
+    this.markClaimable(t)
   }
 
   // Fence: only the worker that still holds the (running) claim may finalize.
@@ -123,6 +208,7 @@ export class InMemoryScheduledTaskStore implements ScheduledTaskStore {
     if (!t) return
     t.status = "cancelled"
     t.completedAt = Date.now()
+    this.markTerminal(t)
   }
 
   async list(filter?: { status?: ScheduledTask["status"]; limit?: number }): Promise<ScheduledTask[]> {
@@ -133,22 +219,35 @@ export class InMemoryScheduledTaskStore implements ScheduledTaskStore {
     return out.map((t) => ({ ...t }))
   }
 
+  /** Walks the terminal list, not the whole map, so cost tracks what actually expired. */
   private pruneTerminal(now = Date.now()): void {
-    const terminal: ScheduledTask[] = []
-    for (const task of this.map.values()) {
-      if (task.status !== "completed" && task.status !== "failed" && task.status !== "cancelled") continue
+    let live = 0
+    for (let i = 0; i < this.terminal.length; i++) {
+      const id = this.terminal[i]
+      const task = this.map.get(id)
+      if (!task || (task.status !== "completed" && task.status !== "failed" && task.status !== "cancelled")) continue
       const terminalAt = task.completedAt ?? task.createdAt
-      if (now - terminalAt > this.terminalRetentionMs) {
-        this.map.delete(task.id)
-      } else {
-        terminal.push(task)
+      const expired = now - terminalAt > this.terminalRetentionMs
+      if (expired) {
+        this.map.delete(id)
+        continue
       }
+      this.terminal[live++] = id
     }
-    if (terminal.length <= this.maxTerminalTasks) return
-    terminal.sort((a, b) => (a.completedAt ?? a.createdAt) - (b.completedAt ?? b.createdAt))
-    for (let i = 0; i < terminal.length - this.maxTerminalTasks; i++) {
-      this.map.delete(terminal[i].id)
-    }
+    this.terminal.length = live
+
+    const overflow = this.terminal.length - this.maxTerminalTasks
+    if (overflow <= 0) return
+    for (let i = 0; i < overflow; i++) this.map.delete(this.terminal[i])
+    this.terminal.splice(0, overflow)
+  }
+
+  size(): number {
+    return this.map.size
+  }
+
+  dueQueueSize(): number {
+    return this.due.size
   }
 }
 
@@ -271,11 +370,14 @@ export class Scheduler {
     const inflightIds = new Set(claimed.map((t) => t.id))
     let heartbeat: NodeJS.Timeout | undefined
     if (typeof this.store.extendLease === "function") {
-      heartbeat = setInterval(() => {
-        void this.store.extendLease!([...inflightIds], this.workerId).catch((err: unknown) => {
-          this.logger.warn({ event: "scheduler.lease.extend_failed", err: (err as Error)?.message })
-        })
-      }, Math.max(1000, Math.floor(this.claimTtlMs / 2)))
+      heartbeat = setInterval(
+        () => {
+          void this.store.extendLease!([...inflightIds], this.workerId).catch((err: unknown) => {
+            this.logger.warn({ event: "scheduler.lease.extend_failed", err: (err as Error)?.message })
+          })
+        },
+        Math.max(1000, Math.floor(this.claimTtlMs / 2))
+      )
       if (typeof heartbeat.unref === "function") heartbeat.unref()
     }
 
@@ -391,15 +493,13 @@ interface ScheduledMeta extends ScheduledDecoratorOptions {
 export function Scheduled(options: ScheduledDecoratorOptions = {}): MethodDecorator {
   return (target, propertyKey) => {
     const ctor = (target as any)?.constructor ?? target
-    const list = (Reflect.getMetadata(NEVO_METHOD_SCHEDULED, ctor) as ScheduledMeta[] | undefined) ?? []
-    list.push({ ...options, propertyKey: propertyKey as string })
-    Reflect.defineMetadata(NEVO_METHOD_SCHEDULED, list, ctor)
+    defineMethodMetadata(NEVO_METHOD_SCHEDULED, ctor, propertyKey, { ...options, propertyKey: propertyKey as string })
   }
 }
 
 export function getScheduledMethods(target: any): ScheduledMeta[] {
-  const ctor = target?.constructor ?? target
-  return (Reflect.getMetadata(NEVO_METHOD_SCHEDULED, ctor) as ScheduledMeta[] | undefined) ?? []
+  const map = readMethodMetadataMap<ScheduledMeta>(NEVO_METHOD_SCHEDULED, target)
+  return map ? [...map.values()] : []
 }
 
 /** Find `@Scheduled` methods on `instances`, register them, and enqueue an initial run. */

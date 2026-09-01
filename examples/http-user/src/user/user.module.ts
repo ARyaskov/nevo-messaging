@@ -1,14 +1,50 @@
 import { Module } from "@nestjs/common"
-import { HealthRegistry, HttpTransportController, createNevoHttpClient, eventLoopLagPing, httpPing, memoryUsagePing } from "@riaskov/nevo-messaging"
+import {
+  HealthRegistry,
+  HttpTransportController,
+  NevoModule,
+  createHttpTransportOptionsProvider,
+  createNevoHttpClient,
+  eventLoopLagPing,
+  httpPing,
+  memoryUsagePing
+} from "@riaskov/nevo-messaging"
 import { UserController } from "./user.controller"
 import { UserService } from "./user.service"
 
 const COORDINATOR_URL = process.env.HTTP_COORDINATOR ?? "http://127.0.0.1:8091"
 
 @Module({
+  imports: [
+    // Request-processing options for every @*SignalRouter controller in this app.
+    // The factory can inject anything, so stores and registries stay real providers.
+    NevoModule.forRootAsync({
+      inject: [HealthRegistry],
+      useFactory: (health: HealthRegistry) => ({
+        serviceName: "user",
+        serviceVersion: "2.0.0",
+        health,
+        accessControl: {
+          rules: [
+            { topic: "user-events", method: "*", allow: ["frontend", "coordinator"] },
+            { topic: "user-events", method: "user.delete", allow: ["coordinator"] }
+          ],
+          logDenied: true,
+          allowAllByDefault: false
+        }
+      })
+    })
+  ],
   controllers: [UserController, HttpTransportController],
   providers: [
     UserService,
+
+    // HttpTransportController's endpoints let a caller inject messages into any
+    // service's pub/sub channel, so they fail closed unless configured. This demo
+    // runs on a local network and opts out; a real deployment passes
+    // `authorize: (req) => ...` instead.
+    createHttpTransportOptionsProvider({ insecure: true }),
+
     {
       provide: HealthRegistry,
       useFactory: () => {

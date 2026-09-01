@@ -18,5 +18,14 @@
     "noImplicitAny": true
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "devtools", "test", "examples", "**/*.test.ts", "**/*.spec.ts"]
+  "//": "src/devtools-ui/client is browser JSX bundled by esbuild — see tsconfig.devtools-ui.json for its type-check",
+  "exclude": [
+    "node_modules",
+    "dist",
+    "test",
+    "examples",
+    "**/*.test.ts",
+    "**/*.spec.ts",
+    "src/devtools-ui/client"
+  ]
 }

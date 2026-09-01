@@ -4,6 +4,7 @@ import assert from "node:assert/strict"
 import { gzipSync } from "node:zlib"
 import { randomBytes } from "node:crypto"
 import { KafkaSignalRouter } from "../src/transports/kafka/kafka.signal-router.decorator"
+import { bindSignalRouterForTesting } from "../src/signal-router.utils"
 import { addSignalMetadata } from "../src/signal.decorator"
 import { JsonCodec } from "../src/common/codec"
 
@@ -47,7 +48,8 @@ function makeController() {
   // of the host toolchain's decorator mode — the test runner emits TC39 standard
   // decorators, under which a legacy method decorator cannot reach the class.
   addSignalMetadata(Controller, "doThing", "echo")
-  KafkaSignalRouter(EchoService, { codec: new JsonCodec(), logger: SILENT_LOGGER, debug: false })(Controller)
+  KafkaSignalRouter(EchoService, { codec: new JsonCodec(), debug: false })(Controller)
+  bindSignalRouterForTesting(Controller, { logger: SILENT_LOGGER, devtools: false, tracing: { enabled: false } })
   return new Controller() as any
 }
 

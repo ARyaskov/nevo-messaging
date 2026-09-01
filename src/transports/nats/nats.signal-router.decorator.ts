@@ -13,7 +13,7 @@ function fnv1aHash64(str: string): string {
 }
 import { Type, Inject, Optional } from "@nestjs/common"
 import type { NatsConnection, Subscription } from "@nats-io/nats-core"
-import { createSignalRouterDecorator, SignalRouterOptions } from "../../signal-router.utils"
+import { createSignalRouterDecorator, SignalRouterOptions, getRouterRuntime } from "../../signal-router.utils"
 import {
   Codec,
   getCodec,
@@ -24,10 +24,7 @@ import {
   maybeDecompressAsync,
   shouldDecompressAsync,
   enforcePayloadLimit,
-  DEFAULT_MAX_PAYLOAD_BYTES,
   resolveCompressionOptions,
-  getDefaultLogger,
-  DlqRouter,
   LruIdempotencyCache
 } from "../../common"
 import { getNatsModule } from "../optional-deps"
@@ -56,9 +53,6 @@ const DEFAULT_NATS_CLIENT_TOKEN = "NEVO_NATS_CLIENT"
 export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?: NatsSignalRouterOptions) {
   const codec: Codec = typeof options?.codec === "string" ? getCodec(options.codec) : (options?.codec as Codec) || getDefaultCodec()
   const compression = resolveCompressionOptions(options?.compression)
-  const maxPayloadBytes = options?.security?.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES
-  const logger = options?.logger || getDefaultLogger().child({ component: "nats-router" })
-  const dlq = options?.dlq instanceof DlqRouter ? options.dlq : new DlqRouter({ enabled: (options?.dlq as any)?.enabled === true })
 
   const responseCacheEnabled = options?.responseCache?.enabled === true && compression.enabled
   const responseCache = responseCacheEnabled
@@ -76,7 +70,7 @@ export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?:
 
   return createSignalRouterDecorator(
     serviceType,
-    { ...options, dlq, logger },
+    options ?? {},
     (data) => {
       const messageData: any = data
       return {
@@ -115,6 +109,11 @@ export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?:
       const originalOnModuleInit = target.prototype.onModuleInit || function () {}
       target.prototype.onModuleInit = async function () {
         await originalOnModuleInit.call(this)
+
+        const runtime = getRouterRuntime(this.constructor)
+        const logger = runtime.logger
+        const dlq = runtime.dlq
+        const maxPayloadBytes = runtime.maxPayloadBytes
 
         let nc: NatsConnection | null = null
         let ownsConnection = false
@@ -206,7 +205,7 @@ export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?:
               await sleep(1000)
             }
           }
-        })()
+        })().catch((err) => logger.error({ event: "nats.router.pump_crashed", err: (err as Error)?.message }))
       }
 
       const originalOnModuleDestroy = target.prototype.onModuleDestroy || function () {}

@@ -1,15 +1,7 @@
 import { Type } from "@nestjs/common"
 import { createServer, Server as HttpServer } from "node:http"
-import { createSignalRouterDecorator, SignalRouterOptions } from "../../signal-router.utils"
-import {
-  DEFAULT_DISCOVERY_TOPIC,
-  DEFAULT_SUBSCRIPTION_SUFFIX,
-  stringifyWithBigInt,
-  getDefaultLogger,
-  DlqRouter,
-  formatMethod,
-  DEFAULT_METHOD_VERSION
-} from "../../common"
+import { createSignalRouterDecorator, SignalRouterOptions, getRouterRuntime } from "../../signal-router.utils"
+import { DEFAULT_DISCOVERY_TOPIC, DEFAULT_SUBSCRIPTION_SUFFIX, stringifyWithBigInt, formatMethod, DEFAULT_METHOD_VERSION } from "../../common"
 import { getSocketIoModule } from "../optional-deps"
 
 export interface SocketSignalRouterOptions extends SignalRouterOptions {
@@ -31,12 +23,9 @@ function toVersionedMethod(method: unknown): string | null {
 }
 
 export function SocketSignalRouter(serviceType: Type<any> | Type<any>[], options?: SocketSignalRouterOptions) {
-  const logger = options?.logger || getDefaultLogger().child({ component: "socket-router" })
-  const dlq = options?.dlq instanceof DlqRouter ? options.dlq : new DlqRouter({ enabled: (options?.dlq as any)?.enabled === true })
-
   return createSignalRouterDecorator(
     serviceType,
-    { ...options, logger, dlq },
+    options ?? {},
     (data) => {
       const messageData: any = data || {}
       return {
@@ -54,6 +43,10 @@ export function SocketSignalRouter(serviceType: Type<any> | Type<any>[], options
       const originalOnModuleInit = target.prototype.onModuleInit || function () {}
       target.prototype.onModuleInit = async function () {
         await originalOnModuleInit.call(this)
+
+        const runtime = getRouterRuntime(this.constructor)
+        const logger = runtime.logger
+        const dlq = runtime.dlq
 
         const port = options?.port || 3100
         const path = options?.path || "/socket.io"

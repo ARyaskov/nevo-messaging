@@ -17,8 +17,23 @@ export interface SchemaLike {
   validate?: (input: unknown) => unknown
 }
 
+// Adapters are pure wrappers, so one per schema object is enough.
+const validatorCache = new WeakMap<object, SchemaValidator | null>()
+
 export function toValidator(schema: unknown): SchemaValidator | null {
   if (!schema) return null
+  if (typeof schema === "object" || typeof schema === "function") {
+    const key = schema as object
+    const cached = validatorCache.get(key)
+    if (cached !== undefined) return cached
+    const built = buildValidator(schema)
+    validatorCache.set(key, built)
+    return built
+  }
+  return buildValidator(schema)
+}
+
+function buildValidator(schema: unknown): SchemaValidator | null {
   const s = schema as SchemaLike
 
   if (typeof s.parse === "function") {
@@ -48,25 +63,37 @@ export function toValidator(schema: unknown): SchemaValidator | null {
   return null
 }
 
-function classValidatorAdapter(Ctor: new () => unknown): SchemaValidator | null {
+let classValidatorModules: { validateSync: any; plainToInstance: any } | null | undefined
+
+function loadClassValidator(): { validateSync: any; plainToInstance: any } | null {
+  if (classValidatorModules !== undefined) return classValidatorModules
   try {
-    const { validateSync } = nodeRequire("class-validator")
-    const { plainToInstance } = nodeRequire("class-transformer")
-    return {
-      parse: (input) => {
-        const instance = plainToInstance(Ctor, input)
-        const errors = validateSync(instance as object)
-        if (errors.length) {
-          throw new MessagingError(ErrorCode.VALIDATION_FAILED, {
-            message: "Validation failed",
-            errors: errors.map((e: any) => ({ property: e.property, constraints: e.constraints }))
-          })
-        }
-        return instance
-      }
+    classValidatorModules = {
+      validateSync: nodeRequire("class-validator").validateSync,
+      plainToInstance: nodeRequire("class-transformer").plainToInstance
     }
   } catch {
-    return null
+    classValidatorModules = null
+  }
+  return classValidatorModules
+}
+
+function classValidatorAdapter(Ctor: new () => unknown): SchemaValidator | null {
+  const mods = loadClassValidator()
+  if (!mods) return null
+  const { validateSync, plainToInstance } = mods
+  return {
+    parse: (input) => {
+      const instance = plainToInstance(Ctor, input)
+      const errors = validateSync(instance as object)
+      if (errors.length) {
+        throw new MessagingError(ErrorCode.VALIDATION_FAILED, {
+          message: "Validation failed",
+          errors: errors.map((e: any) => ({ property: e.property, constraints: e.constraints }))
+        })
+      }
+      return instance
+    }
   }
 }
 

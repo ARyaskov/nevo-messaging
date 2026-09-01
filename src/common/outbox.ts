@@ -1,4 +1,5 @@
 import { uuidv7 } from "./uuid"
+import { mapLimit } from "./concurrency"
 
 export interface OutboxRecord {
   id: string
@@ -49,8 +50,22 @@ export class InMemoryOutboxTx {
   }
 }
 
+export interface InMemoryOutboxStoreOptions {
+  /** How long a published record is kept before pruning. Default 5 min. */
+  publishedRetentionMs?: number
+  /** Hard cap on retained published records. Default 10_000. */
+  maxPublished?: number
+}
+
 export class InMemoryOutboxStore implements OutboxStore {
   private readonly records = new Map<string, OutboxRecord>()
+  private readonly publishedRetentionMs: number
+  private readonly maxPublished: number
+
+  constructor(opts: InMemoryOutboxStoreOptions = {}) {
+    this.publishedRetentionMs = Math.max(0, opts.publishedRetentionMs ?? 5 * 60_000)
+    this.maxPublished = Math.max(0, opts.maxPublished ?? 10_000)
+  }
 
   /** Open a staging transaction for {@link withOutboxTransaction}. */
   beginTx(): InMemoryOutboxTx {
@@ -85,6 +100,7 @@ export class InMemoryOutboxStore implements OutboxStore {
   }
 
   async listPending(limit: number): Promise<OutboxRecord[]> {
+    this.prunePublished()
     const all = [...this.records.values()].sort((a, b) => a.createdAt - b.createdAt)
     const blockedPartitions = new Set<string>()
     const out: OutboxRecord[] = []
@@ -101,6 +117,22 @@ export class InMemoryOutboxStore implements OutboxStore {
       if (out.length >= limit) break
     }
     return out
+  }
+
+  private prunePublished(now = Date.now()): void {
+    const published: OutboxRecord[] = []
+    for (const r of this.records.values()) {
+      if (r.status !== "published") continue
+      if (now - (r.publishedAt ?? r.createdAt) > this.publishedRetentionMs) this.records.delete(r.id)
+      else published.push(r)
+    }
+    if (published.length <= this.maxPublished) return
+    published.sort((a, b) => (a.publishedAt ?? a.createdAt) - (b.publishedAt ?? b.createdAt))
+    for (let i = 0; i < published.length - this.maxPublished; i++) this.records.delete(published[i].id)
+  }
+
+  size(): number {
+    return this.records.size
   }
 }
 
@@ -131,7 +163,7 @@ export class Outbox {
   constructor(
     private readonly store: OutboxStore,
     private readonly publisher: OutboxPublisher,
-    private readonly opts: { batch?: number; intervalMs?: number; maxAttempts?: number } = {}
+    private readonly opts: { batch?: number; intervalMs?: number; maxAttempts?: number; partitionConcurrency?: number } = {}
   ) {}
 
   /** Append an event to the outbox. Pass `opts.tx` to enlist the write in your business transaction; see {@link withOutboxTransaction}. */
@@ -169,10 +201,12 @@ export class Outbox {
       failed += r.failed
     }
 
-    for (const part of ordered) {
-      const r = await this.relayOrdered(part, maxAttempts)
-      published += r.published
-      failed += r.failed
+    if (ordered.length > 0) {
+      const results = await mapLimit(ordered, this.opts.partitionConcurrency ?? 8, (part) => this.relayOrdered(part, maxAttempts))
+      for (const r of results) {
+        published += r.published
+        failed += r.failed
+      }
     }
 
     return { published, failed }

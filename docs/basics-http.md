@@ -9,20 +9,36 @@ HTTP transport is ideal for services that must be reachable from external client
 ## Server side
 
 ```ts
-import { HttpSignalRouter, HttpTransportController, createHttpMicroservice } from "@riaskov/nevo-messaging"
+import {
+  HttpSignalRouter,
+  HttpTransportController,
+  NevoModule,
+  createHttpMicroservice,
+  createHttpTransportOptionsProvider
+} from "@riaskov/nevo-messaging"
 
 @Controller()
-@HttpSignalRouter([UserService], {
-  accessControl: {
-    rules: [{ topic: "user-events", method: "*", allow: ["frontend"] }],
-    logDenied: true
-  }
-})
+@HttpSignalRouter([UserService])
 export class UserController { ... }
 
 @Module({
+  imports: [
+    // Request-processing options live here so they can be built from providers.
+    NevoModule.forRoot({
+      serviceName: "user",
+      accessControl: {
+        rules: [{ topic: "user-events", method: "*", allow: ["frontend"] }],
+        logDenied: true
+      }
+    })
+  ],
   controllers: [UserController, HttpTransportController],
-  providers: [UserService]
+  providers: [
+    UserService,
+    createHttpTransportOptionsProvider({
+      authorize: (req) => isTrustedPeer(req as FastifyRequest)
+    })
+  ]
 })
 export class AppModule {}
 
@@ -34,6 +50,24 @@ createHttpMicroservice({
 ```
 
 `HttpTransportController` is required when you use `subscribe` / `publish` / `broadcast`; it exposes the SSE endpoint and publish hook. For pure `query` / `emit` you can omit it.
+
+### Authorizing the transport endpoints — required
+
+`HttpTransportController` exposes `POST /__nevo/publish`, `POST /__broadcast` and `POST /__nevo.discovery`. A caller reaching them can inject messages into **any** service's pub/sub channel and forge discovery announcements, so the built-in guard **fails closed**: without configuration every request is rejected with `403`.
+
+Pick one:
+
+```ts
+// Verify the caller (mTLS subject, shared secret, JWT, allowlisted source, …).
+createHttpTransportOptionsProvider({ authorize: async (req) => checkPeer(req) })
+
+// Or state explicitly that the endpoints are unreachable from outside a trusted network.
+createHttpTransportOptionsProvider({ insecure: true })
+```
+
+`maxPayloadBytes` (default 4 MiB) caps inbound bodies before they are decoded.
+
+SSE channels are reference-counted: a channel exists only while at least one subscriber is attached, and `DEFAULT_MAX_SSE_CHANNELS` (1024, override with `createHttpSseBrokerProvider({ maxChannels })`) bounds how many may exist at once. A `publish` to a channel with no live subscriber is dropped and reported as `{ ok: true, delivered: false }` — a plain fan-out hub has no replay buffer, so there was never anything to retain.
 
 ## Client side
 

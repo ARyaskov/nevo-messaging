@@ -26,21 +26,24 @@ export function levenshteinDistance(a: string, b: string): number {
   return prev[a.length]
 }
 
+const MAX_SUGGEST_INPUT_CHARS = 256
+
+/** The length pre-filter and input cap matter: this runs on caller-controlled names. */
 export function suggestClosestMethod(method: string, candidates: string[]): string | null {
-  if (!candidates.length) return null
+  if (!candidates.length || !method || method.length > MAX_SUGGEST_INPUT_CHARS) return null
 
   const normalized = method.toLowerCase()
+  const threshold = Math.max(2, Math.floor(method.length * 0.4))
   let best: { name: string; score: number } | null = null
 
   for (const candidate of candidates) {
+    if (Math.abs(candidate.length - normalized.length) > threshold) continue
     const score = levenshteinDistance(normalized, candidate.toLowerCase())
-    if (!best || score < best.score) {
+    if (score <= threshold && (!best || score < best.score)) {
       best = { name: candidate, score }
+      if (score === 0) break
     }
   }
 
-  if (!best) return null
-
-  const threshold = Math.max(2, Math.floor(method.length * 0.4))
-  return best.score <= threshold ? best.name : null
+  return best?.name ?? null
 }

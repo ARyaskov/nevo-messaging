@@ -19,7 +19,7 @@ import {
   MessagingError,
   ErrorCode
 } from "../src/common"
-import { createSignalRouterDecorator } from "../src/signal-router.utils"
+import { createSignalRouterDecorator, bindSignalRouterForTesting } from "../src/signal-router.utils"
 import { addSignalMetadata } from "../src/signal.decorator"
 
 // Decorator factories are applied manually here so the test works regardless of
@@ -312,13 +312,15 @@ function buildRouterHandler(serviceType: any, serviceInstance: any, signalName: 
     svc: any = serviceInstance
   }
   addSignalMetadata(Ctrl, signalName, methodName)
+  const opts: any = { serviceName: "router", tracing: { enabled: false }, devtools: false }
   const decorate = createSignalRouterDecorator(
     serviceType,
-    { serviceName: "router", tracing: { enabled: false }, devtools: false },
+    opts,
     (data: any) => ({ method: data.method, params: data.params, uuid: data.uuid, meta: data.meta }),
     () => {}
   )
   decorate(Ctrl)
+  bindSignalRouterForTesting(Ctrl, opts)
   const ctrl: any = new Ctrl()
   return (data: any) => ctrl.handleSignalMessage(data) as Promise<any>
 }

@@ -1,6 +1,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { WsSignalRouter } from "../src/transports/websocket/ws.signal-router.decorator"
+import { bindSignalRouterForTesting } from "../src/signal-router.utils"
 import { NevoWsClient } from "../src/transports/websocket/nevo-ws.client"
 
 class UserService {
@@ -13,13 +14,9 @@ test("ws router: publish fans out to subscribed clients and skips the RPC handle
   class Ctrl {
     svc = new UserService()
   }
-  const decorate = WsSignalRouter([UserService], {
-    serviceName: "user",
-    port: 0,
-    devtools: false,
-    tracing: { enabled: false }
-  })
+  const decorate = WsSignalRouter([UserService], { serviceName: "user", port: 0 })
   decorate(Ctrl)
+  bindSignalRouterForTesting(Ctrl, { devtools: false, tracing: { enabled: false } })
 
   const ctrl: any = new Ctrl()
   await ctrl.onModuleInit()
@@ -57,13 +54,9 @@ test("ws router: publish does not reach clients subscribed to a different method
   class Ctrl {
     svc = new UserService()
   }
-  const decorate = WsSignalRouter([UserService], {
-    serviceName: "user",
-    port: 0,
-    devtools: false,
-    tracing: { enabled: false }
-  })
+  const decorate = WsSignalRouter([UserService], { serviceName: "user", port: 0 })
   decorate(Ctrl)
+  bindSignalRouterForTesting(Ctrl, { devtools: false, tracing: { enabled: false } })
 
   const ctrl: any = new Ctrl()
   await ctrl.onModuleInit()

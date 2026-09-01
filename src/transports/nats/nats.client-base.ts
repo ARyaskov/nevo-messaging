@@ -1,12 +1,7 @@
 import { NevoNatsClient } from "./nevo-nats.client"
+import type { ClientCallOptions } from "../../common/client-runtime"
 
-export interface ClientCallOptions {
-  version?: string
-  idempotencyKey?: string
-  headers?: Record<string, string>
-  tenantId?: string
-  timeoutMs?: number
-}
+export type { ClientCallOptions }
 
 export abstract class NatsClientBase {
   protected readonly universalClient: NevoNatsClient

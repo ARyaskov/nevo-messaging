@@ -1,5 +1,5 @@
 import { createRequire } from "node:module"
-import { deserializeBigInt, makeBigIntReviver, normalizeWireValue } from "./bigint.utils"
+import { deserializeBigInt, makeBigIntReviver, mayContainWireSentinel, normalizeWireValue } from "./bigint.utils"
 import { MessagingError } from "./errors"
 import { ErrorCode } from "./error-code"
 
@@ -87,7 +87,8 @@ export class MessagePackCodec implements Codec {
       data = Buffer.from(data, "binary")
     }
     try {
-      return deserializeBigInt(this.decoder!.decode(data)) as T
+      const decoded = this.decoder!.decode(data)
+      return (mayContainWireSentinel(data) ? deserializeBigInt(decoded) : decoded) as T
     } catch (err: any) {
       throw new MessagingError(ErrorCode.PARSE_ERROR, { message: `MessagePack decode error: ${err.message}` })
     }

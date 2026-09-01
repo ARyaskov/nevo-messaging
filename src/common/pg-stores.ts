@@ -5,6 +5,7 @@ import type { SagaStore, SagaSnapshot } from "./saga"
 import type { EventStore, DomainEvent, EventStoreReadRange } from "./event-store"
 import type { DlqStore, DlqEntry, DlqQuery, DlqStats } from "./dlq"
 import type { ScheduledTask, ScheduledTaskStore } from "./scheduler"
+import type { WorkflowLock } from "./workflow"
 import { uuidv7 } from "./uuid"
 import { getDefaultLogger, type NevoLogger } from "./logger"
 import { stringifyWithBigInt, deserializeBigInt } from "./bigint.utils"
@@ -414,7 +415,7 @@ export class PgSagaStore implements SagaStore {
     }
   }
 
-  async listPending(): Promise<SagaSnapshot[]> {
+  async listPending(limit = 200): Promise<SagaSnapshot[]> {
     const res = await this.client.query<{
       saga_id: string
       type: string | null
@@ -428,7 +429,10 @@ export class PgSagaStore implements SagaStore {
     }>(
       `SELECT saga_id, type, status, steps, executed, compensated, ctx, error, updated_at
          FROM ${this.table}
-        WHERE status IN ('pending', 'compensating')`
+        WHERE status IN ('pending', 'compensating')
+        ORDER BY updated_at ASC
+        LIMIT $1`,
+      [Math.max(1, limit)]
     )
     return res.rows.map((row) => ({
       sagaId: row.saga_id,
@@ -456,6 +460,14 @@ export interface PgEventStoreOptions extends PgStoreOptions {
   table?: string
 }
 
+export interface PgEventStoreSubscribeOptions {
+  pollIntervalMs?: number
+  batchSize?: number
+  maxAttemptsPerEvent?: number
+  maxBackoffMs?: number
+  onPoison?: (event: DomainEvent, err: unknown) => Promise<void> | void
+}
+
 /** Postgres event store. */
 export class PgEventStore implements EventStore {
   private readonly client: PgClient
@@ -478,32 +490,30 @@ export class PgEventStore implements EventStore {
         aggregate_id TEXT,
         payload      JSONB NOT NULL,
         meta         JSONB,
+        txid         xid8 NOT NULL DEFAULT pg_current_xact_id(),
         ts           TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `)
+    await this.client.query(`ALTER TABLE ${this.table} ADD COLUMN IF NOT EXISTS txid xid8 NOT NULL DEFAULT pg_current_xact_id();`)
     await this.client.query(`
       CREATE INDEX IF NOT EXISTS nevo_events_aggregate_idx ON ${this.table} (aggregate_id, sequence);
     `)
     await this.client.query(`
       CREATE INDEX IF NOT EXISTS nevo_events_type_idx ON ${this.table} (type);
     `)
+    await this.client.query(`
+      CREATE INDEX IF NOT EXISTS nevo_events_txid_idx ON ${this.table} (txid, sequence);
+    `)
   }
 
-  /**
-   * Appends one event. A per-table advisory lock serialises appends so the
-   * `sequence` column is strictly gap-free (required by the poll-based
-   * `subscribe`/`read` cursor). This caps append throughput to one writer at a
-   * time for the whole store; if you need higher write concurrency, shard the
-   * store per aggregate or switch consumers to a gap-tolerant cursor.
-   */
+  /** Requires Postgres 13+ (`xid8`); commit-order visibility is explained in docs/cqrs.md. */
   async append(input: Omit<DomainEvent, "id" | "sequence" | "ts">): Promise<DomainEvent> {
     const id = uuidv7()
     const res = await this.client.query<{ sequence: string | number; ts: Date }>(
       `INSERT INTO ${this.table} (id, type, aggregate_id, payload, meta)
-       SELECT $1, $2, $3, $4::jsonb, $5::jsonb
-         FROM (SELECT pg_advisory_xact_lock(hashtext($6))) AS seq_lock
+       VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
        RETURNING sequence, ts`,
-      [id, input.type, input.aggregateId ?? null, stringifyWithBigInt(input.payload), input.meta ? stringifyWithBigInt(input.meta) : null, this.table]
+      [id, input.type, input.aggregateId ?? null, stringifyWithBigInt(input.payload), input.meta ? stringifyWithBigInt(input.meta) : null]
     )
     const row = res.rows[0]!
     return {
@@ -536,6 +546,7 @@ export class PgEventStore implements EventStore {
       params.push(range.aggregateId)
       filters.push(`aggregate_id = $${params.length}`)
     }
+    if (range.committedOnly) filters.push(`txid < pg_snapshot_xmin(pg_current_snapshot())`)
     const where = filters.length ? `WHERE ${filters.join(" AND ")}` : ""
     let limitClause = ""
     if (range.limit !== undefined) {
@@ -568,38 +579,82 @@ export class PgEventStore implements EventStore {
   async subscribe(
     from: number,
     handler: (event: DomainEvent) => Promise<void> | void,
-    opts?: { pollIntervalMs?: number; batchSize?: number }
+    opts?: PgEventStoreSubscribeOptions
   ): Promise<{ unsubscribe(): Promise<void> }> {
     let cursor = from
     let stopped = false
     const interval = Math.max(50, opts?.pollIntervalMs ?? 200)
     const batchSize = Math.max(1, opts?.batchSize ?? 500)
+    const maxAttempts = Math.max(1, opts?.maxAttemptsPerEvent ?? 5)
+    const maxBackoff = Math.max(interval, opts?.maxBackoffMs ?? 30_000)
+    let stuck: { sequence: number; attempts: number } | null = null
+
+    const nextDelay = (): number => {
+      if (!stuck) return interval
+      return Math.min(maxBackoff, interval * 2 ** Math.min(stuck.attempts - 1, 10))
+    }
+
+    const onEventFailed = async (event: DomainEvent, err: unknown): Promise<"retry" | "skip"> => {
+      stuck =
+        stuck?.sequence === event.sequence ? { sequence: event.sequence, attempts: stuck.attempts + 1 } : { sequence: event.sequence, attempts: 1 }
+      const attempts = stuck.attempts
+      const message = (err as Error)?.message ?? String(err)
+      if (attempts < maxAttempts) {
+        this.logger?.warn(
+          { sequence: event.sequence, id: event.id, type: event.type, attempts, err: message },
+          "event-store.subscribe: handler failed; retrying with backoff (cursor not advanced)"
+        )
+        return "retry"
+      }
+      this.logger?.error(
+        { sequence: event.sequence, id: event.id, type: event.type, attempts, err: message },
+        "event-store.subscribe: handler failed repeatedly; skipping the event to unblock the stream"
+      )
+      if (opts?.onPoison) {
+        try {
+          await opts.onPoison(event, err)
+        } catch (sinkErr) {
+          this.logger?.error(
+            { sequence: event.sequence, err: (sinkErr as Error)?.message },
+            "event-store.subscribe: onPoison sink threw; the event is dropped from the stream"
+          )
+        }
+      }
+      return "skip"
+    }
+
     const tick = async () => {
       if (stopped) return
+      let delay = interval
       try {
         let more = true
         while (more && !stopped) {
-          const events = await this.read({ from: cursor, limit: batchSize })
+          const events = await this.read({ from: cursor, limit: batchSize, committedOnly: true })
           more = events.length === batchSize
-          for (const e of events) {
+          for (const event of events) {
             if (stopped) break
             try {
-              await handler(e)
+              await handler(event)
+              if (stuck?.sequence === event.sequence) stuck = null
             } catch (err) {
-              // Handler threw: stop without advancing the cursor so the event retries next tick.
-              this.logger?.warn(
-                { sequence: e.sequence, id: e.id, type: e.type, err: (err as Error)?.message ?? String(err) },
-                "event-store.subscribe: handler failed; retrying event next tick (cursor not advanced)"
-              )
-              more = false
-              break
+              const decision = await onEventFailed(event, err)
+              if (decision === "retry") {
+                more = false
+                delay = nextDelay()
+                break
+              }
+              stuck = null
             }
-            cursor = e.sequence + 1
+            cursor = event.sequence + 1
           }
         }
-      } catch {}
-      if (!stopped) timer = setTimeout(tick, interval)
-      if (timer && typeof timer.unref === "function") timer.unref()
+      } catch (err) {
+        this.logger?.warn({ err: (err as Error)?.message }, "event-store.subscribe: poll failed")
+      }
+      if (!stopped) {
+        timer = setTimeout(tick, delay)
+        if (typeof timer.unref === "function") timer.unref()
+      }
     }
     let timer: NodeJS.Timeout | undefined = setTimeout(tick, 0)
     if (typeof timer.unref === "function") timer.unref()
@@ -987,14 +1042,79 @@ export class PgScheduledTaskStore implements ScheduledTaskStore {
 }
 
 // ===========================================================================
+// PgWorkflowLock
+// ===========================================================================
+
+export interface PgWorkflowLockOptions extends PgStoreOptions {
+  table?: string
+}
+
+export class PgWorkflowLock implements WorkflowLock {
+  private readonly client: PgClient
+  private readonly table: string
+
+  constructor(opts: PgWorkflowLockOptions) {
+    if (!opts.client) throw new Error("PgWorkflowLock: `client` is required")
+    this.client = opts.client
+    this.table = qident(opts.schema, opts.table ?? "nevo_workflow_locks")
+  }
+
+  async migrate(): Promise<void> {
+    await this.client.query(`
+      CREATE TABLE IF NOT EXISTS ${this.table} (
+        workflow_id TEXT PRIMARY KEY,
+        owner       TEXT NOT NULL,
+        expires_at  TIMESTAMPTZ NOT NULL
+      );
+    `)
+  }
+
+  async acquire(workflowId: string, owner: string, leaseMs: number): Promise<boolean> {
+    const res = await this.client.query<{ workflow_id: string }>(
+      `INSERT INTO ${this.table} AS l (workflow_id, owner, expires_at)
+       VALUES ($1, $2, NOW() + ($3 || ' milliseconds')::interval)
+       ON CONFLICT (workflow_id) DO UPDATE
+         SET owner = EXCLUDED.owner, expires_at = EXCLUDED.expires_at
+         WHERE l.owner = EXCLUDED.owner OR l.expires_at < NOW()
+       RETURNING workflow_id`,
+      [workflowId, owner, String(Math.max(1, leaseMs))]
+    )
+    return res.rows.length > 0
+  }
+
+  async renew(workflowId: string, owner: string, leaseMs: number): Promise<boolean> {
+    const res = await this.client.query<{ workflow_id: string }>(
+      `UPDATE ${this.table} SET expires_at = NOW() + ($3 || ' milliseconds')::interval
+        WHERE workflow_id = $1 AND owner = $2
+       RETURNING workflow_id`,
+      [workflowId, owner, String(Math.max(1, leaseMs))]
+    )
+    return res.rows.length > 0
+  }
+
+  async release(workflowId: string, owner: string): Promise<void> {
+    await this.client.query(`DELETE FROM ${this.table} WHERE workflow_id = $1 AND owner = $2`, [workflowId, owner])
+  }
+}
+
+// ===========================================================================
 // One-shot migrate helper
 // ===========================================================================
 
+const MIGRATION_LOCK_KEY = 0x6e65766f
+
+/** Serialises DDL so replicas booting together can't deadlock on `CREATE ... IF NOT EXISTS`. */
 export async function migrateAllPgStores(client: PgClient, schema?: string): Promise<void> {
-  await new PgOutboxStore({ client, schema }).migrate()
-  await new PgInboxStore({ client, schema }).migrate()
-  await new PgSagaStore({ client, schema }).migrate()
-  await new PgEventStore({ client, schema }).migrate()
-  await new PgDlqStore({ client, schema }).migrate()
-  await new PgScheduledTaskStore({ client, schema }).migrate()
+  await client.query(`SELECT pg_advisory_lock($1)`, [MIGRATION_LOCK_KEY])
+  try {
+    await new PgOutboxStore({ client, schema }).migrate()
+    await new PgInboxStore({ client, schema }).migrate()
+    await new PgSagaStore({ client, schema }).migrate()
+    await new PgEventStore({ client, schema }).migrate()
+    await new PgDlqStore({ client, schema }).migrate()
+    await new PgScheduledTaskStore({ client, schema }).migrate()
+    await new PgWorkflowLock({ client, schema }).migrate()
+  } finally {
+    await client.query(`SELECT pg_advisory_unlock($1)`, [MIGRATION_LOCK_KEY])
+  }
 }

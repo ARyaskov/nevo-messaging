@@ -2,6 +2,7 @@ import { BackpressureLimiter, type BackpressureOptions, type PausableSubscriptio
 import { MessagingError } from "./errors"
 import { ErrorCode } from "./error-code"
 import { getMethodBackpressure } from "./resilience-decorators"
+import { getDefaultLogger } from "./logger"
 import type { SubscriptionContext } from "./types"
 
 /**
@@ -41,7 +42,12 @@ export function wrapSubscriptionHandler<T>(
       if (overflow === "nack") {
         try {
           await ctx.nack?.("backpressure overflow")
-        } catch {}
+        } catch (err) {
+          getDefaultLogger().warn(
+            { event: "backpressure.nack_failed", err: (err as Error)?.message },
+            "Backpressure overflow could not be nacked; the message waits for its redelivery timeout"
+          )
+        }
         return
       }
       throw new MessagingError(ErrorCode.RATE_LIMITED, {

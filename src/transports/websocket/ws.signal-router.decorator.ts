@@ -1,7 +1,7 @@
 import { Type } from "@nestjs/common"
 import { createServer, Server as HttpServer } from "node:http"
-import { createSignalRouterDecorator, SignalRouterOptions } from "../../signal-router.utils"
-import { Codec, getCodec, getDefaultCodec, getDefaultLogger, DlqRouter, formatMethod, parseMethod, DEFAULT_METHOD_VERSION } from "../../common"
+import { createSignalRouterDecorator, SignalRouterOptions, getRouterRuntime } from "../../signal-router.utils"
+import { Codec, getCodec, getDefaultCodec, formatMethod, parseMethod, DEFAULT_METHOD_VERSION } from "../../common"
 import { getWsModule } from "./optional-ws"
 
 export interface WsSignalRouterOptions extends SignalRouterOptions {
@@ -22,12 +22,10 @@ export interface WsSignalRouterOptions extends SignalRouterOptions {
 
 export function WsSignalRouter(serviceType: Type<any> | Type<any>[], options?: WsSignalRouterOptions) {
   const codec: Codec = typeof options?.codec === "string" ? getCodec(options.codec) : (options?.codec as Codec) || getDefaultCodec()
-  const logger = options?.logger || getDefaultLogger().child({ component: "ws-router" })
-  const dlq = options?.dlq instanceof DlqRouter ? options.dlq : new DlqRouter({ enabled: (options?.dlq as any)?.enabled === true })
 
   return createSignalRouterDecorator(
     serviceType,
-    { ...options, dlq, logger },
+    options ?? {},
     (data) => {
       const messageData: any = data || {}
       return {
@@ -45,6 +43,10 @@ export function WsSignalRouter(serviceType: Type<any> | Type<any>[], options?: W
       const originalOnModuleInit = target.prototype.onModuleInit || function () {}
       target.prototype.onModuleInit = async function () {
         await originalOnModuleInit.call(this)
+
+        const runtime = getRouterRuntime(this.constructor)
+        const logger = runtime.logger
+        const dlq = runtime.dlq
 
         const port = options?.port ?? 3200
         const host = options?.host || "0.0.0.0"

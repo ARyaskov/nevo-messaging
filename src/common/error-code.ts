@@ -18,15 +18,17 @@ export enum ErrorCode {
   CANCELLED = 16,
   UNSUPPORTED_VERSION = 17,
   ACK_FAILED = 18,
-  REMOTE_ERROR = 19
+  REMOTE_ERROR = 19,
+  /** One idempotency key was reused for a different request payload. */
+  IDEMPOTENCY_KEY_CONFLICT = 20
 }
 
+/** INTERNAL is excluded: opt in with `retryOnCodes` or `retryable: true`. */
 export function isRetryable(code: ErrorCode): boolean {
   switch (code) {
     case ErrorCode.TIMEOUT:
     case ErrorCode.SERVICE_UNAVAILABLE:
     case ErrorCode.CONNECTION_LOST:
-    case ErrorCode.INTERNAL:
       return true
     default:
       return false

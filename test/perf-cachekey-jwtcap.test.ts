@@ -2,6 +2,7 @@ import "reflect-metadata"
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { HttpSignalRouter } from "../src/transports/http/http.signal-router.decorator"
+import { bindSignalRouterForTesting } from "../src/signal-router.utils"
 import { addSignalMetadata } from "../src/signal.decorator"
 import { Cacheable } from "../src/common/method-decorators"
 import { createJwksVerifier } from "../src/common/jwt-verifier"
@@ -62,7 +63,8 @@ function makeRouter() {
   // of the host toolchain's decorator mode — the test runner emits TC39 standard
   // decorators, under which a legacy method decorator cannot reach the class.
   addSignalMetadata(Controller, "doThing", "echo")
-  HttpSignalRouter(EchoService, { serviceName: "svc", logger: SILENT_LOGGER, debug: false })(Controller)
+  HttpSignalRouter(EchoService, { serviceName: "svc", debug: false })(Controller)
+  bindSignalRouterForTesting(Controller, { logger: SILENT_LOGGER, devtools: false, tracing: { enabled: false } })
   const controller = new Controller() as any
 
   let n = 0

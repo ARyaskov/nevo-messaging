@@ -1,8 +1,9 @@
 // PII / secret redaction for logs, audit entries, and DLQ payloads.
 // NOTE: `jsonByteSize` must mirror `_redact`'s per-type representation; keep them in sync.
 
-// Any key CONTAINING one of these tokens (case-insensitive) is redacted.
-const REDACT_SUBSTRING = /password|secret|token|key|auth|cookie|credential/i
+// Bare `key`/`auth` are deliberately absent: they matched sortKey, keyword, authorId.
+const REDACT_SUBSTRING =
+  /password|passwd|secret|token|cookie|credential|bearer|apikey|api[-_]key|privatekey|private[-_]key|accesskey|access[-_]key|signingkey|signing[-_]key|encryptionkey|encryption[-_]key/i
 
 // Exact (case-insensitive) sensitive key names; also the source of truth for `pinoRedactPaths`.
 export const REDACT_KEY_NAMES: readonly string[] = [
@@ -57,13 +58,17 @@ function binarySummary(v: ArrayBufferView): string {
   return `[Buffer ${v.byteLength}B]`
 }
 
+const MAX_REDACT_DEPTH = 512
+const TOO_DEEP = "[TooDeep]"
+
 export function redactObject<T>(value: T, customKeys?: string[]): T {
-  return _redact(value, toExtra(customKeys), []) as T
+  return _redact(value, toExtra(customKeys), [], 0) as T
 }
 
 // `ancestors` tracks the active root-to-`v` path so only genuine back-references become "[Circular]".
-function _redact(v: unknown, extra: Set<string> | null, ancestors: object[]): unknown {
+function _redact(v: unknown, extra: Set<string> | null, ancestors: object[], depth: number): unknown {
   if (v === null || typeof v !== "object") return v
+  if (depth >= MAX_REDACT_DEPTH) return TOO_DEEP
 
   if (v instanceof Date || v instanceof RegExp) return v
   if (isBinary(v)) return binarySummary(v)
@@ -72,22 +77,22 @@ function _redact(v: unknown, extra: Set<string> | null, ancestors: object[]): un
   ancestors.push(v)
   try {
     if (Array.isArray(v)) {
-      return v.map((item) => _redact(item, extra, ancestors))
+      return v.map((item) => _redact(item, extra, ancestors, depth + 1))
     }
     if (v instanceof Set) {
-      return Array.from(v, (item) => _redact(item, extra, ancestors))
+      return Array.from(v, (item) => _redact(item, extra, ancestors, depth + 1))
     }
     if (v instanceof Map) {
       const out: Record<string, unknown> = {}
       for (const [k, val] of v) {
         const key = typeof k === "string" ? k : String(k)
-        out[key] = isSensitiveKey(key, extra) ? REDACTED : _redact(val, extra, ancestors)
+        out[key] = isSensitiveKey(key, extra) ? REDACTED : _redact(val, extra, ancestors, depth + 1)
       }
       return out
     }
     const out: Record<string, unknown> = {}
     for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
-      out[k] = isSensitiveKey(k, extra) ? REDACTED : _redact(val, extra, ancestors)
+      out[k] = isSensitiveKey(k, extra) ? REDACTED : _redact(val, extra, ancestors, depth + 1)
     }
     return out
   } finally {

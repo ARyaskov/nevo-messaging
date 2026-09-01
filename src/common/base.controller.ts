@@ -18,7 +18,7 @@ import {
 import { suggestClosestMethod } from "./levenshtein"
 import { getDefaultLogger, NevoLogger } from "./logger"
 import { LruIdempotencyCache } from "./idempotency"
-import type { IdempotencyStore } from "./idempotency-store"
+import type { IdempotencyEnvelope, IdempotencyStore } from "./idempotency-store"
 import { TwoTierIdempotency } from "./idempotency-runtime"
 import { ReplayGuard } from "./replay-protection"
 import { getSchemaFor, toValidator } from "./schema"
@@ -35,11 +35,13 @@ import { AuditLog } from "./audit-log"
 import {
   runDispatchPipeline,
   shapeDispatchError,
+  toWireError,
   type DispatchPipelineConfig,
   type DispatchStrategyArgs,
   type DispatchStrategyResult
 } from "./dispatch-pipeline"
 
+/** @deprecated Use a `@*SignalRouter` controller with `NevoModule`. Removed in the next major. */
 export abstract class BaseMessageController {
   protected readonly methodRegistry: ServiceMethodMapping = {}
   serviceInstances: any[] = []
@@ -57,9 +59,9 @@ export abstract class BaseMessageController {
     this._logger = this._loggerOverride ?? getDefaultLogger().child({ component: "controller", service: this.serviceName })
     return this._logger
   }
-  protected readonly idempotency: LruIdempotencyCache<MessageResponse>
+  protected readonly idempotency: LruIdempotencyCache<IdempotencyEnvelope<MessageResponse>>
   /** Optional distributed idempotency backend (Redis, Memcached, …). */
-  protected readonly distributedIdempotency?: IdempotencyStore<MessageResponse>
+  protected readonly distributedIdempotency?: IdempotencyStore<IdempotencyEnvelope<MessageResponse>>
   /** Shared two-tier idempotency runtime (L1 + claim-before-execute). */
   private readonly idem: TwoTierIdempotency<MessageResponse>
   protected readonly replayGuard: ReplayGuard
@@ -89,7 +91,7 @@ export abstract class BaseMessageController {
       accessControl?: AccessControlConfig
       logger?: NevoLogger
       idempotency?: IdempotencyOptions
-      idempotencyStore?: IdempotencyStore<MessageResponse>
+      idempotencyStore?: IdempotencyStore<IdempotencyEnvelope<MessageResponse>>
       security?: SecurityOptions
       metrics?: MetricsOptions
       tracing?: TracingOptions
@@ -113,7 +115,7 @@ export abstract class BaseMessageController {
     this.debug = options?.debug || false
     this.accessControl = options?.accessControl
     this._loggerOverride = options?.logger ?? null
-    this.idempotency = new LruIdempotencyCache<MessageResponse>(options?.idempotency)
+    this.idempotency = new LruIdempotencyCache<IdempotencyEnvelope<MessageResponse>>(options?.idempotency)
     this.distributedIdempotency = options?.idempotencyStore
     this.idem = new TwoTierIdempotency<MessageResponse>({
       l1: this.idempotency,
@@ -221,7 +223,7 @@ export abstract class BaseMessageController {
 
   protected createErrorResponse(uuid: string, method: string, error: any, meta?: MessageMeta): MessageResponse {
     if (error instanceof MessagingError) {
-      return { uuid, method, params: { result: "error", error: error.toJSON() }, meta }
+      return { uuid, method, params: { result: "error", error: toWireError(error) }, meta }
     }
 
     this.logger.error({ event: "ctl.unexpected_error", method, err: error?.message || String(error) }, "Unexpected error")
@@ -299,10 +301,8 @@ export abstract class BaseMessageController {
 
     const handler = this.methodRegistry[parsed.name] ?? this.methodRegistry[method]
     if (!handler) {
-      const suggestion = suggestClosestMethod(parsed.name, Object.keys(this.methodRegistry))
-      const message = suggestion
-        ? `Invalid method name '${parsed.name}', did you mean '${suggestion}'?`
-        : `Method handler not found: ${parsed.name}`
+      const suggestion = IS_PROD ? null : suggestClosestMethod(parsed.name, Object.keys(this.methodRegistry))
+      const message = suggestion ? `Invalid method name '${parsed.name}', did you mean '${suggestion}'?` : `Method handler not found: ${parsed.name}`
       return { response: shapeDispatchError(this.serviceName, uuid, method, new MessagingError(ErrorCode.METHOD_NOT_FOUND, { message }), meta) }
     }
 

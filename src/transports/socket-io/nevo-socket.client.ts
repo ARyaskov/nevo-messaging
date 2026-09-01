@@ -1,45 +1,21 @@
 import type { Socket } from "socket.io-client"
-import { randomUUID } from "node:crypto"
-import { uuidv7 } from "../../common/uuid"
 import {
   DEFAULT_BROADCAST_TOPIC,
   DEFAULT_DISCOVERY_TOPIC,
   DiscoveryRegistry,
   DiscoveryAnnouncement,
-  MessageMeta,
-  MessageType,
   MessagingError,
   TimeoutError,
   ErrorCode,
   Subscription,
   SubscriptionContext,
   SubscriptionOptions,
-  Codec,
-  getCodec,
-  getDefaultCodec,
-  NevoLogger,
-  getDefaultLogger,
-  CircuitBreakerRegistry,
-  ResolvedRetryOptions,
-  ResolvedCompressionOptions,
-  resolveRetryOptions,
-  withRetry,
-  resolveCompressionOptions,
-  DEFAULT_MAX_PAYLOAD_BYTES,
-  getDefaultTracer,
-  NevoTracer,
-  getDefaultMetrics,
-  NEVO_METRIC_NAMES,
-  methodLabel,
-  MetricsRegistry,
-  GracefulShutdown,
-  LruIdempotencyCache,
   TransportClientOptions,
+  ClientRuntime,
+  type ClientCallOptions,
   matchesFilter,
-  DEFAULT_METHOD_VERSION,
-  formatMethod,
   normalizeServiceName,
-  resolveOutboundChainId
+  parseMethod
 } from "../../common"
 import { getSocketIoClientModule } from "../optional-deps"
 
@@ -48,22 +24,8 @@ export interface NevoSocketClientOptions extends TransportClientOptions {
 }
 
 export class NevoSocketClient {
+  private readonly runtime: ClientRuntime
   private readonly serviceUrls: Map<string, string>
-  private readonly timeoutMs: number
-  private readonly debug: boolean
-  private readonly serviceName?: string
-  private readonly instanceId: string
-  private readonly authToken?: string
-  private readonly logger: NevoLogger
-  private readonly codec: Codec
-  private readonly circuitBreaker: CircuitBreakerRegistry
-  private readonly retryOptions: ResolvedRetryOptions
-  private readonly compression: ResolvedCompressionOptions
-  private readonly tracer: NevoTracer
-  private readonly metrics: MetricsRegistry
-  private readonly shutdown = new GracefulShutdown()
-  private readonly maxPayloadBytes: number
-  private readonly idempotencyCache: LruIdempotencyCache<unknown>
   private readonly sockets = new Map<string, Socket>()
   private readonly activeSubscriptions = new Map<
     string,
@@ -71,67 +33,19 @@ export class NevoSocketClient {
   >()
   private readonly discoveryRegistry = new DiscoveryRegistry()
   private readonly discoveryEnabled: boolean
-  private readonly discoveryHeartbeatIntervalMs: number
   private readonly discoveryTtlMs: number
-  private readonly metaStaticPart: Pick<MessageMeta, "service" | "instanceId" | "auth" | "codec">
 
   constructor(serviceUrls: Record<string, string>, options?: NevoSocketClientOptions) {
     this.serviceUrls = new Map(Object.entries(serviceUrls).map(([k, v]) => [k.toLowerCase(), v]))
-    this.timeoutMs = options?.timeoutMs ?? options?.timeout ?? 20000
-    this.debug = options?.debug || false
-    this.serviceName = options?.serviceName
-    this.instanceId = options?.instanceId || randomUUID()
-    this.authToken = options?.authToken
-    this.logger = (options?.logger as NevoLogger) || getDefaultLogger().child({ component: "socket-client", service: this.serviceName })
-    this.codec = typeof options?.codec === "string" ? getCodec(options.codec) : (options?.codec as Codec) || getDefaultCodec()
-    this.circuitBreaker = new CircuitBreakerRegistry(options?.circuitBreaker)
-    this.retryOptions = resolveRetryOptions(options?.retry)
-    this.compression = resolveCompressionOptions(options?.compression)
-    this.tracer = getDefaultTracer()
-    this.metrics = getDefaultMetrics()
-    this.maxPayloadBytes = options?.security?.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES
-    this.idempotencyCache = new LruIdempotencyCache<unknown>(options?.idempotency)
+    // socket.io serializes the envelope itself; a compressed body is unrecognisable to the peer.
+    this.runtime = new ClientRuntime(options, { transport: "socketio", component: "socket-client", compressionCapable: false })
     this.discoveryEnabled = options?.discovery?.enabled === true
-    this.discoveryHeartbeatIntervalMs = options?.discovery?.heartbeatIntervalMs || 10000
     this.discoveryTtlMs = options?.discovery?.ttlMs || 30000
     if (this.discoveryEnabled) this.discoveryRegistry.startBackgroundPrune(this.discoveryTtlMs)
-    this.metaStaticPart = Object.freeze({
-      service: this.serviceName,
-      instanceId: this.instanceId,
-      auth: this.authToken ? { token: this.authToken } : undefined,
-      codec: this.codec.name
-    })
   }
 
   getInstanceId(): string {
-    return this.instanceId
-  }
-
-  private buildMeta(type: MessageType, opts?: any): MessageMeta {
-    const baseMeta: MessageMeta = {
-      ...this.metaStaticPart,
-      type,
-      ts: Date.now(),
-      version: opts?.version || DEFAULT_METHOD_VERSION,
-      idempotencyKey: opts?.idempotencyKey,
-      tenantId: opts?.tenantId,
-      headers: opts?.headers,
-      nevoChainId: resolveOutboundChainId()
-    }
-    return this.tracer.inject(baseMeta)
-  }
-
-  private buildEnvelope(method: string, params: unknown, type: MessageType, opts?: any) {
-    const uuid = uuidv7()
-    const meta = this.buildMeta(type, opts)
-    const versioned = method.includes("@") ? method : formatMethod(method, opts?.version || DEFAULT_METHOD_VERSION)
-    const env = { uuid, method: versioned, params, meta }
-    const encoded = this.codec.encode(env)
-    if (encoded.byteLength > this.maxPayloadBytes) {
-      throw new MessagingError(ErrorCode.PAYLOAD_TOO_LARGE, { message: `Payload size ${encoded.byteLength}B exceeds ${this.maxPayloadBytes}B` })
-    }
-    this.metrics.observeHistogram(NEVO_METRIC_NAMES.payloadBytes, { direction: "out", service: this.serviceName ?? "unknown" }, encoded.byteLength)
-    return { env, uuid, meta, encoded }
+    return this.runtime.instanceId
   }
 
   private getSocket(serviceName: string): Socket {
@@ -160,7 +74,7 @@ export class NevoSocketClient {
             const payload = typeof raw === "string" ? JSON.parse(raw) : raw
             if (payload?.serviceName) this.discoveryRegistry.update(payload as DiscoveryAnnouncement)
           } catch (err) {
-            this.logger.error({ event: "socket.discovery.parse_error", err: (err as Error)?.message })
+            this.runtime.logger.error({ event: "socket.discovery.parse_error", err: (err as Error)?.message })
           }
         })
       }
@@ -168,82 +82,74 @@ export class NevoSocketClient {
     return socket
   }
 
-  async query<T = unknown>(
+  async query<T = unknown>(serviceName: string, method: string, params: unknown, opts?: ClientCallOptions): Promise<T> {
+    const normalized = normalizeServiceName(serviceName)
+    return this.runtime.query<T>({
+      serviceName: normalized,
+      method,
+      params,
+      opts,
+      send: (request) => {
+        const socket = this.getSocket(serviceName)
+        const timeout = opts?.timeoutMs ?? this.runtime.timeoutMs
+        const { promise, resolve, reject } = Promise.withResolvers<unknown>()
+        let settled = false
+        socket.timeout(timeout).emit("nevo:query", request.envelope, (timeoutErr: any, response: any) => {
+          if (settled) return
+          settled = true
+          if (timeoutErr) {
+            reject(new TimeoutError(serviceName, method, timeout))
+            return
+          }
+          resolve(response)
+        })
+        return promise
+      }
+    })
+  }
+
+  async emit(serviceName: string, method: string, params: unknown, opts?: ClientCallOptions): Promise<void> {
+    return this.dispatch(serviceName, method, params, "emit", "nevo:emit", opts)
+  }
+
+  async publish(serviceName: string, method: string, params: unknown, opts?: ClientCallOptions): Promise<void> {
+    return this.dispatch(serviceName, method, params, "sub", "nevo:publish", opts)
+  }
+
+  async broadcast(method: string, params: unknown, opts?: ClientCallOptions): Promise<void> {
+    const first = this.serviceUrls.keys().toArray()[0]
+    if (!first) throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, { message: "No base URL available for broadcast" })
+    return this.runtime.emit({
+      serviceName: DEFAULT_BROADCAST_TOPIC,
+      method,
+      params,
+      opts,
+      type: "broadcast",
+      send: async (request) => {
+        this.getSocket(first).emit("nevo:broadcast", request.envelope)
+      }
+    })
+  }
+
+  private async dispatch(
     serviceName: string,
     method: string,
     params: unknown,
-    opts?: { version?: string; idempotencyKey?: string; headers?: Record<string, string>; timeoutMs?: number; tenantId?: string }
-  ): Promise<T> {
-    const cbKey = `${normalizeServiceName(serviceName)}:${method}`
-    return this.shutdown.trackInflight(
-      (async () => {
-        if (opts?.idempotencyKey && this.idempotencyCache.isEnabled() && this.idempotencyCache.has(opts.idempotencyKey)) {
-          return this.idempotencyCache.get(opts.idempotencyKey) as T
-        }
-        const result = await withRetry(async (attempt) => {
-          this.circuitBreaker.before(cbKey)
-          try {
-            const socket = this.getSocket(serviceName)
-            const { env } = this.buildEnvelope(method, params, "query", {
-              ...opts,
-              headers: { ...(opts?.headers || {}), "nevo-attempt": String(attempt) }
-            })
-            const { promise, resolve, reject } = Promise.withResolvers<T>()
-            const effectiveTimeout = opts?.timeoutMs ?? this.timeoutMs
-            let settled = false
-            socket.timeout(effectiveTimeout).emit("nevo:query", env, (timeoutErr: any, response: any) => {
-              if (settled) return
-              settled = true
-              if (timeoutErr) {
-                reject(new TimeoutError(serviceName, method, effectiveTimeout))
-                return
-              }
-              if (response?.params?.result === "error" && response?.params?.error) {
-                const err = response.params.error
-                reject(new MessagingError(err.code, err.details ?? { message: err.message }, err.service || serviceName))
-                return
-              }
-              this.circuitBreaker.onSuccess(cbKey)
-              this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, {
-                transport: "socketio",
-                service: serviceName,
-                method: methodLabel(method),
-                role: "client"
-              })
-              resolve(response?.params?.result as T)
-            })
-            return await promise
-          } catch (err) {
-            this.circuitBreaker.onFailure(cbKey, err)
-            if (attempt > 1)
-              this.metrics.incCounter(NEVO_METRIC_NAMES.retries, { transport: "socketio", service: serviceName, method: methodLabel(method) })
-            throw err
-          }
-        }, this.retryOptions)
-        if (opts?.idempotencyKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(opts.idempotencyKey, result)
-        return result
-      })()
-    )
-  }
-
-  async emit(serviceName: string, method: string, params: unknown, opts?: any): Promise<void> {
-    const socket = this.getSocket(serviceName)
-    const { env } = this.buildEnvelope(method, params, "emit", opts)
-    socket.emit("nevo:emit", env)
-  }
-
-  async publish(serviceName: string, method: string, params: unknown, opts?: any): Promise<void> {
-    const socket = this.getSocket(serviceName)
-    const { env } = this.buildEnvelope(method, params, "sub", opts)
-    socket.emit("nevo:publish", env)
-  }
-
-  async broadcast(method: string, params: unknown, opts?: any): Promise<void> {
-    const first = this.serviceUrls.keys().toArray()[0]
-    if (!first) throw new MessagingError(ErrorCode.SERVICE_NOT_FOUND, { message: "No base URL available for broadcast" })
-    const socket = this.getSocket(first)
-    const { env } = this.buildEnvelope(method, params, "broadcast", opts)
-    socket.emit("nevo:broadcast", env)
+    type: "emit" | "sub",
+    event: string,
+    opts?: ClientCallOptions
+  ): Promise<void> {
+    const normalized = normalizeServiceName(serviceName)
+    return this.runtime.emit({
+      serviceName: normalized,
+      method,
+      params,
+      opts,
+      type,
+      send: async (request) => {
+        this.getSocket(serviceName).emit(event, request.envelope)
+      }
+    })
   }
 
   async subscribe<T = unknown>(
@@ -273,7 +179,7 @@ export class NevoSocketClient {
 
     const onMessage = async (raw: any) => {
       const payload: any = typeof raw === "string" ? JSON.parse(raw) : raw
-      if (method && payload.method !== method && payload.method?.split("@")[0] !== method) return
+      if (method && payload.method !== method && parseMethod(payload.method ?? "").name !== method) return
       if (!matchesFilter(options?.filter, payload.meta)) return
 
       const context: SubscriptionContext = {
@@ -284,7 +190,7 @@ export class NevoSocketClient {
       try {
         await handler(payload.params as T, context)
       } catch (err) {
-        this.logger.error({ event: "socket.sub.handler_error", err: (err as Error)?.message })
+        this.runtime.logger.error({ event: "socket.sub.handler_error", err: (err as Error)?.message })
       }
     }
 
@@ -328,6 +234,6 @@ export class NevoSocketClient {
       } catch {}
     }
     this.sockets.clear()
-    await this.shutdown.shutdown(timeoutMs)
+    await this.runtime.close(timeoutMs)
   }
 }

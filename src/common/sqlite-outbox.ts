@@ -15,7 +15,8 @@ function getSqlite(): SqliteModule {
     return sqliteCache
   } catch (err: any) {
     throw new Error(
-      `node:sqlite is unavailable: ${err?.message ?? err}. Requires Node 23+ with --experimental-sqlite, or Node 24+ where it is stable.`
+      `node:sqlite is unavailable: ${err?.message ?? err}. Requires Node 23+ with --experimental-sqlite, or Node 24+ where it is stable.`,
+      { cause: err }
     )
   }
 }

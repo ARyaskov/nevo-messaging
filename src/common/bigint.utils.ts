@@ -163,10 +163,31 @@ function deserializeBigIntInner(obj: any, options: { acceptLegacy?: boolean } | 
   }
   seen.add(obj)
   try {
-    if (Array.isArray(obj)) return obj.map((v) => deserializeBigIntInner(v, options, depth + 1, seen))
-    const deserialized: Record<string, unknown> = {}
-    for (const [key, value] of Object.entries(obj)) setRebuiltKey(deserialized, key, deserializeBigIntInner(value, options, depth + 1, seen))
-    return deserialized
+    // Copy-on-write: containers are only reallocated along paths that change.
+    if (Array.isArray(obj)) {
+      let out: unknown[] | null = null
+      for (let i = 0; i < obj.length; i++) {
+        const next = deserializeBigIntInner(obj[i], options, depth + 1, seen)
+        if (out) out.push(next)
+        else if (next !== obj[i]) {
+          out = obj.slice(0, i)
+          out.push(next)
+        }
+      }
+      return out ?? obj
+    }
+    const entries = Object.entries(obj)
+    let out: Record<string, unknown> | null = null
+    for (let i = 0; i < entries.length; i++) {
+      const [key, value] = entries[i]
+      const next = deserializeBigIntInner(value, options, depth + 1, seen)
+      if (!out && (next !== value || key === "__proto__")) {
+        out = {}
+        for (let j = 0; j < i; j++) setRebuiltKey(out, entries[j][0], entries[j][1])
+      }
+      if (out) setRebuiltKey(out, key, next)
+    }
+    return out ?? obj
   } finally {
     seen.delete(obj)
   }
@@ -174,6 +195,15 @@ function deserializeBigIntInner(obj: any, options: { acceptLegacy?: boolean } | 
 
 export function deserializeBigInt(obj: any, options?: { acceptLegacy?: boolean }): any {
   return deserializeBigIntInner(obj, options, 0, new WeakSet<object>())
+}
+
+export const SENTINEL_PREFIX = "@@nevo:"
+const SENTINEL_PROBE = Buffer.from(SENTINEL_PREFIX, "utf8")
+
+/** A buffer without this byte sequence lets {@link deserializeBigInt} be skipped entirely. */
+export function mayContainWireSentinel(data: Uint8Array): boolean {
+  const buf = Buffer.isBuffer(data) ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength)
+  return buf.indexOf(SENTINEL_PROBE) !== -1
 }
 
 export function stringifyWithBigInt(obj: unknown): string {
