@@ -388,7 +388,7 @@ export class SagaStepRegistry<C = any> {
   private readonly steps = new Map<string, SagaStep<C>>()
 
   private key(type: string, name: string): string {
-    return `${type} ${name}`
+    return `${type}\u0000${name}`
   }
 
   register(type: string, step: SagaStep<C>): this {

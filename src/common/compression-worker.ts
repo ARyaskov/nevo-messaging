@@ -25,7 +25,11 @@ parentPort.on("message", (msg) => {
       else if (encoding === "zstd" && typeof zlib.zstdDecompressSync === "function") result = zlib.zstdDecompressSync(data, limit)
       else result = data
     }
-    parentPort.postMessage({ id, ok: true, data: result }, [result.buffer])
+    // zlib results may live in Node's buffer pool, whose ArrayBuffer is untransferable
+    // (DataCloneError on Node 26) and larger than the result; transfer a private copy.
+    const out = new Uint8Array(result.byteLength)
+    out.set(result)
+    parentPort.postMessage({ id, ok: true, data: out }, [out.buffer])
   } catch (err) {
     parentPort.postMessage({ id, ok: false, err: err && err.message ? err.message : String(err), code: err && err.code ? err.code : undefined })
   }
