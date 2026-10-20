@@ -49,7 +49,7 @@ See [rate-limiting.md](./rate-limiting.md). Buckets are partitioned by the combi
 ```ts
 await this.subscribe(
   "orders", "orders.placed",
-  { filters: { meta: { tenantId: "t-42" } } },
+  { filter: { meta: { tenantId: "t-42" } } },
   handler
 )
 ```
@@ -59,7 +59,7 @@ See [subscription-filters.md](./subscription-filters.md).
 ## Per-tenant ACL
 
 ```ts
-@NatsSignalRouter([UserService], {
+NevoModule.forRoot({
   accessControl: {
     rules: [
       { topic: "*", method: "user.export", allow: ["paid-tier"] }

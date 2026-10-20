@@ -213,3 +213,20 @@ test("reset() wipes handlers and history", async () => {
   // The handler was removed too — the next call has nothing to route to.
   await assert.rejects(() => new C().q())
 })
+
+test("subscribe filters match MessageMeta fields and meta.headers", async () => {
+  const t = createMemoryTransport()
+  const byTenant: unknown[] = []
+  const byRegion: unknown[] = []
+  t.subscribe("orders", "orders.placed", { filter: { meta: { tenantId: "t-42" } } }, (p) => {
+    byTenant.push(p)
+  })
+  t.subscribe("orders", "orders.placed", { filter: { headers: { region: /^eu-/ } } }, (p) => {
+    byRegion.push(p)
+  })
+  await t.publish("shop", "orders", "orders.placed", { n: 1 }, { tenantId: "t-42", headers: { region: "us-east" } })
+  await t.publish("shop", "orders", "orders.placed", { n: 2 }, { tenantId: "t-7", headers: { region: "eu-west" } })
+  await new Promise((r) => setImmediate(r))
+  assert.deepEqual(byTenant, [{ n: 1 }])
+  assert.deepEqual(byRegion, [{ n: 2 }])
+})

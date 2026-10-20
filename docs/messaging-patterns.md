@@ -54,7 +54,7 @@ Subscriber:
 ```ts
 const sub = await this.subscribe(
   "user", "user.updated",
-  { ack: true, durable: "audit-projector" },
+  { ack: true, durableKey: "audit-projector" },
   async (msg, ctx) => {
     await projectAudit(msg)
     await ctx.ack()
@@ -68,9 +68,10 @@ Common subscription options:
 
 | Option | Behavior |
 |---|---|
-| `ack` | Enable JetStream / Kafka manual-ack semantics |
-| `durable` | Durable consumer name (NATS JetStream) |
-| `filters` | `headers` / `meta` predicates — see [subscription-filters.md](./subscription-filters.md) |
+| `ack` | Kafka: manual offset commit on `ctx.ack()`. No-op on core NATS and the other transports (see [capability-matrix.md](./capability-matrix.md)) |
+| `durableKey` | Kafka: stable consumer group `nevo-sub-<durableKey>` so offsets survive restarts (an explicit `groupId` wins) |
+| `groupId` | Kafka consumer group / NATS queue group |
+| `filter` | `headers` / `meta` predicates — see [subscription-filters.md](./subscription-filters.md) |
 
 ## Broadcast
 

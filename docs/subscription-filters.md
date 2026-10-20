@@ -13,35 +13,38 @@ interface SubscriptionFilter {
 
 Predicates are either an exact string (matched literally) or a `RegExp`. No function predicates today.
 
+Both kinds are evaluated against the envelope's `MessageMeta`, which travels inside the codec-encoded payload:
+
 ```ts
 import { matchesFilter } from "@riaskov/nevo-messaging"
 
+// second argument is the message's MessageMeta
 const ok = matchesFilter(
-  { headers: { region: /^eu-/ }, meta: { tier: "paid" } },
-  { headers: { region: "eu-west" }, meta: { tier: "paid", uid: "42" } }
-)
+  { headers: { region: /^eu-/ }, meta: { tenantId: "t-42" } },
+  { headers: { region: "eu-west" }, tenantId: "t-42", service: "orders" }
+) // true
 ```
 
 ## Header filters
 
-Match on transport headers (NATS headers, Kafka record headers, HTTP request headers):
+Match on `meta.headers` — the string map the publisher passes as `headers` (`publish(service, method, params, { headers: { region: "eu-west" } })`, `broadcast(method, params, { headers })`). Transport-level headers are **not** consulted: NATS headers, Kafka record headers and HTTP request headers added by a proxy, broker or non-Nevo producer never reach the filter. A message without `meta.headers` fails every header filter.
 
 ```ts
 await this.subscribe(
   "orders", "orders.placed",
-  { filters: { headers: { region: "eu-west" } } },
+  { filter: { headers: { region: "eu-west" } } },
   handler
 )
 ```
 
 ## Meta filters
 
-Match on envelope `meta` (in-band, codec-encoded):
+Match on top-level `MessageMeta` fields (`tenantId`, `service`, `version`, `instanceId`, …). Values are compared as strings:
 
 ```ts
 await this.subscribe(
   "orders", "orders.placed",
-  { filters: { meta: { tenantId: "t-42" } } },
+  { filter: { meta: { tenantId: "t-42" } } },
   handler
 )
 ```
@@ -51,7 +54,7 @@ await this.subscribe(
 Both filters are AND-ed: every predicate must pass.
 
 ```ts
-filters: {
+filter: {
   headers: { region: /^eu-/ },
   meta:    { tenantId: "t-42" }
 }
@@ -69,7 +72,7 @@ Filters always run in-process before the handler is invoked. The framework does 
 for (const t of tenants) {
   await this.subscribe(
     "orders", "orders.placed",
-    { filters: { meta: { tenantId: t.id } } },
+    { filter: { meta: { tenantId: t.id } } },
     t.handler
   )
 }
@@ -80,7 +83,7 @@ for (const t of tenants) {
 ```ts
 await this.subscribe(
   "alerts", "alert.*",
-  { filters: { headers: { region: /^eu-/ } } },
+  { filter: { headers: { region: /^eu-/ } } },
   handleEuAlert
 )
 ```
@@ -90,9 +93,9 @@ await this.subscribe(
 ```ts
 await this.subscribe(
   "jobs", "job.run",
-  { filters: { meta: { priority: /^(8|9|10)$/ } } },
+  { filter: { headers: { priority: /^(8|9|10)$/ } } },
   handleHighPriority
 )
 ```
 
-Numbers in `meta` are encoded as strings on the wire; the regex matches the string form.
+`priority` is not a `MessageMeta` field, so the publisher sends it as a header: `publish("jobs", "job.run", job, { headers: { priority: "9" } })`. Header values are strings; the regex matches the string form.

@@ -20,16 +20,22 @@ const verifier = createJwksVerifier({
   requireAud: false   // reject tokens with no `aud` (also matched against `audience` when set)
 })
 
-@NatsSignalRouter([UserService], {
-  accessControl: {
-    rules: [
-      { topic: "user-events", method: "*", allow: ["frontend"] }
-    ],
-    jwtVerifier: verifier,
-    logDenied: true
-  }
+@Module({
+  imports: [
+    NevoModule.forRoot({
+      accessControl: {
+        rules: [
+          { topic: "user-events", method: "*", allow: ["frontend"] }
+        ],
+        jwtVerifier: verifier,
+        logDenied: true
+      }
+    })
+  ],
+  controllers: [UserController],
+  providers: [UserService]
 })
-export class UserController { ... }
+export class AppModule {}
 ```
 
 The verifier:

@@ -89,6 +89,25 @@ export class UserController {
 }
 ```
 
+## Module
+
+```ts
+import { Module } from "@nestjs/common"
+import { NevoModule, createNevoNatsClient } from "@riaskov/nevo-messaging"
+
+@Module({
+  imports: [NevoModule.forRoot({ serviceName: "user" })],
+  controllers: [UserController],
+  providers: [
+    UserService,
+    createNevoNatsClient(["COORDINATOR"], { clientIdPrefix: "user", servers: ["nats://127.0.0.1:4222"] })
+  ]
+})
+export class AppModule {}
+```
+
+`NevoModule.forRoot` is required — it binds every signal-router controller. ACL, idempotency, rate limits and other request-processing options go there, not on `@NatsSignalRouter`.
+
 ## Bootstrap
 
 ```ts
@@ -116,22 +135,11 @@ await this.subscribeWildcard("orders.>", (msg, ctx) => { ... }) // raw subject p
 
 > **Upgrading from ≤2.4:** publishers and subscribers must run the same version — older peers used the bare `<service>-events.sub` subject. JetStream streams capturing pub/sub traffic need their subject filter widened to `<service>-events.sub.>`.
 
-## JetStream-backed `ack: true`
+## Durable consumers (JetStream)
 
-When you subscribe with `{ ack: true }` Nevo upgrades the subscription to a durable JetStream consumer with manual ack. Use this for at-least-once semantics:
+`this.subscribe(...)` on NATS is a core-NATS subscription: `ack` / `nack` on its context are no-ops and `ack` / `durableKey` options do not create a JetStream consumer. `groupId` maps to a NATS queue group.
 
-```ts
-const sub = await this.subscribe(
-  "user", "user.events",
-  { ack: true, durable: "user-events-projector" },
-  async (msg, ctx) => {
-    await project(msg)
-    await ctx.ack()
-  }
-)
-```
-
-`ctx.nack(delayMs)` and `ctx.term()` are also available.
+For at-least-once delivery with real acknowledgement use the JetStream helper (`getJetStreamHelper(nc)`): `ensureStream`, `ensureConsumer`, `pullSubscribe`, whose context exposes `ack()`, `nack(delayMs?)`, `term()` and `working()`. See [capability-matrix.md](./capability-matrix.md#nats--the-most-capable-transport).
 
 ## Reconnect behavior
 

@@ -22,19 +22,27 @@ interface AccessRule {
 }
 ```
 
-## Apply to a controller
+## Apply to controllers
+
+ACL is configured on `NevoModule` and applies to every signal-router controller it binds (use `NevoModule.forFeature(...)` in a feature module to override it for that module's controllers):
 
 ```ts
-@NatsSignalRouter([UserService], {
-  accessControl: {
-    rules: [
-      { topic: "user-events", method: "*",          allow: ["frontend", "coordinator"] },
-      { topic: "user-events", method: "user.delete", deny:  ["frontend"] }
-    ],
-    logDenied: true
-  }
+@Module({
+  imports: [
+    NevoModule.forRoot({
+      accessControl: {
+        rules: [
+          { topic: "user-events", method: "*",          allow: ["frontend", "coordinator"] },
+          { topic: "user-events", method: "user.delete", deny:  ["frontend"] }
+        ],
+        logDenied: true
+      }
+    })
+  ],
+  controllers: [UserController],
+  providers: [UserService]
 })
-export class UserController { ... }
+export class AppModule {}
 ```
 
 Semantics:

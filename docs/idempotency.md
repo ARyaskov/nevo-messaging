@@ -153,15 +153,22 @@ const store = new RedisIdempotencyStore({
   keyPrefix: "myapp:idem:"
 })
 
-// Wire it on the controller side (handlers reuse cached results across replicas).
-// The store is honoured by the signal-router DECORATOR, not by
+// Wire it on the server side (handlers reuse cached results across replicas).
+// The store is honoured by NevoModule, not by the signal-router decorator or
 // `createNatsMicroservice` — that factory only knows `microserviceName`,
 // `module`, `port?`, `host?`, `debug?`, `onInit?` and ignores anything else.
 @Controller()
-@NatsSignalRouter([PaymentService], { idempotencyStore: store })
+@NatsSignalRouter([PaymentService])
 export class PaymentController {
   // …@Signal handlers…
 }
+
+@Module({
+  imports: [NevoModule.forRoot({ idempotencyStore: store })],
+  controllers: [PaymentController],
+  providers: [PaymentService]
+})
+export class AppModule {}
 
 // `createNatsMicroservice` just boots the Nest app that hosts the controller:
 createNatsMicroservice({
@@ -199,9 +206,12 @@ const store = new EtcdIdempotencyStore({
   readErrorPolicy: "closed"
 })
 
-@Controller()
-@NatsSignalRouter([PaymentService], { idempotencyStore: store })
-export class PaymentController {}
+@Module({
+  imports: [NevoModule.forRoot({ idempotencyStore: store })],
+  controllers: [PaymentController],
+  providers: [PaymentService]
+})
+export class AppModule {}
 ```
 
 Install the peer-optional client with `npm install etcd3`.

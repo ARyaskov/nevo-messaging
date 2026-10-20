@@ -21,12 +21,11 @@ WsSignalRouter([UserService], {
     serverMaxWindowBits: 12,
     clientMaxWindowBits: 12
   },
-  maxPayload: 1024 * 1024,
-  accessControl: {
-    rules: [{ topic: "user-events", method: "*", allow: ["frontend"] }],
-    logDenied: true
-  }
+  maxPayload: 1024 * 1024
 })(UserController)
+
+// AppModule imports NevoModule.forRoot({ accessControl: { rules: [...], logDenied: true } }) —
+// ACL and other request-processing options live there, not on the router.
 ```
 
 ### Options

@@ -226,7 +226,7 @@ export class MemoryTransport {
       if (!sub.active) continue
       if (sub.serviceName !== serviceName) continue
       if (sub.method !== method && !this.wildcardMatch(sub.method, method)) continue
-      if (sub.options?.filter && !matchesFilter(sub.options.filter, { headers: meta.headers, meta } as any)) continue
+      if (sub.options?.filter && !matchesFilter(sub.options.filter, meta)) continue
       await this.deliver(sub, params, meta, uuid)
     }
   }

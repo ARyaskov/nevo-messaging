@@ -102,12 +102,13 @@ export class UserController {
 // user.module.ts
 import { Module } from "@nestjs/common"
 import { ConfigModule } from "@nestjs/config"
-import { createNevoNatsClient } from "@riaskov/nevo-messaging"
+import { NevoModule, createNevoNatsClient } from "@riaskov/nevo-messaging"
 import { UserController } from "./user.controller"
 import { UserService } from "./user.service"
 
 @Module({
-  imports: [ConfigModule],
+  // NevoModule.forRoot is required: it binds signal routers and holds ACL, idempotency, rate limits, etc.
+  imports: [ConfigModule, NevoModule.forRoot({ serviceName: "user" })],
   controllers: [UserController],
   providers: [
     UserService,
@@ -167,10 +168,10 @@ const user = await this.query("user", "user.getById", { id: 123n })
 // Fire-and-forget
 await this.emit("notifications", "user.created", { userId: 123n })
 
-// Publish / subscribe (durable JetStream consumer)
+// Publish / subscribe (durableKey = stable Kafka consumer group; NATS JetStream goes through getJetStreamHelper)
 const sub = await this.subscribe(
   "user", "user.updated",
-  { ack: true, durable: "audit" },
+  { ack: true, durableKey: "audit" },
   async (msg, ctx) => { await project(msg); await ctx.ack() }
 )
 

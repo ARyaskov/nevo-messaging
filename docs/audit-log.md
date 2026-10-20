@@ -23,20 +23,24 @@ interface AuditEntry {
 }
 ```
 
-## Wiring via the router `auditLog` option
+## Wiring via the `NevoModule` `auditLog` option
 
-You almost never construct `AuditEntry` by hand. Build an `AuditLog`, pass it to your signal-router (or controller), and the framework records one redacted entry per call automatically.
+You almost never construct `AuditEntry` by hand. Build an `AuditLog`, pass it to `NevoModule.forRoot` (or `forRootAsync`), and the framework records one redacted entry per call on every signal-router controller automatically.
 
 ```ts
-import { AuditLog, FileAuditSink, NatsSignalRouter } from "@riaskov/nevo-messaging"
+import { AuditLog, FileAuditSink, NevoModule } from "@riaskov/nevo-messaging"
 
 const auditLog = new AuditLog({
   sink: new FileAuditSink({ path: "/var/log/nevo/audit.ndjson" }),
   redactPaths: ["params.password", "params.card.number", "result.token"]
 })
 
-@NatsSignalRouter([UserService], { auditLog })
-export class UserRouter {}
+@Module({
+  imports: [NevoModule.forRoot({ auditLog })],
+  controllers: [UserController],
+  providers: [UserService]
+})
+export class AppModule {}
 ```
 
 Internally the router and `BaseMessageController` call `auditLog.recordFromResponse(...)` after the handler returns, deriving `outcome`/`error`/`result` from the response envelope (a `result === "error"` envelope becomes `outcome: "error"` and the `result` field is dropped). The call is **fire-and-forget** — wrapped so a sink failure can never block, slow, or fail request completion; failures are logged and the entry is dropped. The `caller`, `tenantId`, and trace fields are pulled from the inbound message meta.

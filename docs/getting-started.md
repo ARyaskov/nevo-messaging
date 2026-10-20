@@ -6,7 +6,7 @@ This guide walks you through installing Nevo Messaging, writing your first servi
 
 - Node.js **≥ 24** (tested on 26)
 - TypeScript **≥ 6**
-- NestJS **≥ 11**
+- NestJS **11 or 12** (`@nestjs/config` 4 or 12; all `@nestjs/*` peers on the same major)
 - One transport runtime: NATS, Kafka, HTTP, Socket.IO, or WebSocket
 
 ## Install
@@ -49,6 +49,46 @@ This creates a NestJS microservice wired to NATS with sample `getById` / `create
 ## Hand-rolled minimum
 
 A complete service is four small files — see [basics-nats.md](./basics-nats.md) for a copy-paste example.
+
+## Register `NevoModule`
+
+Every application that declares a `@*SignalRouter` controller must import `NevoModule.forRoot(...)` (or `forRootAsync(...)`) once. It binds the routers at startup; without it the first call fails with "Nevo router … is not initialised".
+
+Since v2.5 the router decorator only carries routing metadata (`eventPattern`, `serviceName`, `debug`, `before`, `after`) plus transport options (`servers`, `port`, `codec`, …). Request-processing options — `accessControl`, `idempotencyStore`, `rateLimit`, `security`, `auditLog`, `metrics`, `tracing`, `dlq`, `health`, … — go to `NevoModule`:
+
+```ts
+import { Module } from "@nestjs/common"
+import { NevoModule, createNevoNatsClient } from "@riaskov/nevo-messaging"
+
+@Module({
+  imports: [
+    NevoModule.forRoot({
+      serviceName: "user",
+      accessControl: {
+        rules: [{ topic: "user-events", method: "*", allow: ["frontend"] }]
+      }
+    })
+  ],
+  controllers: [UserController],
+  providers: [UserService, createNevoNatsClient(["COORDINATOR"], { clientIdPrefix: "user" })]
+})
+export class AppModule {}
+```
+
+Build the options from injected providers with `forRootAsync`:
+
+```ts
+NevoModule.forRootAsync({
+  imports: [ConfigModule],
+  inject: [ConfigService],
+  useFactory: (config: ConfigService) => ({
+    serviceName: "user",
+    rateLimit: { enabled: true, capacity: config.get("RATE_LIMIT", 100), refillPerSec: 50 }
+  })
+})
+```
+
+`NevoModule.forFeature(options)` is a provider you add to a feature module to override root options for the controllers declared there (keys are replaced, not deep-merged).
 
 ## Make a request from another service
 

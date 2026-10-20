@@ -39,7 +39,7 @@ try {
 }
 ```
 
-In practice you don't call this manually — pass the options to the transport client and the client wires it in.
+In practice you don't call this manually — pass the options to the transport client (`createNevoNatsClient(..., { circuitBreaker: { enabled: true, failureThreshold: 5 } })`) and the client wires it in. The client `circuitBreaker` option is always this count breaker; the sliding-window options below apply only to `@CircuitBreaker`.
 
 ## Sliding-window breaker
 

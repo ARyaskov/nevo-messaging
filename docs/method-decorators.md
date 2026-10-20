@@ -24,9 +24,20 @@ Variants by transport:
 
 ```ts
 @NatsSignalRouter([UserService], {
+  serviceName: "user",          // default: derived from the controller name
+  eventPattern: "user-events",  // default: `${serviceName}-events`
   before: async (ctx) => ctx.params,
   after:  async (ctx) => ctx.response,
-  debug: true,
+  debug: true
+})
+```
+
+`before` may mutate `ctx.params`; `after` may mutate `ctx.response`. Throw from either to reject the call.
+
+These five keys are the only common router options. Request-processing options — `accessControl`, `idempotencyStore`, `rateLimit`, `security`, `auditLog`, `metrics`, `dlq`, … — are set on `NevoModule.forRoot` / `forRootAsync` (see [getting-started.md](./getting-started.md#register-nevomodule), [access-control.md](./access-control.md), [security.md](./security.md)):
+
+```ts
+NevoModule.forRoot({
   accessControl: {
     rules: [{ topic: "user-events", method: "*", allow: ["frontend"] }],
     logDenied: true,
@@ -35,8 +46,6 @@ Variants by transport:
   }
 })
 ```
-
-`before` may mutate `ctx.params`; `after` may mutate `ctx.response`. Throw from either to reject the call. See [access-control.md](./access-control.md), [security.md](./security.md).
 
 Transport-specific options (e.g. `port`, `cors`, `perMessageDeflate`, `reuseClient`) live on the corresponding router — see the per-transport docs.
 

@@ -18,13 +18,12 @@ import { SocketSignalRouter, createSocketMicroservice } from "@riaskov/nevo-mess
   serviceName: "user",
   port: 8093,
   cors: { origin: "*" },
-  discovery: { enabled: true, heartbeatIntervalMs: 5_000 },
-  accessControl: {
-    rules: [{ topic: "user-events", method: "*", allow: ["frontend"] }],
-    logDenied: true
-  }
+  discovery: { enabled: true, heartbeatIntervalMs: 5_000 }
 })
 export class UserController { ... }
+
+// AppModule imports NevoModule.forRoot({ accessControl: { rules: [...], logDenied: true } }) —
+// ACL and other request-processing options live there, not on the router.
 
 createSocketMicroservice({
   microserviceName: "user",
