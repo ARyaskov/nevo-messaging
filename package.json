@@ -206,7 +206,7 @@
     "esbuild": "^0.28.1",
     "eslint": "9.39.5",
     "kafkajs": "2.2.4",
-    "pino": "9.5.0",
+    "pino": "10.4.0",
     "pino-pretty": "11.3.0",
     "prettier": "3.5.3",
     "prom-client": "15.1.3",
