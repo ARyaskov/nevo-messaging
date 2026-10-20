@@ -17,6 +17,13 @@ export interface SocketSignalRouterOptions extends SignalRouterOptions {
   }
 }
 
+const USER_ROOM_PREFIX = "user:"
+
+// `user:*` rooms carry targeted pushes and are joined only through verifyIdentity.
+function isJoinableRoom(room: unknown): room is string {
+  return typeof room === "string" && room.length > 0 && room.length <= 256 && !room.startsWith(USER_ROOM_PREFIX)
+}
+
 function toVersionedMethod(method: unknown): string | null {
   if (typeof method !== "string" || method.length === 0) return null
   return method.includes("@") ? method : formatMethod(method, DEFAULT_METHOD_VERSION)
@@ -114,7 +121,7 @@ export function SocketSignalRouter(serviceType: Type<any> | Type<any>[], options
             if (!userId) return
             if (!(await verifyUserId(socket, String(userId), data?.authToken ?? data?.meta?.auth?.token))) return
             ;(socket as any).__nevoUserId = String(userId)
-            socket.join(`user:${userId}`)
+            socket.join(`${USER_ROOM_PREFIX}${userId}`)
           })
 
           socket.on("nevo:subscribe", async (data: any) => {
@@ -123,11 +130,15 @@ export function SocketSignalRouter(serviceType: Type<any> | Type<any>[], options
             const explicit = data?.room
             const stickyTo = data?.stickyUserId
             if (!serviceName) return
+            if (explicit !== undefined && explicit !== null && !isJoinableRoom(explicit)) {
+              logger.warn({ event: "socket.subscribe.room_rejected", room: String(explicit).slice(0, 64) })
+              return
+            }
             if (explicit) socket.join(explicit)
             else if (method) socket.join(`${serviceName}${DEFAULT_SUBSCRIPTION_SUFFIX}:${method}`)
             else socket.join(`${serviceName}${DEFAULT_SUBSCRIPTION_SUFFIX}`)
             if (stickyTo && (await verifyUserId(socket, String(stickyTo), data?.authToken ?? data?.meta?.auth?.token))) {
-              socket.join(`user:${stickyTo}`)
+              socket.join(`${USER_ROOM_PREFIX}${stickyTo}`)
             }
           })
 
@@ -136,6 +147,7 @@ export function SocketSignalRouter(serviceType: Type<any> | Type<any>[], options
             const method = toVersionedMethod(data?.method)
             const explicit = data?.room
             if (!serviceName) return
+            if (explicit !== undefined && explicit !== null && !isJoinableRoom(explicit)) return
             if (explicit) socket.leave(explicit)
             else if (method) socket.leave(`${serviceName}${DEFAULT_SUBSCRIPTION_SUFFIX}:${method}`)
             else socket.leave(`${serviceName}${DEFAULT_SUBSCRIPTION_SUFFIX}`)
@@ -155,7 +167,7 @@ export function SocketSignalRouter(serviceType: Type<any> | Type<any>[], options
             const methodRoom = method ? `${baseRoom}:${method}` : null
             const targetUserId = payload?.meta?.headers?.["nevo-target-user"]
             if (targetUserId) {
-              io.to(`user:${targetUserId}`).emit("nevo:sub", payload)
+              io.to(`${USER_ROOM_PREFIX}${targetUserId}`).emit("nevo:sub", payload)
               return
             }
             io.to(baseRoom).emit("nevo:sub", payload)

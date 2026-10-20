@@ -3,6 +3,7 @@ import { dirname } from "node:path"
 import { redactObject, jsonByteSize } from "./redact"
 import type { MessageMeta, MessageResponse } from "./types"
 import { getDefaultLogger, type NevoLogger } from "./logger"
+import { assertQualifiedSqlIdentifier } from "./sql-ident"
 
 // Append-only audit log with pluggable sinks (in-memory, file, pg, tee).
 
@@ -250,7 +251,7 @@ export class PgAuditSink implements AuditSink {
   constructor(opts: PgAuditSinkOptions) {
     if (!opts.client) throw new Error("PgAuditSink: `client` is required")
     this.client = opts.client
-    this.table = opts.table ?? "nevo_audit"
+    this.table = assertQualifiedSqlIdentifier(opts.table ?? "nevo_audit", "table")
     this.bufferCap = Math.max(1, opts.bufferCap ?? 1000)
     this.logger = (opts.logger ?? getDefaultLogger()).child({ component: "audit.pg" })
   }

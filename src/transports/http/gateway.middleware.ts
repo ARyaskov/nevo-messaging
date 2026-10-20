@@ -17,11 +17,24 @@ export interface NevoHttpGatewayOptions {
   requestIdHeader?: string
 }
 
+// Access-Control-Allow-Origin carries a single origin, so an allow-list is matched against the request.
+function resolveAllowedOrigin(allowed: string | string[] | undefined, requestOrigin: string | undefined, credentials: boolean): string | null {
+  if (!allowed) return null
+  const list = Array.isArray(allowed) ? allowed : [allowed]
+  if (list.includes("*")) {
+    // Browsers reject `*` with credentials; never turn it into "reflect every origin".
+    return credentials ? null : "*"
+  }
+  return requestOrigin && list.includes(requestOrigin) ? requestOrigin : null
+}
+
 export function createNevoHttpGateway(opts: NevoHttpGatewayOptions = {}): (req: Request, res: Response, next: NextFunction) => void {
   return (req, res, next) => {
     if (opts.cors) {
-      const origin = Array.isArray(opts.cors.origin) ? opts.cors.origin.join(",") : opts.cors.origin
+      const requestOrigin = typeof req.headers.origin === "string" ? req.headers.origin : undefined
+      const origin = resolveAllowedOrigin(opts.cors.origin, requestOrigin, opts.cors.credentials === true)
       if (origin) res.setHeader("access-control-allow-origin", origin)
+      if (origin && origin !== "*") res.setHeader("vary", "Origin")
       if (opts.cors.methods?.length) res.setHeader("access-control-allow-methods", opts.cors.methods.join(","))
       if (opts.cors.allowHeaders?.length) res.setHeader("access-control-allow-headers", opts.cors.allowHeaders.join(","))
       if (opts.cors.exposeHeaders?.length) res.setHeader("access-control-expose-headers", opts.cors.exposeHeaders.join(","))

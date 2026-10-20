@@ -219,8 +219,14 @@ export function createJwksVerifier(opts: JwksVerifierOptions): (token: string) =
     // Bind JWK to header `alg` (key family + any pinned `alg`) to block algorithm-confusion attacks.
     if (!ktyMatchesFamily(jwk.kty, spec.family)) return null
     if (jwk.alg !== undefined && jwk.alg !== header.alg) return null
+    if (jwk.use !== undefined && jwk.use !== "sig") return null
 
-    const keyObj = jwkToPublicKey(jwk)
+    let keyObj: import("node:crypto").KeyObject
+    try {
+      keyObj = jwkToPublicKey(jwk)
+    } catch {
+      return null
+    }
     const v = createVerify(spec.hash)
     v.update(decoded.signedBytes)
     v.end()

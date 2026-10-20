@@ -37,7 +37,7 @@ export async function setupNevoTracing(opts: NevoTracingSetupOptions): Promise<N
     const attrs: Record<string, string> = {}
     attrs[semconv.SemanticResourceAttributes?.SERVICE_NAME ?? "service.name"] = opts.serviceName
     if (opts.serviceVersion) attrs[semconv.SemanticResourceAttributes?.SERVICE_VERSION ?? "service.version"] = opts.serviceVersion
-    const resource = new resources.Resource(attrs)
+    const resource = typeof resources.resourceFromAttributes === "function" ? resources.resourceFromAttributes(attrs) : new resources.Resource(attrs)
 
     let exporter: any
     if (opts.exporter === "otlp") {
@@ -68,15 +68,21 @@ export async function setupNevoTracing(opts: NevoTracingSetupOptions): Promise<N
       exporter = new sdkTrace.ConsoleSpanExporter()
     }
 
-    provider = new sdkTrace.NodeTracerProvider({
+    processor = new sdkTrace.BatchSpanProcessor(exporter)
+    const providerOpts = {
       resource,
       sampler:
         opts.sampleRate !== undefined
           ? new sdkTrace.TraceIdRatioBasedSampler(Math.max(0, Math.min(1, opts.sampleRate)))
           : new sdkTrace.AlwaysOnSampler()
-    })
-    processor = new sdkTrace.BatchSpanProcessor(exporter)
-    provider.addSpanProcessor(processor)
+    }
+    // SDK 2.x removed addSpanProcessor in favour of the `spanProcessors` constructor option.
+    if (typeof sdkTrace.NodeTracerProvider.prototype.addSpanProcessor === "function") {
+      provider = new sdkTrace.NodeTracerProvider(providerOpts)
+      provider.addSpanProcessor(processor)
+    } else {
+      provider = new sdkTrace.NodeTracerProvider({ ...providerOpts, spanProcessors: [processor] })
+    }
     provider.register()
 
     void tracingApi

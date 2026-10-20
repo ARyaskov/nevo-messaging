@@ -1,6 +1,6 @@
 # Nevo Messaging
 
-A microservices messaging framework for NestJS 11+ with multi-transport support (NATS, Kafka, HTTP/SSE, HTTP/2, WebSocket, Socket.IO), designed for building scalable distributed systems with type-safe inter-service communication.
+A microservices messaging framework for NestJS 11 and 12 with multi-transport support (NATS, Kafka, HTTP/SSE, HTTP/2, WebSocket, Socket.IO), designed for building scalable distributed systems with type-safe inter-service communication.
 
 > **Full documentation lives in [docs/](./docs/README.md).** This README only covers a minimal NATS setup. For every other feature — Kafka, HTTP/2, the saga orchestrator, outbox, sliding-window circuit breakers, idempotency, JWT, OpenTelemetry, the DevTools dashboard, and a hundred more — start at the [docs index](./docs/README.md).
 
@@ -27,7 +27,7 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 - Node.js **≥ 24** (tested on 26) — enforced by the package's `engines` field, so older runtimes are refused at install time. The built-in `node:sqlite` store and several runtime APIs require Node 24.
 - TypeScript **≥ 6**
-- NestJS **≥ 11**
+- NestJS **11 or 12** (`@nestjs/config` 4 or 12). Nest 12 ships ESM-only packages; this package stays CommonJS and loads them through `require(esm)`, so both CommonJS and ESM applications work.
 
 ## Install
 

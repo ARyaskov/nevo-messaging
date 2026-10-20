@@ -80,9 +80,9 @@ This catches a class of bugs where an unvalidated response was used as if it wer
 
 ### `@nestjs/*` peer dependencies are required
 
-The `@nestjs/common`, `@nestjs/core`, `@nestjs/microservices`, `@nestjs/config`, and `@nestjs/platform-fastify` peers are **no longer optional** — the framework targets NestJS 11 and assumes they are present. Transport SDKs (kafkajs, the NATS packages, socket.io, ws, undici, …) and other integrations (msgpack, zod, prom-client, pino, OTel) remain **optional** peers: install only the transports/features you use, and the relevant module is loaded lazily.
+The `@nestjs/common`, `@nestjs/core`, `@nestjs/microservices`, `@nestjs/config`, and `@nestjs/platform-fastify` peers are **no longer optional** — the framework targets NestJS 11 and 12 and assumes they are present. Transport SDKs (kafkajs, the NATS packages, socket.io, ws, undici, …) and other integrations (msgpack, zod, prom-client, pino, OTel) remain **optional** peers: install only the transports/features you use, and the relevant module is loaded lazily.
 
-**Action:** ensure `@nestjs/common@^11`, `@nestjs/core@^11`, `@nestjs/microservices@^11`, `@nestjs/config@^4`, and `@nestjs/platform-fastify@^11` are installed in the host app. Missing optional peers only error when you actually touch that transport/feature (e.g. msgpack falls back to JSON; a transport throws a clear "missing optional dependency" message).
+**Action:** ensure `@nestjs/common`, `@nestjs/core`, `@nestjs/microservices` and `@nestjs/platform-fastify` (all `^11` or all `^12`, not mixed) plus `@nestjs/config` (`^4` with Nest 11, `^12` with Nest 12) are installed in the host app. Missing optional peers only error when you actually touch that transport/feature (e.g. msgpack falls back to JSON; a transport throws a clear "missing optional dependency" message).
 
 ### Package exports map
 

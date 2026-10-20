@@ -303,3 +303,17 @@ test("selects the only key when no kid is present, but refuses an ambiguous set"
   const ambiguous = makeToken({ alg: "RS256", key: a.privateKey, payload: { sub: "x", exp: nowSec() + 3600 } })
   assert.equal(await verifyMulti(ambiguous), null)
 })
+
+test("rejects a JWK whose `use` is not sig", async () => {
+  const { fn } = countingFetch(async () => ({ keys: [{ ...RSA.jwk, use: "enc" }] }))
+  const verify = createJwksVerifier({ jwksUri: "u", fetchImpl: fn })
+  const token = makeToken({ alg: "RS256", key: RSA.privateKey, kid: "rsa-1", payload: { sub: "svc-a", exp: nowSec() + 3600 } })
+  assert.equal(await verify(token), null)
+})
+
+test("returns null instead of throwing on a malformed JWK", async () => {
+  const { fn } = countingFetch(async () => ({ keys: [{ kty: "RSA", kid: "rsa-1", n: "!!", e: "AQAB" }] }))
+  const verify = createJwksVerifier({ jwksUri: "u", fetchImpl: fn })
+  const token = makeToken({ alg: "RS256", key: RSA.privateKey, kid: "rsa-1", payload: { sub: "svc-a", exp: nowSec() + 3600 } })
+  assert.equal(await verify(token), null)
+})

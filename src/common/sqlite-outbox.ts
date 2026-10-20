@@ -1,6 +1,7 @@
 import { createRequire } from "node:module"
 import type { OutboxRecord, OutboxStore, OutboxMarkResult } from "./outbox"
 import { stringifyWithBigInt, parseWithBigInt } from "./bigint.utils"
+import { assertSqlIdentifier } from "./sql-ident"
 
 const nodeRequire = createRequire(__filename)
 
@@ -41,7 +42,7 @@ export class SqliteOutboxStore implements OutboxStore {
   }
 
   constructor(opts: SqliteOutboxStoreOptions = {}) {
-    this.table = opts.tableName ?? "nevo_outbox"
+    this.table = assertSqlIdentifier(opts.tableName ?? "nevo_outbox", "tableName")
 
     if (opts.db) {
       this.db = opts.db

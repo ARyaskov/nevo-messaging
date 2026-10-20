@@ -9,6 +9,7 @@ import type { WorkflowLock } from "./workflow"
 import { uuidv7 } from "./uuid"
 import { getDefaultLogger, type NevoLogger } from "./logger"
 import { stringifyWithBigInt, deserializeBigInt } from "./bigint.utils"
+import { assertSqlIdentifier } from "./sql-ident"
 
 /** Postgres backends for outbox, inbox, saga, event store, DLQ, and scheduled tasks. */
 
@@ -28,8 +29,9 @@ export interface PgStoreOptions {
 }
 
 function qident(schema: string | undefined, table: string): string {
+  assertSqlIdentifier(table, "table")
   if (!schema || schema === "public") return `"${table}"`
-  return `"${schema}"."${table}"`
+  return `"${assertSqlIdentifier(schema, "schema")}"."${table}"`
 }
 
 // ===========================================================================

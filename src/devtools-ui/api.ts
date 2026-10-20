@@ -16,6 +16,12 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
   res.end(body)
 }
 
+// A non-JSON content type is a CORS "simple request" a foreign page can send without a preflight.
+function isJsonRequest(req: IncomingMessage): boolean {
+  const type = req.headers["content-type"]?.split(";")[0]?.trim().toLowerCase()
+  return type === "application/json"
+}
+
 async function readJsonBody<T>(req: IncomingMessage): Promise<T | null> {
   const chunks: Buffer[] = []
   let size = 0
@@ -99,6 +105,10 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse, url: 
   if (!url.pathname.startsWith("/api/")) return false
 
   const method = req.method ?? "GET"
+  if (method === "POST" && !isJsonRequest(req)) {
+    sendJson(res, 415, { ok: false, error: "content-type must be application/json" })
+    return true
+  }
 
   switch (url.pathname) {
     case "/api/events": {

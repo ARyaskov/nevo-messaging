@@ -56,7 +56,7 @@ interface WsSignalRouterOptions extends SignalRouterOptions {
 | `clientMaxWindowBits` | `15` | Lower → less memory per connection |
 | `zlibDeflateOptions.level` | `6` | Zlib level 1 (fast) … 9 (small) |
 
-`maxPayload` caps inbound frames; oversize frames close the connection with code 1009.
+`maxPayload` caps inbound frames; oversize frames close the connection with code 1009. It defaults to `DEFAULT_MAX_PAYLOAD_BYTES` (4 MiB), the same cap the other transports use, instead of the `ws` library default of 100 MiB. Each connection may hold at most 1024 distinct subscriptions.
 
 ## Client
 

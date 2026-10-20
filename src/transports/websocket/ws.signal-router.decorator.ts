@@ -1,8 +1,10 @@
 import { Type } from "@nestjs/common"
 import { createServer, Server as HttpServer } from "node:http"
 import { createSignalRouterDecorator, SignalRouterOptions, getRouterRuntime } from "../../signal-router.utils"
-import { Codec, getCodec, getDefaultCodec, formatMethod, parseMethod, DEFAULT_METHOD_VERSION } from "../../common"
+import { Codec, getCodec, getDefaultCodec, formatMethod, parseMethod, DEFAULT_METHOD_VERSION, DEFAULT_MAX_PAYLOAD_BYTES } from "../../common"
 import { getWsModule } from "./optional-ws"
+
+const MAX_SUBSCRIPTIONS_PER_SOCKET = 1024
 
 export interface WsSignalRouterOptions extends SignalRouterOptions {
   port?: number
@@ -55,7 +57,7 @@ export function WsSignalRouter(serviceType: Type<any> | Type<any>[], options?: W
         const { WebSocketServer } = getWsModule()
         const wssOpts: any = { server: httpServer, path }
         if (options?.perMessageDeflate !== undefined) wssOpts.perMessageDeflate = options.perMessageDeflate
-        if (options?.maxPayload) wssOpts.maxPayload = options.maxPayload
+        wssOpts.maxPayload = options?.maxPayload || DEFAULT_MAX_PAYLOAD_BYTES
         const wss = new WebSocketServer(wssOpts)
         this.wsServer = wss
         this.wsHttpServer = httpServer
@@ -77,9 +79,13 @@ export function WsSignalRouter(serviceType: Type<any> | Type<any>[], options?: W
             const parsed = typeof envelope?.method === "string" ? parseMethod(envelope.method) : null
 
             if (parsed?.name === "__subscribe") {
-              ;(socket as any).__subscriptions ??= new Set()
+              const subscriptions: Set<string> = ((socket as any).__subscriptions ??= new Set())
               const key = `${envelope.params?.serviceName?.toLowerCase?.()}:${envelope.params?.method}`
-              ;(socket as any).__subscriptions.add(key)
+              if (!subscriptions.has(key) && subscriptions.size >= MAX_SUBSCRIPTIONS_PER_SOCKET) {
+                logger.warn({ event: "ws.subscribe.limit", limit: MAX_SUBSCRIPTIONS_PER_SOCKET })
+                return
+              }
+              subscriptions.add(key)
               return
             }
 
