@@ -188,6 +188,8 @@ export interface ApplyResilienceArgs<T> {
   invoke: (attempt: number, signal: AbortSignal) => Promise<T>
   subscription?: PausableSubscription
   budget?: InvocationBudget
+  /** External caller signal; unioned with every internal attempt signal (timeout/hedge). */
+  signal?: AbortSignal
 }
 
 export const DEFAULT_MAX_PHYSICAL_CALLS = 8
@@ -216,7 +218,7 @@ export class InvocationBudget {
 
 /** Apply the compiled resilience config around `invoke`. */
 export async function applyResilience<T>(args: ApplyResilienceArgs<T>): Promise<T> {
-  const { config, ctx, invoke, subscription } = args
+  const { config, ctx, invoke, subscription, signal } = args
   const budget = args.budget ?? new InvocationBudget()
   const key = ctx.key
 
@@ -232,21 +234,25 @@ export async function applyResilience<T>(args: ApplyResilienceArgs<T>): Promise<
       })
     }
     try {
-      return await runCircuitHedge(config, ctx, invoke, budget)
+      return await runCircuitHedge(config, ctx, invoke, budget, signal)
     } finally {
       limiter.end()
     }
   }
 
-  return runCircuitHedge(config, ctx, invoke, budget)
+  return runCircuitHedge(config, ctx, invoke, budget, signal)
 }
 
 async function runCircuitHedge<T>(
   config: CompiledResilience,
   ctx: ResilienceContext,
-  invoke: (attempt: number, signal: AbortSignal) => Promise<T>,
-  budget: InvocationBudget
+  rawInvoke: (attempt: number, signal: AbortSignal) => Promise<T>,
+  budget: InvocationBudget,
+  signal?: AbortSignal
 ): Promise<T> {
+  // Union the external caller signal with every internal attempt signal so an
+  // abort cancels the timeout timer path and every hedge copy alike.
+  const invoke = signal ? (attempt: number, s: AbortSignal) => rawInvoke(attempt, AbortSignal.any([signal, s])) : rawInvoke
   const key = ctx.key
   const circuitKey = widenKey(key, config.circuit?.keyBy, ctx.dimensions)
   const adaptiveKey = widenKey(key, config.adaptive?.keyBy, ctx.dimensions)

@@ -2,7 +2,7 @@
 
 The inbox is a small wrapper that records every successfully processed message UUID. When a duplicate arrives — because the producer retried, the broker redelivered, or you replayed the DLQ — the inbox short-circuits the handler and returns the cached result.
 
-Pair the inbox with the [outbox](./outbox.md) on the producer side to get effectively exactly-once semantics across the wire.
+Pair the inbox with the [outbox](./outbox.md) on the producer side to get **at-least-once** delivery with consumer-side dedup. The delivery guarantee is at-least-once; the projection is exactly-once only when the projection and `markSeen` share one transaction and the store's claim cannot be stolen while the handler runs.
 
 ## Real API
 
@@ -50,7 +50,7 @@ Note that `markSeen` takes no `opts.tx` itself — transactional commit is wired
 
 The framework **does** ship SQL/Redis inbox stores — you do not have to hand-roll one:
 
-- **`PgInboxStore`** (`src/common/pg-stores.ts`) — Postgres-backed, with `migrate()` and a `prune()` for TTL cleanup. Best for transactional projections where you want true exactly-once by committing dedup state with the projection.
+- **`PgInboxStore`** (`src/common/pg-stores.ts`) — Postgres-backed, with `migrate()` and a `prune()` for TTL cleanup. Best for transactional projections where the projection is exactly-once when you commit the dedup record in the same transaction as the projection (and the claim is not stolen mid-run).
 - **`RedisInboxStore`** (`src/common/inbox-redis.ts`) — Redis-backed, implements the optional `claim()` for cross-process leader election, with a `readErrorPolicy` (`"open"` | `"closed"`). Best for high-throughput consumers.
 
 ```ts
@@ -70,7 +70,7 @@ See [storage-matrix.md](./storage-matrix.md) for when to pick each.
 
 ## Transactional, exactly-once projections
 
-Prefer the shipped `PgInboxStore` over a hand-rolled one. To make the projection and the dedup record commit atomically, pass `opts.tx` to `dedupe` — it is a **commit wrapper** `(commit) => Promise<void>`, so you own the BEGIN/COMMIT and call `commit()` (which runs the store's `markSeen`) inside the same transaction:
+Prefer the shipped `PgInboxStore` over a hand-rolled one. Even then the delivery contract is **at-least-once**; the projection becomes exactly-once only when the projection and `markSeen` commit in one transaction and the claim is not stolen mid-run. Pass `opts.tx` to `dedupe` — it is a **commit wrapper** `(commit) => Promise<void>`: you own BEGIN/COMMIT, run the projection, call `commit()` (which runs the store's `markSeen`) and resolve the wrapper **only after your COMMIT resolves** — the inbox settles its local lease (waking followers) only after the wrapper resolves:
 
 ```ts
 const client = await pool.connect()
@@ -83,30 +83,34 @@ try {
       return { ok: true }
     },
     {
-      // The inbox invokes this with `commit`; pass the transaction client through
-      // so markSeen writes on the same connection inside your BEGIN…COMMIT.
+      // The inbox invokes this with `commit`; everything — projection, markSeen
+      // and COMMIT — happens inside your BEGIN, and the wrapper resolves only
+      // after COMMIT so local followers never observe an uncommitted result.
       tx: async (commit) => {
         await commit(client)
+        await client.query("COMMIT")
       }
     }
   )
-  await client.query("COMMIT")
   return result
 } catch (e) {
-  await client.query("ROLLBACK")
+  // ROLLBACK only makes sense when COMMIT has not resolved; otherwise it is a no-op error.
+  await client.query("ROLLBACK").catch(() => {})
   throw e
 } finally {
   client.release()
 }
 ```
 
-If you need a store that writes `markSeen` on the _very same connection_ as your projection (rather than the store's own connection), implement `InboxStore` over that connection — the shape is small. But for the common case the shipped `PgInboxStore` plus the commit-wrapper above is enough.
+If the wrapper rejects (COMMIT never happened), `ROLLBACK` still applies and the duplicate will be retried — the state remains at-least-once with a rolled-back transaction. Note that a mid-run claim steal by another worker (claim TTL expiry) breaks exactly-once; size `claimTtlMs` above your worst-case handler duration.
+
+If you need a store that writes `markSeen` on the _very same connection_ as your projection (rather than the store's own connection), implement `InboxStore` over that connection — the shape is small. But for the common case the shipped `PgInboxStore` plus the commit-wrapper above is enough — with the guarantee limited to at-least-once unless the projection and `markSeen` share one transaction and the claim is never stolen mid-run.
 
 ## Difference from the idempotency cache
 
 [Idempotency cache](./idempotency.md) is in-memory, per-process, short-lived. It is the right tool for retries within a few seconds.
 
-The inbox is intended to be durable, shared, and to survive restarts and operator replays. It is appropriate when the projection must be exactly-once for correctness (financial postings, immutable history).
+The inbox is intended to be durable, shared, and to survive restarts and operator replays. It is appropriate when the projection must be exactly-once for correctness (financial postings, immutable history) — that exactly-once is an application-level requirement you satisfy via the shared-transaction pattern above, not a guarantee the Inbox primitive itself provides.
 
 ## Pruning
 

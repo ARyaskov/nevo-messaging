@@ -7,6 +7,7 @@ interface CliOptions {
   host: string
   servers: string[]
   subject?: string
+  token?: string
   help?: boolean
 }
 
@@ -24,7 +25,8 @@ function parseArgs(argv: string[]): CliOptions {
   const out: CliOptions = {
     port: Number(process.env["NEVO_DEVTOOLS_PORT"]) || DEFAULT_DEVTOOLS_UI_PORT,
     host: process.env["NEVO_DEVTOOLS_HOST"] || "127.0.0.1",
-    servers: splitServers(envServers)
+    servers: splitServers(envServers),
+    token: process.env["NEVO_DEVTOOLS_TOKEN"]
   }
 
   for (let i = 2; i < argv.length; i++) {
@@ -48,6 +50,9 @@ function parseArgs(argv: string[]): CliOptions {
         break
       case "--subject":
         out.subject = next()
+        break
+      case "--token":
+        out.token = next()
         break
       case "--no-nats":
         // In-process only: useful when the UI is started inside a service.
@@ -77,6 +82,8 @@ Options:
   -n, --nats <urls>       Comma-separated NATS servers to ingest events from
                           (default ${DEFAULT_NATS}, env NEVO_DEVTOOLS_NATS_SERVERS or NATS_URL)
       --subject <s>       DevTools subject (default __nevo.devtools)
+      --token <t>         Auth token for mutating endpoints, required when binding
+                          a non-loopback host (env NEVO_DEVTOOLS_TOKEN)
       --no-nats           Do not bridge to NATS; show only this process's bus
   -h, --help              Show this help
 
@@ -104,7 +111,10 @@ async function main(): Promise<void> {
     port: opts.port,
     host: opts.host,
     natsServers: opts.servers,
-    ...(opts.subject ? { subject: opts.subject } : {})
+    ...(opts.subject ? { subject: opts.subject } : {}),
+    // Empty on a non-loopback bind keeps the server fail-closed: mutating
+    // endpoints stay 401 until a token is configured.
+    ...(opts.token ? { authToken: opts.token } : {})
   })
 
   console.log(`nevo-devtools  ${handle.url}`)

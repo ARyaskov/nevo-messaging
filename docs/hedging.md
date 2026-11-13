@@ -8,19 +8,16 @@ Use it when the latency distribution has a long tail and the call is **idempoten
 
 ```ts
 interface HedgingOptions {
-  enabled?: boolean    // default: false
-  copies?: number      // number of extra parallel attempts, default: 1
-  delayMs?: number     // wait this long before firing each extra copy, default: 25
+  enabled?: boolean // default: false
+  copies?: number // number of extra parallel attempts, default: 1
+  delayMs?: number // wait this long before firing each extra copy, default: 25
 }
 ```
 
 ```ts
 import { hedge } from "@riaskov/nevo-messaging"
 
-const result = await hedge(
-  (attempt, signal) => callPeer({ attempt, signal }),
-  { enabled: true, copies: 1, delayMs: 50 }
-)
+const result = await hedge((attempt, signal) => callPeer({ attempt, signal }), { enabled: true, copies: 1, delayMs: 50 })
 ```
 
 `hedge(fn, opts)` returns the first non-error result. The other attempts receive an aborted `AbortSignal` and should bail out if they are still running.
@@ -58,13 +55,25 @@ To force the same idempotency key across copies, set it explicitly:
 
 ```ts
 await hedge(
-  (attempt, signal) => client.query("user", "user.getById", { id }, {
-    idempotencyKey: "fixed-key-shared-across-copies",
-    signal
-  }),
+  (attempt, signal) =>
+    client.query(
+      "user",
+      "user.getById",
+      { id },
+      {
+        idempotencyKey: "fixed-key-shared-across-copies",
+        signal
+      }
+    ),
   { enabled: true, copies: 1, delayMs: 50 }
 )
 ```
+
+## Cancellation
+
+`ClientCallOptions.signal` is a cooperative cancellation channel for every client call (`query`, `emit`, `publish`, `broadcast`). The signal is forwarded through retries, adaptive timeouts and hedge copies to the transport, and an aborted call rejects with `CANCELLED`; a losing hedge copy never dispatches.
+
+Caveat: aborting the HTTP request only abandons the response. It does **not** roll back a server-side effect that already started — the handler may still complete. Use the server-side inbox/idempotency (with a shared transaction) for rollback/compensation semantics.
 
 ## Bounding the cost
 
@@ -90,7 +99,7 @@ The runtime in [`resilience-runtime.ts`](../src/common/resilience-runtime.ts) re
 
 See [resilience-decorators.md](./resilience-decorators.md) for the full picture.
 
-## What is *still* not provided
+## What is _still_ not provided
 
 - A "cancel on first response" flag — cancellation is the default; non-cancellable callers are responsible for their own cleanup.
 - A `delays: number[]` array — each subsequent copy uses the same `delayMs` interval.

@@ -8,9 +8,9 @@ This makes safe retries possible.
 
 ```ts
 interface IdempotencyOptions {
-  enabled?: boolean       // default: false
-  maxEntries?: number     // LRU cap, default: 10000
-  ttlMs?: number          // entry TTL, default: 60000
+  enabled?: boolean // default: false
+  maxEntries?: number // LRU cap, default: 10000
+  ttlMs?: number // entry TTL, default: 60000
 }
 
 class LruIdempotencyCache<T = unknown> {
@@ -32,7 +32,7 @@ createNevoNatsClient(["PAYMENT"], {
   clientIdPrefix: "checkout",
   idempotency: {
     enabled: true,
-    ttlMs: 300_000,  // 5 minutes
+    ttlMs: 300_000, // 5 minutes
     maxEntries: 50_000
   }
 })
@@ -41,11 +41,7 @@ createNevoNatsClient(["PAYMENT"], {
 ## Per-call key
 
 ```ts
-await this.query(
-  "payment", "card.charge",
-  { userId, amount },
-  { idempotencyKey: `charge-${orderId}` }
-)
+await this.query("payment", "card.charge", { userId, amount }, { idempotencyKey: `charge-${orderId}` })
 ```
 
 When the server receives this envelope:
@@ -75,13 +71,13 @@ The latter is dangerous on parameters that contain timestamps or nonces — be e
 
 The cache is checked on the server before the handler runs, on **both** the live signal-router path (`@NatsSignalRouter`/`@KafkaSignalRouter`/…) and `BaseMessageController`. The effective key is `meta.idempotencyKey` when the client stamped one, otherwise the envelope `uuid` — so timeout-retries (which carry a fresh `uuid` but the same `idempotencyKey`) collapse to a single execution.
 
-The stored key is scoped by **caller identity, tenant and target method**, so reusing one key against two different methods can't hand you the other method's response.
+The stored key is scoped by **caller identity, tenant and target method** (version folded into the method, mirroring the server-side key), so reusing one key against two different methods, tenants or versions can't hand you the other call's response.
 
 ### Same key, different payload
 
-Params are deliberately *not* part of the **key**. The key identifies the logical operation, so a retry must collapse onto the same entry even across replicas — folding the payload into the key would turn any serialization difference into a second execution and defeat the guarantee.
+Params are deliberately _not_ part of the **key**. The key identifies the logical operation, so a retry must collapse onto the same entry even across replicas — folding the payload into the key would turn any serialization difference into a second execution and defeat the guarantee.
 
-Instead the payload's fingerprint is stored *beside* the entry, so reuse is detected rather than silently replayed. A request that presents a known key with a different payload is answered with `ErrorCode.IDEMPOTENCY_KEY_CONFLICT` and the handler does not run:
+Instead the payload's fingerprint is stored _beside_ the entry, so reuse is detected rather than silently replayed. A request that presents a known key with a different payload is answered with `ErrorCode.IDEMPOTENCY_KEY_CONFLICT` and the handler does not run:
 
 ```
 { result: "error", error: { code: 20, message: "Idempotency key was already used for a different request payload on pay.charge" } }
@@ -129,21 +125,21 @@ interface IdempotencyStore<T = unknown> {
 
 ```ts
 import Redis from "ioredis"
-import {
-  RedisIdempotencyStore,
-  createNatsMicroservice,
-  type IdempotencyRedisLike
-} from "@riaskov/nevo-messaging"
+import { RedisIdempotencyStore, createNatsMicroservice, type IdempotencyRedisLike } from "@riaskov/nevo-messaging"
 
 // Thin wrapper around your favourite Redis client.
 const ioredis = new Redis(process.env.REDIS_URL!)
 const client: IdempotencyRedisLike = {
-  async get(key)              { return ioredis.get(key) },
+  async get(key) {
+    return ioredis.get(key)
+  },
   async set(key, value, opts) {
     if (opts.ifNotExists) return ioredis.set(key, value, "PX", opts.ttlMs, "NX")
     return ioredis.set(key, value, "PX", opts.ttlMs)
   },
-  async del(key) { return ioredis.del(key) }
+  async del(key) {
+    return ioredis.del(key)
+  }
 }
 
 const store = new RedisIdempotencyStore({
@@ -230,7 +226,7 @@ Use a dedicated key prefix and an etcd role limited to read/write/delete within 
 
 The shape is intentionally narrow. Any backend that supports a TTL'd `get/set` is enough. The store implementation can return Promises freely; the controller awaits transparently.
 
-## What is *still* not provided
+## What is _still_ not provided
 
 - **No autoKey config** — you provide the key explicitly.
 - **No `cacheErrors` option** — only successful results are cached.

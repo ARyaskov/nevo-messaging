@@ -2,8 +2,16 @@ import { createHash } from "node:crypto"
 import type { IdempotencyOptions } from "./types"
 import { stringifyWithBigInt } from "./bigint.utils"
 
-export function clientIdempotencyKey(serviceName: string, method: string, idempotencyKey: string): string {
-  return `${serviceName.length}:${serviceName}|${method.length}:${method}|${idempotencyKey}`
+/**
+ * Client-side cache key, shaped to mirror {@link serverIdempotencyKey}: caller,
+ * tenant, versioned method and the supplied key. Version is folded into the
+ * method (as the server sees it on the wire), so a version change is a miss.
+ * Divergence note: the target service is part of the client key only — the
+ * server omits it because each service owns its own idempotency store, while
+ * one ClientRuntime can call many services and must not alias across them.
+ */
+export function clientIdempotencyKey(callerService: string, targetService: string, tenantId: string, method: string, idempotencyKey: string): string {
+  return `${callerService.length}:${callerService}|${targetService.length}:${targetService}|${tenantId.length}:${tenantId}|${method.length}:${method}|${idempotencyKey}`
 }
 
 export function payloadFingerprint(params: unknown): string {

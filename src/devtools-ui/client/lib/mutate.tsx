@@ -8,15 +8,20 @@ const STORAGE_KEY = "nevo-devtools-token"
  * non-loopback bind — so the dashboard stores it locally and sends the
  * `x-nevo-devtools-token` header.
  */
+// In-memory fallback for environments where localStorage is unavailable
+// (private mode, sandboxed iframe): the token lives only for this page session.
+let memoryToken = ""
+
 export function getDevToolsToken(): string {
   try {
-    return globalThis.localStorage?.getItem(STORAGE_KEY) ?? ""
-  } catch {
-    return ""
-  }
+    const stored = globalThis.localStorage?.getItem(STORAGE_KEY)
+    if (stored) return stored
+  } catch {}
+  return memoryToken
 }
 
 export function setDevToolsToken(token: string): void {
+  memoryToken = token
   try {
     if (token) globalThis.localStorage?.setItem(STORAGE_KEY, token)
     else globalThis.localStorage?.removeItem(STORAGE_KEY)

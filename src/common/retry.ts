@@ -55,13 +55,17 @@ export function computeDelay(attempt: number, opts: ResolvedRetryOptions, err?: 
   return Math.floor(Math.random() * exp)
 }
 
-export async function withRetry<T>(fn: (attempt: number) => Promise<T>, opts: ResolvedRetryOptions, signal?: AbortSignal): Promise<T> {
-  if (!opts.enabled) return fn(1)
+export async function withRetry<T>(
+  fn: (attempt: number, signal?: AbortSignal) => Promise<T>,
+  opts: ResolvedRetryOptions,
+  signal?: AbortSignal
+): Promise<T> {
+  if (!opts.enabled) return fn(1, signal)
   let lastErr: unknown
   for (let attempt = 1; attempt <= opts.maxAttempts; attempt++) {
     if (signal?.aborted) throw new MessagingError(ErrorCode.CANCELLED, { message: "Retry cancelled" })
     try {
-      return await fn(attempt)
+      return await fn(attempt, signal)
     } catch (err) {
       lastErr = err
       if (attempt >= opts.maxAttempts || !shouldRetry(err, opts)) throw err

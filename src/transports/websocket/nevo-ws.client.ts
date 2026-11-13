@@ -321,6 +321,9 @@ export class NevoWsClient {
 
   async close(timeoutMs = 30_000): Promise<void> {
     this.discoveryRegistry.stopBackgroundPrune()
+    // Stop accepting, then drain in-flight queries while the sockets are still
+    // open so pending replies arrive before the transport is torn down.
+    await this.runtime.close(timeoutMs)
     for (const [, entry] of this.sockets) {
       entry.closed = true
       for (const [, p] of entry.pending) {
@@ -333,6 +336,5 @@ export class NevoWsClient {
       } catch {}
     }
     this.sockets.clear()
-    await this.runtime.close(timeoutMs)
   }
 }

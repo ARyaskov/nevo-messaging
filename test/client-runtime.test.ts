@@ -49,22 +49,22 @@ test("query turns an error envelope into a MessagingError and keeps the message 
   )
 })
 
-test("query caches by idempotency key, scoped to service and method", async () => {
+test("query caches by idempotency key, scoped to caller, tenant and versioned method", async () => {
   const r = runtime({ idempotency: { enabled: true, ttlMs: 60_000 } })
   let calls = 0
-  const call = (serviceName: string, method: string) =>
+  const call = (extra: Record<string, unknown>) =>
     r.query<number>({
-      serviceName,
-      method,
+      serviceName: "svc",
+      method: "m",
       params: {},
-      opts: { idempotencyKey: "same-key" },
+      opts: { idempotencyKey: "same-key", ...extra },
       send: async () => okEnvelope(++calls)
     })
 
-  assert.equal(await call("svc-a", "m"), 1)
-  assert.equal(await call("svc-a", "m"), 1, "second identical call is served from cache")
-  assert.equal(await call("svc-b", "m"), 2, "another service must not read the first one's entry")
-  assert.equal(await call("svc-a", "other"), 3, "another method must not read it either")
+  assert.equal(await call({}), 1)
+  assert.equal(await call({}), 1, "second identical call is served from cache")
+  assert.equal(await call({ tenantId: "t2" }), 2, "another tenant must not read the first one's entry")
+  assert.equal(await call({ version: "v2" }), 3, "another version folds into the method, so it is a miss")
 })
 
 test("same idempotency key with different params is a conflict, not a stale hit", async () => {

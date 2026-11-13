@@ -49,12 +49,17 @@ test("serverIdempotencyKey falls back to the envelope uuid and returns undefined
   assert.equal(serverIdempotencyKey({ method: "m" }), undefined)
 })
 
-test("clientIdempotencyKey separates service and method", () => {
-  assert.notEqual(clientIdempotencyKey("svc-a", "m", "k"), clientIdempotencyKey("svc-b", "m", "k"))
-  assert.notEqual(clientIdempotencyKey("svc", "m1", "k"), clientIdempotencyKey("svc", "m2", "k"))
-  assert.equal(clientIdempotencyKey("svc", "m", "k"), clientIdempotencyKey("svc", "m", "k"))
+test("clientIdempotencyKey separates caller, target, tenant and method (server-mirrored shape + target)", () => {
+  assert.notEqual(clientIdempotencyKey("svc-a", "t", "", "m", "k"), clientIdempotencyKey("svc-b", "t", "", "m", "k"))
+  // The target service is client-key-only: the server's store is per-target.
+  assert.notEqual(clientIdempotencyKey("caller", "target-a", "", "m", "k"), clientIdempotencyKey("caller", "target-b", "", "m", "k"))
+  assert.notEqual(clientIdempotencyKey("svc", "t", "t1", "m", "k"), clientIdempotencyKey("svc", "t", "t2", "m", "k"))
+  assert.notEqual(clientIdempotencyKey("svc", "t", "", "m1", "k"), clientIdempotencyKey("svc", "t", "", "m2", "k"))
+  assert.equal(clientIdempotencyKey("svc", "t", "", "m", "k"), clientIdempotencyKey("svc", "t", "", "m", "k"))
   // Length prefixes stop a boundary shift from aliasing two different calls.
-  assert.notEqual(clientIdempotencyKey("a", "bc", "k"), clientIdempotencyKey("ab", "c", "k"))
+  assert.notEqual(clientIdempotencyKey("a", "t", "", "bc", "k"), clientIdempotencyKey("ab", "t", "", "c", "k"))
+  // A version change folds into the method, so the key changes too.
+  assert.notEqual(clientIdempotencyKey("svc", "t", "", "m@v1", "k"), clientIdempotencyKey("svc", "t", "", "m@v2", "k"))
 })
 
 test("@Cacheable does not serve one tenant's result to another", async () => {

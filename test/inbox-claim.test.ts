@@ -147,3 +147,88 @@ test("PgInboxStore.markSeen writes through the supplied transaction client", asy
   assert.equal(queries[0].client, tx, "the record lands on the caller's transaction connection")
   assert.match(queries[0].sql, /INSERT INTO/)
 })
+
+test("a lost claim with no surfaced result is re-claimed, not raced (skip, no double-execute)", async () => {
+  let claims = 0
+  // A "live peer" holds the claim for the whole window: the loser must never
+  // fall through to the handler (the old behaviour).
+  const heldStore = {
+    hasSeen: async () => false,
+    markSeen: async () => {},
+    getResult: async () => undefined,
+    isDone: async () => false,
+    claim: async () => {
+      claims++
+      return { acquired: false }
+    }
+  }
+  const inbox = new Inbox({ store: heldStore as any, awaitTimeoutMs: 60 })
+  let runs = 0
+  const r = await inbox.dedupe("live-peer", async () => {
+    runs++
+    return "ran"
+  })
+  assert.equal(r, undefined, "the loser skips instead of double-executing")
+  assert.equal(runs, 0, "the handler never runs while the peer holds the claim")
+  assert.equal(claims, 2, "the loser awaits once, then re-claims once before skipping")
+})
+
+test("an expired claim is re-claimed successfully and the handler runs exactly once", async () => {
+  let claims = 0
+  // First claim is held (crashed peer); by the re-claim the TTL has expired.
+  const store = {
+    hasSeen: async () => false,
+    markSeen: async () => {},
+    getResult: async () => undefined,
+    isDone: async () => false,
+    claim: async () => {
+      return ++claims === 1 ? { acquired: false } : { acquired: true }
+    }
+  }
+  const inbox = new Inbox({ store: store as any, awaitTimeoutMs: 60 })
+  let runs = 0
+  const r = await inbox.dedupe("crashed-peer", async () => {
+    runs++
+    return "ran"
+  })
+  assert.equal(r, "ran")
+  assert.equal(runs, 1, "the re-claim winner runs the handler exactly once")
+})
+
+test("a follower settles only after the leader's commit wrapper resolves", async () => {
+  let release!: () => void
+  const gate = new Promise<void>((r) => {
+    release = r
+  })
+  const events: string[] = []
+  const store = {
+    hasSeen: async () => false,
+    markSeen: async () => {
+      events.push("markSeen")
+    },
+    getResult: async () => undefined
+  }
+  const inbox = new Inbox({ store: store as any })
+  const leader = inbox.dedupe(
+    "tx-order",
+    async () => "ok",
+    // The wrapper resolves only after the external COMMIT; the local lease must
+    // not settle (waking followers) before that.
+    {
+      tx: async (commit) => {
+        await commit()
+        await gate
+        events.push("commit")
+      }
+    }
+  )
+  const follower = inbox.dedupe("tx-order", async () => {
+    events.push("follower-ran")
+    return "bad"
+  })
+  await new Promise((r) => setTimeout(r, 20))
+  release()
+  await Promise.all([leader, follower])
+  assert.equal(events.indexOf("follower-ran"), -1, "followers must not re-run the handler")
+  assert.ok(events.indexOf("markSeen") < events.indexOf("commit"), "markSeen precedes the commit wrapper's resolution")
+})

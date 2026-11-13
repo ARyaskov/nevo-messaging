@@ -310,7 +310,7 @@ export class NevoHttpClient {
       req.destroy(new Error("timeout"))
     }, timeoutMs ?? this.timeoutMs)
     // Hedging/cancellation: a losing copy must not keep the wire busy.
-    const onAbort = () => req.destroy(new Error("aborted"))
+    const onAbort = () => req.destroy(new MessagingError(ErrorCode.CANCELLED, { message: "Request aborted" }))
     if (signal) {
       if (signal.aborted) onAbort()
       else signal.addEventListener("abort", onAbort, { once: true })
@@ -403,6 +403,9 @@ export class NevoHttpClient {
       }
     } catch (err) {
       if (err instanceof MessagingError) throw err
+      // An external caller abort is a CANCELLED, not a timeout: only the
+      // internal deadline timer maps to timeout.
+      if (signal?.aborted) throw new MessagingError(ErrorCode.CANCELLED, { message: "Request aborted" })
       if (controller.signal.aborted) throw new Error("timeout", { cause: err })
       throw err
     } finally {
@@ -590,7 +593,7 @@ export class NevoHttpClient {
 
     const readLoop = async (firstReader: ReadableStreamDefaultReader<Uint8Array>) => {
       let reader: ReadableStreamDefaultReader<Uint8Array> | null = firstReader
-      for (let attempt = 0; ; ) {
+      for (let attempt = 0; ;) {
         if (reader) {
           try {
             await consume(reader)
@@ -643,7 +646,7 @@ export class NevoHttpClient {
     const discoveryEndpoint = `${this.discoveryUrl.replace(/\/+$/, "")}/${DEFAULT_DISCOVERY_TOPIC}`
 
     const listenLoop = async () => {
-      for (let attempt = 0; ; ) {
+      for (let attempt = 0; ;) {
         try {
           const response = await fetch(discoveryEndpoint, {
             headers: { Accept: "text/event-stream" },
@@ -711,12 +714,14 @@ export class NevoHttpClient {
     if (this.discoveryAbort) this.discoveryAbort.abort()
     for (const controller of this.streamAborts) controller.abort()
     this.streamAborts.clear()
+    // Stop accepting, then drain in-flight calls while the transport is still
+    // alive; only after the drain do we release the sockets.
+    await this.runtime.close(timeoutMs)
     try {
       await this.undiciDispatcher?.close()
     } catch {}
     this.httpAgent.destroy()
     this.httpsAgent.destroy()
-    await this.runtime.close(timeoutMs)
   }
 }
 

@@ -228,12 +228,14 @@ export class NevoSocketClient {
 
   async close(timeoutMs = 30_000): Promise<void> {
     this.discoveryRegistry.stopBackgroundPrune()
+    // Stop accepting, then drain in-flight calls while the sockets are still
+    // connected so pending acks can arrive before teardown.
+    await this.runtime.close(timeoutMs)
     for (const s of this.sockets.values()) {
       try {
         s.close()
       } catch {}
     }
     this.sockets.clear()
-    await this.runtime.close(timeoutMs)
   }
 }

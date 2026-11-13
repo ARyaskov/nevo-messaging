@@ -34,6 +34,8 @@ export interface ClientCallOptions {
   headers?: Record<string, string>
   tenantId?: string
   timeoutMs?: number
+  /** Cooperative cancellation: forwarded to the transport; aborting rejects with CANCELLED. */
+  signal?: AbortSignal
 }
 
 export interface EncodedRequest {
@@ -51,7 +53,8 @@ export async function runClientPipeline<T>(
   retryOptions: ResolvedRetryOptions,
   key: string,
   attempt: (attempt: number, signal?: AbortSignal) => Promise<T>,
-  resilience?: CompiledResilience
+  resilience?: CompiledResilience,
+  signal?: AbortSignal
 ): Promise<T> {
   circuitBreaker.before(key)
   const budget = new InvocationBudget()
@@ -62,11 +65,13 @@ export async function runClientPipeline<T>(
           ? applyResilience<T>({
               config: resilience,
               ctx: { key },
-              invoke: (_attempt, signal) => attempt(retryAttempt, signal),
-              budget
+              invoke: (_attempt, sig) => attempt(retryAttempt, sig),
+              budget,
+              signal
             })
-          : budget.run(() => attempt(retryAttempt)),
-      retryOptions
+          : budget.run(() => attempt(retryAttempt, signal)),
+      retryOptions,
+      signal
     )
     circuitBreaker.onSuccess(key)
     return result
@@ -269,7 +274,14 @@ export class ClientRuntime {
   async query<T>(spec: ClientQuerySpec): Promise<T> {
     const { serviceName, method, params, opts, send, mapError } = spec
     const fingerprint = opts?.idempotencyKey ? payloadFingerprint(params) : undefined
-    const cacheKey = opts?.idempotencyKey ? clientIdempotencyKey(serviceName, method, opts.idempotencyKey) : undefined
+    // Client key is caller|target|tenant|versioned-method|key. It intentionally
+    // diverges from the 4-part serverIdempotencyKey: the server omits the
+    // target because its cfg.idem store is partitioned per target, while one
+    // ClientRuntime shares one cache across many targets.
+    const versioned = this.versionedMethod(method, opts)
+    const cacheKey = opts?.idempotencyKey
+      ? clientIdempotencyKey(this.serviceName ?? "", serviceName, opts.tenantId ?? "", versioned, opts.idempotencyKey)
+      : undefined
     if (cacheKey && this.idempotencyCache.isEnabled() && this.idempotencyCache.has(cacheKey)) {
       const entry = this.idempotencyCache.get(cacheKey)!
       // The key must not alias a response produced for a different payload.
@@ -284,69 +296,76 @@ export class ClientRuntime {
     const retryIdemKey = opts?.idempotencyKey ?? uuidv7()
 
     const result = await this.shutdown.trackInflight(() =>
-      runClientPipeline<T>(this.circuitBreaker, this.retryOptions, this.breakerKey(serviceName, method), async (attempt, signal) => {
-        const startMs = Date.now()
-        let request: EncodedRequest | undefined
-        const span = this.tracer.startSpan(`nevo.client.query ${serviceName}.${method}`, {
-          "nevo.method": method,
-          "nevo.service": serviceName,
-          "nevo.codec": this.codec.name,
-          "nevo.attempt": attempt
-        })
-        try {
-          if (signal?.aborted) {
-            throw new MessagingError(ErrorCode.CANCELLED, { message: `Request to ${serviceName}.${method} was aborted before dispatch` })
-          }
-          request = await this.encode(method, params, "query", {
-            ...opts,
-            idempotencyKey: retryIdemKey,
-            headers: { ...(opts?.headers ?? {}), "nevo-attempt": String(attempt) }
+      runClientPipeline<T>(
+        this.circuitBreaker,
+        this.retryOptions,
+        this.breakerKey(serviceName, method),
+        async (attempt, signal) => {
+          const startMs = Date.now()
+          let request: EncodedRequest | undefined
+          const span = this.tracer.startSpan(`nevo.client.query ${serviceName}.${method}`, {
+            "nevo.method": method,
+            "nevo.service": serviceName,
+            "nevo.codec": this.codec.name,
+            "nevo.attempt": attempt
           })
-          const envelope = await send(request, attempt, signal)
-          const value = this.unwrap<T>(envelope, serviceName)
-          span.setStatus({ code: 1 })
-          publishClientEvent(this.devtoolsBus, {
-            service: serviceName,
-            method,
-            uuid: request.uuid,
-            chainId: request.meta.nevoChainId,
-            durationMs: Date.now() - startMs,
-            status: "ok",
-            transport: this.transport,
-            origin: this.serviceName
-          })
-          return value
-        } catch (raw) {
-          const err = mapError ? mapError(raw) : raw
-          span.recordException(err)
-          span.setStatus({ code: 2, message: (err as Error)?.message })
-          publishClientEvent(this.devtoolsBus, {
-            service: serviceName,
-            method,
-            uuid: request?.uuid,
-            chainId: request?.meta.nevoChainId,
-            durationMs: Date.now() - startMs,
-            status: "error",
-            transport: this.transport,
-            origin: this.serviceName,
-            error: {
-              code: err instanceof MessagingError ? err.code : (err as { code?: number })?.code,
-              message: (err as Error)?.message ?? String(err)
+          try {
+            if (signal?.aborted) {
+              throw new MessagingError(ErrorCode.CANCELLED, { message: `Request to ${serviceName}.${method} was aborted before dispatch` })
             }
-          })
-          throw err
-        } finally {
-          span.end()
-          this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, this.metricLabels(serviceName, method))
-          if (attempt > 1) {
-            this.metrics.incCounter(NEVO_METRIC_NAMES.retries, {
-              transport: this.transport,
-              service: serviceName,
-              method: methodLabel(method)
+            request = await this.encode(method, params, "query", {
+              ...opts,
+              idempotencyKey: retryIdemKey,
+              headers: { ...(opts?.headers ?? {}), "nevo-attempt": String(attempt) }
             })
+            const envelope = await send(request, attempt, signal)
+            const value = this.unwrap<T>(envelope, serviceName)
+            span.setStatus({ code: 1 })
+            publishClientEvent(this.devtoolsBus, {
+              service: serviceName,
+              method,
+              uuid: request.uuid,
+              chainId: request.meta.nevoChainId,
+              durationMs: Date.now() - startMs,
+              status: "ok",
+              transport: this.transport,
+              origin: this.serviceName
+            })
+            return value
+          } catch (raw) {
+            const err = mapError ? mapError(raw) : raw
+            span.recordException(err)
+            span.setStatus({ code: 2, message: (err as Error)?.message })
+            publishClientEvent(this.devtoolsBus, {
+              service: serviceName,
+              method,
+              uuid: request?.uuid,
+              chainId: request?.meta.nevoChainId,
+              durationMs: Date.now() - startMs,
+              status: "error",
+              transport: this.transport,
+              origin: this.serviceName,
+              error: {
+                code: err instanceof MessagingError ? err.code : (err as { code?: number })?.code,
+                message: (err as Error)?.message ?? String(err)
+              }
+            })
+            throw err
+          } finally {
+            span.end()
+            this.metrics.incCounter(NEVO_METRIC_NAMES.requestsTotal, this.metricLabels(serviceName, method))
+            if (attempt > 1) {
+              this.metrics.incCounter(NEVO_METRIC_NAMES.retries, {
+                transport: this.transport,
+                service: serviceName,
+                method: methodLabel(method)
+              })
+            }
           }
-        }
-      })
+        },
+        undefined,
+        opts?.signal
+      )
     )
 
     if (cacheKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(cacheKey, idempotencyEnvelope(result, fingerprint))
@@ -361,17 +380,24 @@ export class ClientRuntime {
     // caller supplied an idempotency key the server can dedupe on.
     const retryOptions = opts?.idempotencyKey ? this.retryOptions : { ...this.retryOptions, enabled: false }
     return this.shutdown.trackInflight(() =>
-      runClientPipeline<void>(this.circuitBreaker, retryOptions, this.breakerKey(serviceName, method), async (attempt, signal) => {
-        try {
-          if (signal?.aborted) {
-            throw new MessagingError(ErrorCode.CANCELLED, { message: `Emit to ${serviceName}.${method} was aborted before dispatch` })
+      runClientPipeline<void>(
+        this.circuitBreaker,
+        retryOptions,
+        this.breakerKey(serviceName, method),
+        async (attempt, signal) => {
+          try {
+            if (signal?.aborted) {
+              throw new MessagingError(ErrorCode.CANCELLED, { message: `Emit to ${serviceName}.${method} was aborted before dispatch` })
+            }
+            const request = await this.encode(method, params, spec.type ?? "emit", { ...opts, idempotencyKey: idemKey })
+            await send(request, attempt, signal)
+          } catch (raw) {
+            throw mapError ? mapError(raw) : raw
           }
-          const request = await this.encode(method, params, spec.type ?? "emit", { ...opts, idempotencyKey: idemKey })
-          await send(request, attempt, signal)
-        } catch (raw) {
-          throw mapError ? mapError(raw) : raw
-        }
-      })
+        },
+        undefined,
+        opts?.signal
+      )
     )
   }
 

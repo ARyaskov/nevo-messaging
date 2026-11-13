@@ -94,7 +94,25 @@ export class Inbox {
             this.settleLease(uuid, undefined)
             return undefined as T
           }
-          // Claim held by a peer that produced no result before the deadline — run it ourselves.
+          // Claim held by a peer with no result yet: do NOT race it — re-claim
+          // once, and execute only when the fresh claim is actually acquired
+          // (e.g. the peer crashed and its claim TTL expired). Otherwise skip.
+          const reClaim = await this.store.claim(uuid)
+          if (!reClaim.acquired) {
+            let retry = reClaim.existing
+            if (retry === undefined) retry = await this.awaitResult(uuid)
+            if (retry !== undefined) {
+              this.settleLease(uuid, retry)
+              return retry as T
+            }
+            if (await this.isFinished(uuid)) {
+              this.settleLease(uuid, undefined)
+              return undefined as T
+            }
+            // Still held by a live peer: skip rather than double-execute.
+            this.settleLease(uuid, undefined)
+            return undefined as T
+          }
         }
       } else if (await this.store.hasSeen(uuid)) {
         const existing = await this.store.getResult(uuid)
