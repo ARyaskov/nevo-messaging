@@ -231,7 +231,7 @@ test("the client idempotency cache is scoped by tenant and version (no foreign/s
     assert.equal(await call({ tenantId: "t1" }), 0)
     assert.equal(await call({ tenantId: "t1" }), 0, "same tenant + version is served from cache")
     assert.equal(await call({ tenantId: "t2" }), 1, "another tenant must miss the cache")
-    assert.equal(await call({ version: "v2" }), 2, "another version must miss the cache")
+    assert.equal(await call({ tenantId: "t1", version: "v2" }), 2, "another version on the same tenant must miss the cache")
     assert.equal(stub.requests(), 3)
   } finally {
     await client.close()

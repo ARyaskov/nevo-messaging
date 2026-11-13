@@ -11,8 +11,12 @@ const STORAGE_KEY = "nevo-devtools-token"
 // In-memory fallback for environments where localStorage is unavailable
 // (private mode, sandboxed iframe): the token lives only for this page session.
 let memoryToken = ""
+// Set once a localStorage write fails while reads still work: a stale stored
+// token must not shadow the newer in-memory value until a write succeeds.
+let memoryWins = false
 
 export function getDevToolsToken(): string {
+  if (memoryWins) return memoryToken
   try {
     const stored = globalThis.localStorage?.getItem(STORAGE_KEY)
     if (stored) return stored
@@ -25,8 +29,10 @@ export function setDevToolsToken(token: string): void {
   try {
     if (token) globalThis.localStorage?.setItem(STORAGE_KEY, token)
     else globalThis.localStorage?.removeItem(STORAGE_KEY)
+    // A successful write means the stored value now matches memory again.
+    memoryWins = false
   } catch {
-    // Storage unavailable (private mode): keep the in-memory value only.
+    memoryWins = true
   }
 }
 

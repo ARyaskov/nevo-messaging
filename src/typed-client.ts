@@ -14,6 +14,8 @@ export interface TypedQueryOptions {
   headers?: Record<string, string>
   timeoutMs?: number
   tenantId?: string
+  /** Cooperative cancellation: forwarded to the transport; aborting rejects with CANCELLED. */
+  signal?: AbortSignal
 }
 
 /** Per-call options understood by every transport client's `emit`. */
@@ -22,6 +24,8 @@ export interface TypedEmitOptions {
   idempotencyKey?: string
   headers?: Record<string, string>
   tenantId?: string
+  /** Cooperative cancellation: forwarded to the transport; aborting rejects with CANCELLED. */
+  signal?: AbortSignal
 }
 
 /** The minimal runtime surface {@link typed} needs from a transport client. */

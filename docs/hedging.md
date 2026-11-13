@@ -71,7 +71,7 @@ await hedge(
 
 ## Cancellation
 
-`ClientCallOptions.signal` is a cooperative cancellation channel for every client call (`query`, `emit`, `publish`, `broadcast`). The signal is forwarded through retries, adaptive timeouts and hedge copies to the transport, and an aborted call rejects with `CANCELLED`; a losing hedge copy never dispatches.
+`ClientCallOptions.signal` is a cooperative cancellation channel for client calls (`query`, `emit`, `publish`, `broadcast`), forwarded through retries, adaptive timeouts and hedge copies. Today only the HTTP transport honors an explicitly passed signal on the wire: an aborted call rejects with `CANCELLED` and tears down the in-flight request. Hedged copies **are** dispatched in parallel — after a winner resolves, `hedge()` aborts the losers' signals, so a losing copy's wire request may already have been sent and is aborted only afterwards. The http2 client does not honor the signal (its `send` path drops it and relies only on a timeout), and the WS, Socket.IO, NATS and Kafka send paths do not observe the signal yet; the `@Hedge` decorator's auto-wrapping is not wired for cancellation either — a losing copy on those paths runs to completion.
 
 Caveat: aborting the HTTP request only abandons the response. It does **not** roll back a server-side effect that already started — the handler may still complete. Use the server-side inbox/idempotency (with a shared transaction) for rollback/compensation semantics.
 

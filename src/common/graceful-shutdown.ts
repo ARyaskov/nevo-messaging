@@ -5,6 +5,8 @@ export class GracefulShutdown {
   private readonly inflight = new Set<symbol>()
   private shuttingDown = false
   private resolveDrain?: () => void
+  // One shutdown sequence shared by every concurrent close() caller.
+  private shutdownPromise?: Promise<void>
 
   isShuttingDown(): boolean {
     return this.shuttingDown
@@ -54,8 +56,14 @@ export class GracefulShutdown {
     }
   }
 
-  async shutdown(timeoutMs = 30_000): Promise<void> {
-    if (this.shuttingDown) return
+  shutdown(timeoutMs = 30_000): Promise<void> {
+    // Every caller awaits the SAME sequence: a second close() must not return
+    // early and tear down while the first is still draining.
+    this.shutdownPromise ??= this.performShutdown(timeoutMs)
+    return this.shutdownPromise
+  }
+
+  private async performShutdown(timeoutMs: number): Promise<void> {
     this.shuttingDown = true
     await this.drain(timeoutMs)
     for (let i = this.hooks.length - 1; i >= 0; i--) {

@@ -74,8 +74,8 @@ Prefer the shipped `PgInboxStore` over a hand-rolled one. Even then the delivery
 
 ```ts
 const client = await pool.connect()
-await client.query("BEGIN")
 try {
+  await client.query("BEGIN")
   const result = await inbox.dedupe(
     env.uuid,
     async () => {
@@ -83,9 +83,10 @@ try {
       return { ok: true }
     },
     {
-      // The inbox invokes this with `commit`; everything — projection, markSeen
-      // and COMMIT — happens inside your BEGIN, and the wrapper resolves only
-      // after COMMIT so local followers never observe an uncommitted result.
+      // The inbox invokes this with `commit` on the executing path only;
+      // everything — projection, markSeen and COMMIT — happens inside your
+      // BEGIN, and the wrapper resolves only after COMMIT so local followers
+      // never observe an uncommitted result.
       tx: async (commit) => {
         await commit(client)
         await client.query("COMMIT")
@@ -94,15 +95,20 @@ try {
   )
   return result
 } catch (e) {
-  // ROLLBACK only makes sense when COMMIT has not resolved; otherwise it is a no-op error.
-  await client.query("ROLLBACK").catch(() => {})
+  // A retryable busy/pending claim (thrown as a MessagingError) or a failed
+  // COMMIT propagates here; rethrow so the message is redelivered.
   throw e
 } finally {
+  // Duplicate/cached and follower calls return before opts.tx runs, so the
+  // BEGIN above can still be open when we get here. ROLLBACK is a no-op after
+  // a successful COMMIT, and this guarantees no client is released into the
+  // pool with an open transaction.
+  await client.query("ROLLBACK").catch(() => {})
   client.release()
 }
 ```
 
-If the wrapper rejects (COMMIT never happened), `ROLLBACK` still applies and the duplicate will be retried — the state remains at-least-once with a rolled-back transaction. Note that a mid-run claim steal by another worker (claim TTL expiry) breaks exactly-once; size `claimTtlMs` above your worst-case handler duration.
+If the wrapper rejects (COMMIT never happened), `ROLLBACK` still applies in the `finally` and the duplicate will be retried — the state remains at-least-once with a rolled-back transaction. The `finally` `ROLLBACK` also covers the calls that return before `opts.tx` runs (duplicate hit, cached result, follower, or a thrown retryable busy/pending error): their `BEGIN` would otherwise be released into the pool still open. Note that a mid-run claim steal by another worker (claim TTL expiry) breaks exactly-once; size `claimTtlMs` above your worst-case handler duration.
 
 If you need a store that writes `markSeen` on the _very same connection_ as your projection (rather than the store's own connection), implement `InboxStore` over that connection — the shape is small. But for the common case the shipped `PgInboxStore` plus the commit-wrapper above is enough — with the guarantee limited to at-least-once unless the projection and `markSeen` share one transaction and the claim is never stolen mid-run.
 

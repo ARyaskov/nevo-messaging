@@ -70,7 +70,14 @@ export async function withRetry<T>(
       lastErr = err
       if (attempt >= opts.maxAttempts || !shouldRetry(err, opts)) throw err
       const delay = computeDelay(attempt, opts, err)
-      await sleep(delay, undefined, { signal })
+      try {
+        await sleep(delay, undefined, { signal })
+      } catch (abortErr) {
+        // Aborting during backoff must surface the same CANCELLED contract as
+        // a pre-dispatch or in-flight abort, not the native ABORT_ERR.
+        if (signal?.aborted) throw new MessagingError(ErrorCode.CANCELLED, { message: "Retry cancelled" })
+        throw abortErr
+      }
     }
   }
   throw lastErr

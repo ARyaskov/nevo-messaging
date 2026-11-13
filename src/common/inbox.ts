@@ -1,4 +1,6 @@
 import { setTimeout as sleep } from "node:timers/promises"
+import { ErrorCode } from "./error-code"
+import { MessagingError } from "./errors"
 import { LruIdempotencyCache } from "./idempotency"
 import type { IdempotencyClaim } from "./idempotency-store"
 
@@ -109,9 +111,14 @@ export class Inbox {
               this.settleLease(uuid, undefined)
               return undefined as T
             }
-            // Still held by a live peer: skip rather than double-execute.
-            this.settleLease(uuid, undefined)
-            return undefined as T
+            // Still held by a live peer: never double-execute, and do NOT
+            // settle the lease — the peer may still commit a result. Report
+            // "not ready yet" as retryable instead of faking an empty success,
+            // which would lose the delivery under a false-success ACK.
+            throw new MessagingError(ErrorCode.SERVICE_UNAVAILABLE, {
+              message: `Inbox entry ${uuid} is still being processed by a live peer; retry later`,
+              retryable: true
+            })
           }
         }
       } else if (await this.store.hasSeen(uuid)) {

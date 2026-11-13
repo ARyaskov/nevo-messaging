@@ -3,6 +3,9 @@ import assert from "node:assert/strict"
 import { Inbox, InMemoryInboxStore } from "../src/common/inbox"
 import { RedisInboxStore, type InboxRedisClient } from "../src/common/inbox-redis"
 import { PgInboxStore, type PgClient } from "../src/common/pg-stores"
+import type { InboxStore } from "../src/common/inbox"
+import { MessagingError } from "../src/common/errors"
+import { ErrorCode, isRetryable } from "../src/common/error-code"
 
 function fakeRedis(): InboxRedisClient & { storage: Map<string, string> } {
   const storage = new Map<string, string>()
@@ -125,7 +128,7 @@ test("dedupe's commit wrapper threads the caller's transaction into markSeen", a
     },
     getResult: async () => undefined
   }
-  const inbox = new Inbox({ store: store as any })
+  const inbox = new Inbox({ store: store as InboxStore })
   const txClient = { id: "txn-1" }
   await inbox.dedupe("evt-tx", async () => "ok", {
     // The user's commit wrapper receives the tx handle and forwards it, so the
@@ -137,10 +140,10 @@ test("dedupe's commit wrapper threads the caller's transaction into markSeen", a
 })
 
 test("PgInboxStore.markSeen writes through the supplied transaction client", async () => {
-  const queries: { client: PgClient; sql: string }[] = []
-  const tx: PgClient = { query: (sql: any) => (queries.push({ client: tx, sql }), Promise.resolve({ rows: [] })) }
+  const queries: { client: PgClient | undefined; sql: string }[] = []
+  const tx: PgClient = { query: (sql: string) => (queries.push({ client: tx, sql }), Promise.resolve({ rows: [] })) }
   const store = new PgInboxStore({
-    client: { query: (sql: any) => (queries.push({ client: undefined as any, sql }), Promise.resolve({ rows: [] })) }
+    client: { query: (sql: string) => (queries.push({ client: undefined, sql }), Promise.resolve({ rows: [] })) }
   })
   await store.markSeen("u-tx", { ok: true }, { tx })
   assert.equal(queries.length, 1)
@@ -148,7 +151,7 @@ test("PgInboxStore.markSeen writes through the supplied transaction client", asy
   assert.match(queries[0].sql, /INSERT INTO/)
 })
 
-test("a lost claim with no surfaced result is re-claimed, not raced (skip, no double-execute)", async () => {
+test("a lost claim with no surfaced result is re-claimed, not raced (retryable, no double-execute)", async () => {
   let claims = 0
   // A "live peer" holds the claim for the whole window: the loser must never
   // fall through to the handler (the old behaviour).
@@ -162,15 +165,21 @@ test("a lost claim with no surfaced result is re-claimed, not raced (skip, no do
       return { acquired: false }
     }
   }
-  const inbox = new Inbox({ store: heldStore as any, awaitTimeoutMs: 60 })
+  const inbox = new Inbox({ store: heldStore as InboxStore, awaitTimeoutMs: 60 })
   let runs = 0
-  const r = await inbox.dedupe("live-peer", async () => {
-    runs++
-    return "ran"
-  })
-  assert.equal(r, undefined, "the loser skips instead of double-executing")
+  // A live peer holding the claim is "not ready yet": the loser must get a
+  // retryable error, never a fake empty success (which would lose the
+  // delivery under a false-success ACK).
+  await assert.rejects(
+    () =>
+      inbox.dedupe("live-peer", async () => {
+        runs++
+        return "ran"
+      }),
+    (err: unknown) => err instanceof MessagingError && err.code === ErrorCode.SERVICE_UNAVAILABLE && err.retryable === true && isRetryable(err.code)
+  )
   assert.equal(runs, 0, "the handler never runs while the peer holds the claim")
-  assert.equal(claims, 2, "the loser awaits once, then re-claims once before skipping")
+  assert.equal(claims, 2, "the loser awaits once, then re-claims once before reporting not-ready")
 })
 
 test("an expired claim is re-claimed successfully and the handler runs exactly once", async () => {
@@ -185,7 +194,7 @@ test("an expired claim is re-claimed successfully and the handler runs exactly o
       return ++claims === 1 ? { acquired: false } : { acquired: true }
     }
   }
-  const inbox = new Inbox({ store: store as any, awaitTimeoutMs: 60 })
+  const inbox = new Inbox({ store: store as InboxStore, awaitTimeoutMs: 60 })
   let runs = 0
   const r = await inbox.dedupe("crashed-peer", async () => {
     runs++
@@ -208,7 +217,7 @@ test("a follower settles only after the leader's commit wrapper resolves", async
     },
     getResult: async () => undefined
   }
-  const inbox = new Inbox({ store: store as any })
+  const inbox = new Inbox({ store: store as InboxStore })
   const leader = inbox.dedupe(
     "tx-order",
     async () => "ok",
