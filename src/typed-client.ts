@@ -14,7 +14,13 @@ export interface TypedQueryOptions {
   headers?: Record<string, string>
   timeoutMs?: number
   tenantId?: string
-  /** Cooperative cancellation: forwarded to the transport; aborting rejects with CANCELLED. */
+  /**
+   * Cooperative cancellation: forwarded to the transport. Pre-dispatch and
+   * backoff aborts reject with CANCELLED; whether an in-flight call can be
+   * aborted depends on the transport — today only HTTP honors the signal on
+   * the wire, so an in-flight http2 abort does NOT reject with CANCELLED
+   * (see docs/hedging.md).
+   */
   signal?: AbortSignal
 }
 
@@ -24,7 +30,13 @@ export interface TypedEmitOptions {
   idempotencyKey?: string
   headers?: Record<string, string>
   tenantId?: string
-  /** Cooperative cancellation: forwarded to the transport; aborting rejects with CANCELLED. */
+  /**
+   * Cooperative cancellation: forwarded to the transport. Pre-dispatch and
+   * backoff aborts reject with CANCELLED; whether an in-flight call can be
+   * aborted depends on the transport — today only HTTP honors the signal on
+   * the wire, so an in-flight http2 abort does NOT reject with CANCELLED
+   * (see docs/hedging.md).
+   */
   signal?: AbortSignal
 }
 
