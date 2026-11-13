@@ -51,3 +51,8 @@ test("JsonCodec does not decode legacy-looking strings unless explicitly migrate
   const codec = new JsonCodec()
   assert.deepEqual(codec.decode(codec.encode({ version: "42n" })), { version: "42n" })
 })
+
+test("a string wearing the BigInt sentinel prefix stays a string", () => {
+  const codec = new JsonCodec()
+  assert.deepEqual(codec.decode(codec.encode({ version: "@@nevo:bigint:5" })), { version: "@@nevo:bigint:5" })
+})

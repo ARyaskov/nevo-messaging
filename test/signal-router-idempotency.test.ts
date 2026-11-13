@@ -3,9 +3,12 @@ import assert from "node:assert/strict"
 import { createSignalRouterDecorator, bindSignalRouterForTesting } from "../src/signal-router.utils"
 import { addSignalMetadata } from "../src/signal.decorator"
 import { RedisIdempotencyStore, type IdempotencyRedisLike } from "../src/common/idempotency-store"
+import { ClientRuntime } from "../src/common/client-runtime"
+import { JsonCodec } from "../src/common/codec"
+import { MessagingError } from "../src/common/errors"
+import { ErrorCode } from "../src/common/error-code"
 import { AuditLog, InMemoryAuditSink } from "../src/common/audit-log"
 import { TenantPolicyRegistry, setTenantPolicyRegistry, getTenantPolicyRegistry } from "../src/common/tenant-policy"
-import { ErrorCode } from "../src/common/error-code"
 import type { MessageResponse } from "../src/common/types"
 
 // ---------------------------------------------------------------------------
@@ -201,6 +204,23 @@ test("signal-router: without a caller-supplied key, differing payloads never con
   assert.equal(calls, 2)
 })
 
+test("signal-router: idempotency stays off by default (no lease without an explicit key/store)", async () => {
+  let calls = 0
+  class Svc {
+    async run() {
+      calls++
+      return calls
+    }
+  }
+  // No idempotency options at all: a redelivered envelope uuid must re-execute
+  // instead of leasing a per-request key that can never dedup (each send mints
+  // a fresh uuid).
+  const handle = buildRouter(Svc, new Svc(), "echo.run", "run")
+  await handle({ method: "echo.run", params: {}, uuid: "same-uuid", meta: {} })
+  await handle({ method: "echo.run", params: {}, uuid: "same-uuid", meta: {} })
+  assert.equal(calls, 2)
+})
+
 test("signal-router: distinct idempotency keys do NOT dedup", async () => {
   let calls = 0
   class Svc {
@@ -214,6 +234,44 @@ test("signal-router: distinct idempotency keys do NOT dedup", async () => {
   await handle({ method: "echo.run", params: {}, uuid: "a", meta: { idempotencyKey: "k-a" } })
   await handle({ method: "echo.run", params: {}, uuid: "b", meta: { idempotencyKey: "k-b" } })
   assert.equal(calls, 2)
+})
+
+test("client retry dedups server-side through the auto-generated wire key (response loss)", async () => {
+  // The client always stamps meta.idempotencyKey (auto uuidv7, stable across
+  // retry attempts), so the server lease is load-bearing on the normal path:
+  // a response lost after execution must not re-run the handler.
+  let handlerCalls = 0
+  class Svc {
+    async run(p: any) {
+      handlerCalls++
+      return { n: handlerCalls, p }
+    }
+  }
+  const store = new RedisIdempotencyStore<MessageResponse>({ client: fakeRedis(), enabled: true, ttlMs: 60_000 })
+  const handle = buildRouter(Svc, new Svc(), "echo.run", "run", { idempotencyStore: store })
+
+  const rt = new ClientRuntime(
+    { codec: new JsonCodec(), devtools: false, serviceName: "caller", retry: { maxAttempts: 2, baseMs: 1, maxMs: 2, jitter: false } } as any,
+    { transport: "test" }
+  )
+  let sendAttempts = 0
+  const result = await rt.query<{ n: number; p: unknown }>({
+    serviceName: "router",
+    method: "echo.run",
+    params: { x: 1 },
+    send: async (request) => {
+      sendAttempts++
+      const res = await handle({ method: "echo.run", params: { x: 1 }, uuid: request.uuid, meta: request.meta })
+      if (sendAttempts === 1) {
+        // The handler already ran; simulate the response being lost in transit.
+        throw new MessagingError(ErrorCode.TIMEOUT, { message: "response lost", retryable: true })
+      }
+      return res
+    }
+  })
+  assert.deepEqual(result, { n: 1, p: { x: 1 } }, "the retry got the committed response, not a re-execution")
+  assert.equal(handlerCalls, 1)
+  assert.equal(sendAttempts, 2, "the retry ran against the same stable wire idempotency key")
 })
 
 test("signal-router: audit log records one redacted entry per request", async () => {

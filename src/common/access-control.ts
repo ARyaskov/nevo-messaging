@@ -3,6 +3,11 @@ import { AccessControlConfig, AccessRule, MessageMeta } from "./types"
 import { ErrorCode } from "./error-code"
 import { MessagingError } from "./errors"
 import { getDefaultLogger } from "./logger"
+import { NEVO_CONTRACT_METHOD } from "./contract"
+import { NEVO_HEALTH_METHOD, NEVO_LIVENESS_METHOD, NEVO_READINESS_METHOD } from "./health"
+
+// Exact built-in method names that stay reachable under the deny-default.
+const BUILTIN_METHODS = new Set<string>([NEVO_CONTRACT_METHOD, NEVO_HEALTH_METHOD, NEVO_LIVENESS_METHOD, NEVO_READINESS_METHOD])
 
 const JWT_CACHE_MAX = 1024
 const JWT_CACHE_TTL_MS = 60_000
@@ -185,8 +190,9 @@ export function isAccessAllowed(config: AccessControlConfig | undefined, topic: 
   if (compiled.globalDefault.length) candidates.push(...compiled.globalDefault)
 
   // Built-in introspection methods (contract, health) stay reachable under the
-  // deny-default; an explicit matching rule still overrides this.
-  if (candidates.length === 0) return compiled.allowAllByDefault || method.startsWith("nevo.")
+  // deny-default via an exact-name allowlist; an explicit matching rule still
+  // overrides this.
+  if (candidates.length === 0) return compiled.allowAllByDefault || BUILTIN_METHODS.has(method)
 
   // Deny is authoritative: a matching deny in any candidate rule wins over any allow.
   for (const rule of candidates) {
@@ -209,6 +215,11 @@ export function logAccessDenied(config: AccessControlConfig | undefined, details
   } catch {
     console.warn("[NevoMessaging][ACL] Access denied:", details)
   }
+}
+
+/** Compiled ACLs are cached per config object; drop the cache after an in-place mutation. */
+export function invalidateCompiledAccessControl(config: AccessControlConfig): void {
+  COMPILED.delete(config)
 }
 
 export function createAccessDeniedError(method: string, serviceName: string, callerService?: string) {

@@ -66,6 +66,12 @@ export interface RedisIdempotencyStoreOptions extends IdempotencyOptions {
   claimTtlMs?: number
   /** On a Redis read failure: `"open"` (default) treat as a miss and proceed; `"closed"` rethrow. */
   readErrorPolicy?: StoreReadErrorPolicy
+  /**
+   * On a claim (SET NX) failure: `"closed"` (default) rethrow so dedup never
+   * silently disables while the store is down; `"open"` executes anyway.
+   * Defaults to `readErrorPolicy` when that is explicitly provided.
+   */
+  claimErrorPolicy?: StoreReadErrorPolicy
   logger?: NevoLogger
   metrics?: ReturnType<typeof getDefaultMetrics>
 }
@@ -81,6 +87,7 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
   private readonly l1: LruIdempotencyCache<T>
   private readonly client: IdempotencyRedisLike
   private readonly readErrorPolicy: StoreReadErrorPolicy
+  private readonly claimErrorPolicy: StoreReadErrorPolicy
   private readonly logger: NevoLogger
   private readonly metrics: ReturnType<typeof getDefaultMetrics>
 
@@ -94,6 +101,9 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
     this.decode = (opts.decode as <U>(blob: string) => U) ?? (<U>(blob: string) => JSON.parse(blob) as U)
     this.client = opts.client
     this.readErrorPolicy = opts.readErrorPolicy ?? "open"
+    // Default the claim to fail-closed: an "open" claim on a down store would
+    // hand out { acquired: true } to every caller and silently disable dedup.
+    this.claimErrorPolicy = opts.claimErrorPolicy ?? opts.readErrorPolicy ?? "closed"
     this.logger = (opts.logger ?? getDefaultLogger()).child({ component: "idempotency.redis" })
     this.metrics = opts.metrics ?? getDefaultMetrics()
     this.l1 = new LruIdempotencyCache<T>({
@@ -112,13 +122,10 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
   }
 
   /** Centralised read-failure handling: metric + log, then policy decides. */
-  private onReadError<R>(op: string, err: unknown, failOpenValue: R): R {
-    this.metrics.incCounter(NEVO_METRIC_NAMES.storeErrors, { store: "idempotency", op, policy: this.readErrorPolicy })
-    this.logger.error(
-      { event: "idem.distributed.read.failed", op, policy: this.readErrorPolicy, err: (err as Error)?.message },
-      "Distributed idempotency read failed"
-    )
-    if (this.readErrorPolicy === "closed") throw err instanceof Error ? err : new Error(String(err))
+  private onReadError<R>(op: string, err: unknown, failOpenValue: R, policy: StoreReadErrorPolicy = this.readErrorPolicy): R {
+    this.metrics.incCounter(NEVO_METRIC_NAMES.storeErrors, { store: "idempotency", op, policy })
+    this.logger.error({ event: "idem.distributed.read.failed", op, policy, err: (err as Error)?.message }, "Distributed idempotency read failed")
+    if (policy === "closed") throw err instanceof Error ? err : new Error(String(err))
     return failOpenValue
   }
 
@@ -177,14 +184,14 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
       const res = await this.client.set(this.k(key), IDEMPOTENCY_IN_PROGRESS, { ttlMs, ifNotExists: true })
       if (res === "OK") return { acquired: true }
     } catch (err) {
-      return this.onReadError<IdempotencyClaim<T>>("claim", err, { acquired: true })
+      return this.onReadError<IdempotencyClaim<T>>("claim", err, { acquired: true }, this.claimErrorPolicy)
     }
     // Lost the race: something is already there. Surface a finished result if present.
     try {
       const existing = await this.readReal(key)
       return { acquired: false, existing }
     } catch (err) {
-      return this.onReadError<IdempotencyClaim<T>>("claim", err, { acquired: false })
+      return this.onReadError<IdempotencyClaim<T>>("claim", err, { acquired: false }, this.claimErrorPolicy)
     }
   }
 

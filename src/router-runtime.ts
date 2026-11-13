@@ -239,6 +239,11 @@ export class RouterRuntime {
     const devtoolsBus: DevToolsBus | null =
       options.devtools === false ? null : options.devtools instanceof Object ? (options.devtools as DevToolsBus) : getDevToolsBus()
 
+    // Live ACL holder: the DevTools UI mutates this object in place, and the
+    // dispatch pipeline reads it on every request, so an ACL edit takes effect
+    // without a restart. An empty config is equivalent to the old "no ACL".
+    const liveAccessControl: AccessControlConfig = { ...(options.accessControl ?? {}) }
+
     try {
       getDevToolsRegistry().registerService({
         serviceName: this.serviceName,
@@ -247,7 +252,7 @@ export class RouterRuntime {
         topic: this.eventPattern,
         capabilities: options.capabilities,
         methods: describeMethodsFromSignals(allSignals),
-        accessControl: options.accessControl
+        accessControl: liveAccessControl
       })
     } catch {}
 
@@ -262,7 +267,7 @@ export class RouterRuntime {
       rateLimiter: this.rateLimiter,
       idem,
       dlq: this.dlq,
-      accessControl: options.accessControl,
+      accessControl: liveAccessControl,
       before: classMeta.routerMeta.before,
       after: classMeta.routerMeta.after,
       disableBuiltinHandlers: options.disableBuiltinHandlers,

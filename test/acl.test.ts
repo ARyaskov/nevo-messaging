@@ -45,6 +45,14 @@ test("topic/method not matched falls back to allowAllByDefault", () => {
   assert.equal(isAccessAllowed(cfg2, "user-events", "user.getById", "frontend"), true)
 })
 
+test("deny-default admits only the exact built-in nevo.* methods", () => {
+  const cfg: AccessControlConfig = { rules: [{ topic: "t", method: "x", allow: ["frontend"] }] }
+  for (const builtin of ["nevo.contract", "nevo.health", "nevo.live", "nevo.ready"]) {
+    assert.equal(isAccessAllowed(cfg, "t", builtin, "anyone"), true, `${builtin} stays reachable`)
+  }
+  assert.equal(isAccessAllowed(cfg, "t", "nevo.unknown", "anyone"), false, "a forged nevo.* name must not bypass deny-default")
+})
+
 test("matched rule without allow falls through to allow", () => {
   const cfg: AccessControlConfig = {
     rules: [{ topic: "user-events", method: "ping", deny: ["evil"] }]

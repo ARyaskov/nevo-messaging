@@ -1,6 +1,7 @@
 "use client"
 
 import { useState } from "react"
+import { TokenInput, mutatingHeaders } from "../lib/mutate"
 
 interface Props {
   services: { name: string; methods: string[] }[]
@@ -25,15 +26,16 @@ export function ReplayConsole({ services }: Props) {
     }
     const res = await fetch("/api/replay", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: mutatingHeaders(),
       body: JSON.stringify({ service, method, params })
     })
     const json = await res.json().catch(() => null)
-    setStatus(res.ok ? `Queued: ${JSON.stringify(json)}` : `Error: ${res.status}`)
+    setStatus(res.ok ? `Queued: ${JSON.stringify(json)}` : res.status === 401 ? "Unauthorized: set the API token below." : `Error: ${res.status}`)
   }
 
   return (
     <section className="nv-card">
+      <TokenInput />
       <div className="nv-row" style={{ gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
         <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
           <span className="nv-muted" style={{ fontSize: 12 }}>

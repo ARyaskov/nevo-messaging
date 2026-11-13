@@ -8,13 +8,15 @@
 class GracefulShutdown {
   isShuttingDown(): boolean
   register(name: string, fn: () => Promise<void> | void): void
-  trackInflight<T>(task: Promise<T>): Promise<T>
-  drain(timeoutMs?: number): Promise<void>          // wait for in-flight to finish
-  shutdown(timeoutMs?: number): Promise<void>       // drain + run hooks
+  trackInflight<T>(task: Promise<T> | (() => Promise<T>)): Promise<T>
+  drain(timeoutMs?: number): Promise<void> // wait for in-flight to finish
+  shutdown(timeoutMs?: number): Promise<void> // drain + run hooks
 }
 ```
 
 Both `drain` and `shutdown` accept a per-call timeout (default `30_000`). There is no static config object — the timeout is passed at call time.
+
+Prefer the thunk form (`trackInflight(() => work())`): the task only starts if it can also be tracked, so a spawn racing `shutdown()` is rejected before it can do work. An already-started promise is tracked as-is and — during the drain window — still awaited by `drain()`.
 
 ## Wiring
 
@@ -24,10 +26,18 @@ import { GracefulShutdown } from "@riaskov/nevo-messaging"
 const shutdown = new GracefulShutdown()
 
 // Register hooks (run in registration order during shutdown())
-shutdown.register("stop subscriptions", async () => { await sub.unsubscribe() })
-shutdown.register("close nats client",  async () => { await client.close() })
-shutdown.register("flush outbox",       async () => { await outbox.flushOnce() })
-shutdown.register("close db",           async () => { await pool.end() })
+shutdown.register("stop subscriptions", async () => {
+  await sub.unsubscribe()
+})
+shutdown.register("close nats client", async () => {
+  await client.close()
+})
+shutdown.register("flush outbox", async () => {
+  await outbox.flushOnce()
+})
+shutdown.register("close db", async () => {
+  await pool.end()
+})
 
 // Track each handler invocation so drain() waits for them
 async function onMessage(msg) {
@@ -70,10 +80,14 @@ Pair with the [health registry](./health-checks.md):
 - Readiness — return `down` once `shutdown.isShuttingDown()` returns `true`, so the orchestrator stops sending new traffic.
 
 ```ts
-healthRegistry.register("not-draining", () => ({
-  status: shutdown.isShuttingDown() ? "down" : "ok",
-  message: shutdown.isShuttingDown() ? "draining" : "ready"
-}), { kind: "readiness" })
+healthRegistry.register(
+  "not-draining",
+  () => ({
+    status: shutdown.isShuttingDown() ? "down" : "ok",
+    message: shutdown.isShuttingDown() ? "draining" : "ready"
+  }),
+  { kind: "readiness" }
+)
 ```
 
 ## What is NOT provided

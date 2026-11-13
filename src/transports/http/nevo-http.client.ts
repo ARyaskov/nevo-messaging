@@ -224,10 +224,11 @@ export class NevoHttpClient {
     contentType: string,
     encoding: "gzip" | "deflate" | "zstd" | "identity",
     headers?: Record<string, string>,
-    timeoutMs?: number
+    timeoutMs?: number,
+    signal?: AbortSignal
   ): Promise<{ status: number; body: Uint8Array; headers: Record<string, string> }> {
     if (this.useUndici) {
-      return this.sendBufferUndici(url, body, contentType, encoding, headers, timeoutMs)
+      return this.sendBufferUndici(url, body, contentType, encoding, headers, timeoutMs, signal)
     }
     const u = new URL(url)
     const lib = u.protocol === "https:" ? https : http
@@ -296,6 +297,7 @@ export class NevoHttpClient {
         }
       })
       res.on("end", () => {
+        done()
         clearTimeout(deadline)
         const respBuf = preBuf ? preBuf.subarray(0, offset) : Buffer.concat(chunks)
         const respHeaders: Record<string, string> = {}
@@ -307,10 +309,18 @@ export class NevoHttpClient {
     const deadline = setTimeout(() => {
       req.destroy(new Error("timeout"))
     }, timeoutMs ?? this.timeoutMs)
+    // Hedging/cancellation: a losing copy must not keep the wire busy.
+    const onAbort = () => req.destroy(new Error("aborted"))
+    if (signal) {
+      if (signal.aborted) onAbort()
+      else signal.addEventListener("abort", onAbort, { once: true })
+    }
+    const done = () => signal?.removeEventListener("abort", onAbort)
     req.setTimeout(timeoutMs ?? this.timeoutMs, () => {
       req.destroy(new Error("timeout"))
     })
     req.on("error", (err) => {
+      done()
       clearTimeout(deadline)
       reject(err)
     })
@@ -335,7 +345,8 @@ export class NevoHttpClient {
     contentType: string,
     encoding: "gzip" | "deflate" | "zstd" | "identity",
     headers?: Record<string, string>,
-    timeoutMs?: number
+    timeoutMs?: number,
+    signal?: AbortSignal
   ): Promise<{ status: number; body: Uint8Array; headers: Record<string, string> }> {
     if (!this.undiciRequest || !this.undiciDispatcher) {
       throw new MessagingError(ErrorCode.INTERNAL, { message: "Undici dispatcher is not initialized" })
@@ -348,7 +359,7 @@ export class NevoHttpClient {
       const response = await this.undiciRequest(url, {
         method: "POST",
         dispatcher: this.undiciDispatcher,
-        signal: controller.signal,
+        signal: signal ? AbortSignal.any([controller.signal, signal]) : controller.signal,
         headersTimeout: timeout,
         bodyTimeout: timeout,
         headers: {
@@ -408,8 +419,8 @@ export class NevoHttpClient {
       params,
       opts,
       mapError: (err: any) => (err?.message === "timeout" ? new TimeoutError(serviceName, method, opts?.timeoutMs ?? this.timeoutMs) : err),
-      send: async (request) => {
-        const res = await this.sendBuffer(endpoint, request.payload, this.codec.contentType, request.encoding, undefined, opts?.timeoutMs)
+      send: async (request, _attempt, signal) => {
+        const res = await this.sendBuffer(endpoint, request.payload, this.codec.contentType, request.encoding, undefined, opts?.timeoutMs, signal)
         let envelope: unknown
         try {
           const decompressed = await this.decompressResponse(res)
@@ -446,8 +457,8 @@ export class NevoHttpClient {
       method,
       params,
       opts,
-      send: async (request) => {
-        const res = await this.sendBuffer(endpoint, request.payload, this.codec.contentType, request.encoding)
+      send: async (request, _attempt, signal) => {
+        const res = await this.sendBuffer(endpoint, request.payload, this.codec.contentType, request.encoding, undefined, opts?.timeoutMs, signal)
         if (res.status >= 400) throw httpStatusToError(res.status, serviceName, res.headers)
       }
     })
@@ -462,8 +473,8 @@ export class NevoHttpClient {
       params,
       opts: { ...opts, headers: { ...(opts?.headers ?? {}), "nevo-service": serviceName } },
       type: "sub",
-      send: async (request) => {
-        const res = await this.sendBuffer(endpoint, request.payload, this.codec.contentType, request.encoding)
+      send: async (request, _attempt, signal) => {
+        const res = await this.sendBuffer(endpoint, request.payload, this.codec.contentType, request.encoding, undefined, opts?.timeoutMs, signal)
         if (res.status >= 400) throw httpStatusToError(res.status, serviceName, res.headers)
       }
     })
@@ -479,8 +490,8 @@ export class NevoHttpClient {
       params,
       opts,
       type: "broadcast",
-      send: async (request) => {
-        const res = await this.sendBuffer(endpoint, request.payload, this.codec.contentType, request.encoding)
+      send: async (request, _attempt, signal) => {
+        const res = await this.sendBuffer(endpoint, request.payload, this.codec.contentType, request.encoding, undefined, opts?.timeoutMs, signal)
         if (res.status >= 400) throw httpStatusToError(res.status, DEFAULT_BROADCAST_TOPIC, res.headers)
       }
     })

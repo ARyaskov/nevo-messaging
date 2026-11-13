@@ -34,8 +34,14 @@ const gunzipAsync = promisify(gunzip)
 const deflateAsync = promisify(deflate)
 const inflateAsync = promisify(inflate)
 
-let zstdSync: { compress: (b: Uint8Array, opts?: object) => Buffer; decompress: (b: Uint8Array) => Buffer } | null = null
-let zstdAsync: { compress: (b: Uint8Array, opts?: object) => Promise<Buffer>; decompress: (b: Uint8Array) => Promise<Buffer> } | null = null
+let zstdSync: {
+  compress: (b: Uint8Array, opts?: object) => Buffer
+  decompress: (b: Uint8Array, opts?: { maxOutputLength?: number }) => Buffer
+} | null = null
+let zstdAsync: {
+  compress: (b: Uint8Array, opts?: object) => Promise<Buffer>
+  decompress: (b: Uint8Array, opts?: { maxOutputLength?: number }) => Promise<Buffer>
+} | null = null
 
 function tryLoadZstd(): boolean {
   if (zstdSync && zstdAsync) return true
@@ -44,7 +50,7 @@ function tryLoadZstd(): boolean {
     if (typeof z.zstdCompressSync === "function") {
       zstdSync = {
         compress: (b, opts) => z.zstdCompressSync(b, opts),
-        decompress: (b) => z.zstdDecompressSync(b)
+        decompress: (b, opts) => z.zstdDecompressSync(b, opts)
       }
       zstdAsync = {
         compress: promisify(z.zstdCompress),
@@ -138,7 +144,8 @@ function translateDecompressError(err: unknown, maxOutputBytes?: number): Error 
 // Reads the (optional) Frame_Content_Size from a zstd frame header. zstd has no
 // streaming output cap like zlib's maxOutputLength, so we reject up front when
 // the declared size already exceeds the limit. Returns null when the frame
-// omits the size (legal for streamed frames) — capCheck is the backstop there.
+// omits the size (legal for streamed frames) — the maxOutputLength option below
+// is the backstop there.
 function zstdContentSize(buf: Uint8Array): number | null {
   if (buf.byteLength < 5) return null
   if (buf[0] !== 0x28 || buf[1] !== 0xb5 || buf[2] !== 0x2f || buf[3] !== 0xfd) return null
@@ -170,7 +177,7 @@ export function maybeDecompress(buf: Uint8Array, encoding?: string, maxOutputByt
     if (encoding === "deflate") return capCheck(inflateSync(buf, zlibLimitOptions(maxOutputBytes)), maxOutputBytes)
     if (encoding === "zstd" && tryLoadZstd()) {
       assertZstdWithinCap(buf, maxOutputBytes)
-      return capCheck(zstdSync!.decompress(buf), maxOutputBytes)
+      return capCheck(zstdSync!.decompress(buf, { maxOutputLength: maxOutputBytes }), maxOutputBytes)
     }
   } catch (err) {
     throw translateDecompressError(err, maxOutputBytes)
@@ -192,7 +199,7 @@ export async function maybeDecompressAsync(buf: Uint8Array, encoding?: string, m
     if (encoding === "deflate") return capCheck(await inflateAsync(buf, zlibLimitOptions(maxOutputBytes)), maxOutputBytes)
     if (encoding === "zstd" && tryLoadZstd()) {
       assertZstdWithinCap(buf, maxOutputBytes)
-      return capCheck(await zstdAsync!.decompress(buf), maxOutputBytes)
+      return capCheck(await zstdAsync!.decompress(buf, { maxOutputLength: maxOutputBytes }), maxOutputBytes)
     }
   } catch (err) {
     throw translateDecompressError(err, maxOutputBytes)

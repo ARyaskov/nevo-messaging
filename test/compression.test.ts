@@ -60,6 +60,24 @@ test("round trip still works under the output cap", () => {
   assert.equal(Buffer.from(decoded).toString(), original.toString())
 })
 
+test("a legal FCS-less zstd frame over the cap is rejected before allocation", async () => {
+  const z = (await import("node:zlib")) as any
+  if (typeof z.zstdDecompressSync !== "function") return
+  const big = Buffer.alloc(5 * 1024 * 1024, 65)
+  const frame: Buffer = z.zstdCompressSync(big, { params: { [z.constants.ZSTD_c_contentSizeFlag]: 0 } })
+  // Frame header descriptor 0x00: no Frame_Content_Size is declared, so the
+  // header pre-check cannot see the size — only the decompress cap can.
+  assert.equal(frame[4], 0x00)
+  await assert.rejects(
+    () => maybeDecompressAsync(frame, "zstd", 1024),
+    (err: unknown) => err instanceof PayloadTooLargeError
+  )
+  assert.throws(
+    () => maybeDecompress(frame, "zstd", 1024),
+    (err: unknown) => err instanceof PayloadTooLargeError
+  )
+})
+
 test("async round trip works under the output cap", async () => {
   const opts = resolveCompressionOptions({ enabled: true, algorithm: "gzip", threshold: 1 })
   const original = Buffer.from("hello world ".repeat(1000))

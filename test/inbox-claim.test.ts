@@ -2,6 +2,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { Inbox, InMemoryInboxStore } from "../src/common/inbox"
 import { RedisInboxStore, type InboxRedisClient } from "../src/common/inbox-redis"
+import { PgInboxStore, type PgClient } from "../src/common/pg-stores"
 
 function fakeRedis(): InboxRedisClient & { storage: Map<string, string> } {
   const storage = new Map<string, string>()
@@ -113,4 +114,36 @@ test("RedisInboxStore.claim: fail-closed rethrows when the store is down", async
   }
   const closed = new RedisInboxStore({ client: boom, readErrorPolicy: "closed" })
   await assert.rejects(() => closed.claim("u1"))
+})
+
+test("dedupe's commit wrapper threads the caller's transaction into markSeen", async () => {
+  const seen: unknown[] = []
+  const store = {
+    hasSeen: async () => false,
+    markSeen: async (_uuid: string, _result: unknown, opts?: { tx?: unknown }) => {
+      seen.push(opts?.tx)
+    },
+    getResult: async () => undefined
+  }
+  const inbox = new Inbox({ store: store as any })
+  const txClient = { id: "txn-1" }
+  await inbox.dedupe("evt-tx", async () => "ok", {
+    // The user's commit wrapper receives the tx handle and forwards it, so the
+    // store writes the dedup record on the business-transaction connection.
+    tx: async (commit) => commit(txClient)
+  })
+  assert.equal(seen.length, 1)
+  assert.deepEqual(seen[0], txClient)
+})
+
+test("PgInboxStore.markSeen writes through the supplied transaction client", async () => {
+  const queries: { client: PgClient; sql: string }[] = []
+  const tx: PgClient = { query: (sql: any) => (queries.push({ client: tx, sql }), Promise.resolve({ rows: [] })) }
+  const store = new PgInboxStore({
+    client: { query: (sql: any) => (queries.push({ client: undefined as any, sql }), Promise.resolve({ rows: [] })) }
+  })
+  await store.markSeen("u-tx", { ok: true }, { tx })
+  assert.equal(queries.length, 1)
+  assert.equal(queries[0].client, tx, "the record lands on the caller's transaction connection")
+  assert.match(queries[0].sql, /INSERT INTO/)
 })

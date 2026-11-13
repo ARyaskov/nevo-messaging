@@ -132,3 +132,18 @@ test("readErrorPolicy=open claim falls open to acquired (execute) when the store
   const c = await open.claim("k")
   assert.equal(c.acquired, true)
 })
+
+test("claim fails closed by default when the store is down", async () => {
+  const boom: IdempotencyRedisLike = {
+    async get() {
+      return null
+    },
+    async set() {
+      throw new Error("ECONNREFUSED")
+    }
+  }
+  // No explicit policy: a down store must not silently disable dedup by
+  // handing { acquired: true } to every caller.
+  const store = new RedisIdempotencyStore({ client: boom, enabled: true })
+  await assert.rejects(() => store.claim("k"), /ECONNREFUSED/)
+})

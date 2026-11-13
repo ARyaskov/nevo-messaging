@@ -193,14 +193,10 @@ export async function runDispatchPipeline(cfg: DispatchPipelineConfig, req: Disp
     }
 
     const suppliedIdemKey = meta?.idempotencyKey
-    idemKey = serverIdempotencyKey({
-      callerService,
-      tenantId: meta?.tenantId,
-      method,
-      suppliedKey: suppliedIdemKey,
-      envelopeUuid: uuid
-    })
-    // Only a caller-supplied key can be reused across payloads; an envelope uuid can't.
+    // Only a caller-supplied key leases the dedup runtime: an envelope uuid is
+    // unique per send, so keying on it paid a leader lease + commit on every
+    // request with no dedup benefit (retries mint fresh uuids).
+    idemKey = suppliedIdemKey ? serverIdempotencyKey({ callerService, tenantId: meta?.tenantId, method, suppliedKey: suppliedIdemKey }) : undefined
     idemFingerprint = suppliedIdemKey ? payloadFingerprint(params) : undefined
     if (idemKey && cfg.idem.isEnabled()) {
       const began = await cfg.idem.begin(idemKey, idemFingerprint)

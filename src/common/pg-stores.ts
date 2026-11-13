@@ -279,8 +279,12 @@ export class PgInboxStore implements InboxStore {
     return this.hasSeen(uuid)
   }
 
-  async markSeen(uuid: string, result?: unknown): Promise<void> {
-    await this.client.query(
+  async markSeen(uuid: string, result?: unknown, opts?: { tx?: unknown }): Promise<void> {
+    // `tx` is the caller's transaction connection (see Inbox.dedupe commit wrapper):
+    // writing through it puts the dedup record in the business transaction, which
+    // is what makes the projection exactly-once. Falls back to the store client.
+    const client = (opts?.tx as PgClient | undefined) ?? this.client
+    await client.query(
       `INSERT INTO ${this.table} AS t (uuid, result, status) VALUES ($1, $2::jsonb, 'done')
        ON CONFLICT (uuid) DO UPDATE SET result = EXCLUDED.result, status = 'done', seen_at = NOW()
          WHERE t.status = 'pending'`,

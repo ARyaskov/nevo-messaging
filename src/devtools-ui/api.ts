@@ -1,6 +1,8 @@
 import type { IncomingMessage, ServerResponse } from "node:http"
+import { createHash, timingSafeEqual } from "node:crypto"
 import { getDevToolsBus } from "../common/devtools"
 import { getDevToolsRegistry } from "../common/devtools-registry"
+import { invalidateCompiledAccessControl } from "../common/access-control"
 import { configureSource, getRegistry, snapshot, sourceHealth } from "./source"
 
 const SSE_KEEP_ALIVE_MS = 15000
@@ -97,12 +99,46 @@ interface ConfigUpdate {
   }
 }
 
+/** Mutating endpoints require this header to match when a token is configured. */
+const MUTATING_TOKEN_HEADER = "x-nevo-devtools-token"
+
+function mutatingTokenMatches(supplied: string | undefined, expected: string): boolean {
+  // An empty configured token (non-loopback bind without a token) must never
+  // authenticate, and an empty header value must never match either — both
+  // would otherwise hash-compare equal and bypass the gate.
+  if (expected.length === 0 || supplied === undefined || supplied.length === 0) return false
+  const a = createHash("sha256").update(supplied).digest()
+  const b = createHash("sha256").update(expected).digest()
+  return timingSafeEqual(a, b)
+}
+
+export interface DevToolsApiAuth {
+  /** When set, POST /api/config and POST /api/replay must present the token header. */
+  mutatingToken?: string
+}
+
+/** Non-loopback binds must require a token for the mutating endpoints. */
+export function mutatingEndpointRequiresAuth(url: URL): boolean {
+  return url.pathname === "/api/replay" || url.pathname === "/api/config"
+}
+
+function rejectMutatingWithoutToken(req: IncomingMessage, res: ServerResponse, url: URL, auth: DevToolsApiAuth | undefined): boolean {
+  if (auth?.mutatingToken === undefined) return false
+  if (!mutatingEndpointRequiresAuth(url) || (req.method ?? "GET") !== "POST") return false
+  const supplied = Array.isArray(req.headers[MUTATING_TOKEN_HEADER]) ? undefined : (req.headers[MUTATING_TOKEN_HEADER] as string | undefined)
+  if (mutatingTokenMatches(supplied, auth.mutatingToken)) return false
+  sendJson(res, 401, { ok: false, error: "mutating endpoint requires a valid x-nevo-devtools-token header" })
+  return true
+}
+
 /**
  * Routes `/api/*`. Returns false when the path is not an API route, so the
  * caller can fall through to the static handler.
  */
-export async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
+export async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, auth?: DevToolsApiAuth): Promise<boolean> {
   if (!url.pathname.startsWith("/api/")) return false
+
+  if (rejectMutatingWithoutToken(req, res, url, auth)) return true
 
   const method = req.method ?? "GET"
   if (method === "POST" && !isJsonRequest(req)) {
@@ -184,7 +220,21 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse, url: 
         sendJson(res, 404, { ok: false, error: "unknown service" })
         return true
       }
-      if (body.accessControl) reg.registerService({ ...info, accessControl: body.accessControl })
+      if (body.accessControl) {
+        const live = info.accessControl
+        if (live) {
+          // Mutate the config object the router's dispatch pipeline still reads,
+          // then drop the compiled-ACL cache: the edit takes effect live.
+          const update = body.accessControl
+          live.rules = update.rules ?? []
+          if (update.allowAllByDefault !== undefined) live.allowAllByDefault = update.allowAllByDefault
+          if (update.logDenied !== undefined) live.logDenied = update.logDenied
+          invalidateCompiledAccessControl(live)
+        }
+        // Keep the registry's metadata view in sync when no live object exists
+        // (e.g. services registered outside a signal router).
+        reg.registerService({ ...info, accessControl: live ?? body.accessControl })
+      }
       sendJson(res, 200, { ok: true, applied: { service: body.service } })
       return true
     }

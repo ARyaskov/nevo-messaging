@@ -2,9 +2,15 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { LruIdempotencyCache } from "./idempotency"
 import type { IdempotencyClaim } from "./idempotency-store"
 
+export interface InboxStoreMarkSeenOptions {
+  /** Store-native transaction/connection handle (e.g. a pg client inside BEGIN). */
+  tx?: unknown
+}
+
 export interface InboxStore {
   hasSeen(uuid: string): Promise<boolean>
-  markSeen(uuid: string, result?: unknown): Promise<void>
+  /** Stores that support transactional writes honour `opts.tx` for the record write. */
+  markSeen(uuid: string, result?: unknown, opts?: InboxStoreMarkSeenOptions): Promise<void>
   getResult(uuid: string): Promise<unknown | undefined>
   /** Atomically reserve `uuid` for processing; single winner gets `{ acquired: true }`. Optional. */
   claim?(uuid: string, opts?: { ttlMs?: number }): Promise<IdempotencyClaim<unknown>>
@@ -58,7 +64,7 @@ export class Inbox {
     return this.enabled
   }
 
-  async dedupe<T>(uuid: string, handler: () => Promise<T>, opts?: { tx?: (commit: () => Promise<void>) => Promise<void> }): Promise<T> {
+  async dedupe<T>(uuid: string, handler: () => Promise<T>, opts?: { tx?: (commit: (tx?: unknown) => Promise<void>) => Promise<void> }): Promise<T> {
     if (!this.enabled) return handler()
 
     // In-process leader election: one caller per uuid leads, the rest await it.
@@ -98,8 +104,8 @@ export class Inbox {
 
       const result = await handler()
       if (opts?.tx) {
-        await opts.tx(async () => {
-          await this.store.markSeen(uuid, result)
+        await opts.tx(async (tx) => {
+          await this.store.markSeen(uuid, result, { tx })
         })
       } else {
         await this.store.markSeen(uuid, result)

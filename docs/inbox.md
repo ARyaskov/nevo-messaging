@@ -25,9 +25,9 @@ async function onOrderPlaced(envelope: { uuid: string; payload: OrderPayload }) 
 `Inbox.dedupe(uuid, handler, opts?)`:
 
 - Concurrent calls for the same `uuid` are collapsed by an **in-process leader election**: the first caller leads and runs the handler; the rest await its result instead of re-running.
-- For cross-process dedup, if the store implements the optional `claim(uuid)` the leader atomically reserves the key (claim-before-execute) so duplicates on *other* replicas also wait for the winner's result. Stores without `claim()` fall back to the racy `hasSeen` → `getResult` / `markSeen` check-then-act.
+- For cross-process dedup, if the store implements the optional `claim(uuid)` the leader atomically reserves the key (claim-before-execute) so duplicates on _other_ replicas also wait for the winner's result. Stores without `claim()` fall back to the racy `hasSeen` → `getResult` / `markSeen` check-then-act.
 - On a hit the stored result is returned and the handler is skipped; otherwise the handler runs and `store.markSeen(uuid, result)` records the outcome.
-- `opts.tx` is a **commit wrapper**, not a connection handle: its type is `(commit: () => Promise<void>) => Promise<void>`. The inbox calls `opts.tx(commit)` and, inside your wrapper, you run your projection and invoke `commit()` (which performs `markSeen`) within the same DB transaction — so the dedup record and the projection commit atomically. (This differs from the older `{ tx: connection }` shape.)
+- `opts.tx` is a **commit wrapper**, not a connection handle: its type is `(commit: (tx?: unknown) => Promise<void>) => Promise<void>`. The inbox calls `opts.tx(commit)` and, inside your wrapper, you run your projection and invoke `commit(tx)` (which performs `markSeen`) — pass your transaction connection as `tx` so stores that support it (e.g. `PgInboxStore`) write the dedup record inside the same transaction as the projection. (This differs from the older `{ tx: connection }` shape.)
 
 ## The `InboxStore` interface
 
@@ -44,7 +44,7 @@ interface InboxStore {
 }
 ```
 
-Note that `markSeen` takes no `opts.tx` — transactional commit is wired through `Inbox.dedupe(uuid, handler, { tx })` (see above), not through the store method. The built-in `InMemoryInboxStore` is fine for tests and short retry windows; for durability use a shipped store (below) or implement the interface over your database.
+Note that `markSeen` takes no `opts.tx` itself — transactional commit is wired through `Inbox.dedupe(uuid, handler, { tx })` (see above); `PgInboxStore.markSeen(uuid, result, { tx })` accepts an optional store-native transaction handle that the commit wrapper forwards. The built-in `InMemoryInboxStore` is fine for tests and short retry windows; for durability use a shipped store (below) or implement the interface over your database.
 
 ## Shipped durable stores
 
@@ -76,13 +76,20 @@ Prefer the shipped `PgInboxStore` over a hand-rolled one. To make the projection
 const client = await pool.connect()
 await client.query("BEGIN")
 try {
-  const result = await inbox.dedupe(env.uuid, async () => {
-    await applyProjection(client, env.payload)   // your write, on the txn connection
-    return { ok: true }
-  }, {
-    // The inbox invokes this with `commit`; run it inside the same transaction.
-    tx: async (commit) => { await commit() }
-  })
+  const result = await inbox.dedupe(
+    env.uuid,
+    async () => {
+      await applyProjection(client, env.payload) // your write, on the txn connection
+      return { ok: true }
+    },
+    {
+      // The inbox invokes this with `commit`; pass the transaction client through
+      // so markSeen writes on the same connection inside your BEGIN…COMMIT.
+      tx: async (commit) => {
+        await commit(client)
+      }
+    }
+  )
   await client.query("COMMIT")
   return result
 } catch (e) {
@@ -93,7 +100,7 @@ try {
 }
 ```
 
-If you need a store that writes `markSeen` on the *very same connection* as your projection (rather than the store's own connection), implement `InboxStore` over that connection — the shape is small. But for the common case the shipped `PgInboxStore` plus the commit-wrapper above is enough.
+If you need a store that writes `markSeen` on the _very same connection_ as your projection (rather than the store's own connection), implement `InboxStore` over that connection — the shape is small. But for the common case the shipped `PgInboxStore` plus the commit-wrapper above is enough.
 
 ## Difference from the idempotency cache
 

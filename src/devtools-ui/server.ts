@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http"
-import { handleApi } from "./api"
+import { handleApi, type DevToolsApiAuth } from "./api"
 import { assertAssetsPresent, handleStatic } from "./static"
 import { configureSource, teardownSource, type DevToolsUiSourceOptions } from "./source"
 
@@ -14,6 +14,12 @@ export interface DevToolsUiServerOptions extends DevToolsUiSourceOptions {
    * loopback names when bound to loopback, which blocks DNS-rebinding; any host otherwise.
    */
   allowedHosts?: string[]
+  /**
+   * Token required by the mutating endpoints (POST /api/config, POST /api/replay),
+   * sent as the `x-nevo-devtools-token` header. Mandatory when binding a
+   * non-loopback host; without it those endpoints answer 401 there.
+   */
+  authToken?: string
 }
 
 const LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "::1"]
@@ -76,6 +82,8 @@ export interface DevToolsUiServerHandle {
   port: number
   host: string
   url: string
+  /** Echoed from options; required in the token header for mutating endpoints when set. */
+  mutatingToken?: string
   close: () => Promise<void>
 }
 
@@ -95,6 +103,11 @@ export async function startDevToolsUiServer(opts: DevToolsUiServerOptions = {}):
   configureSource(opts)
 
   const guard = createDevToolsRequestGuard(host, opts.allowedHosts)
+  const loopback = LOOPBACK_HOSTS.includes(host.toLowerCase())
+  // A non-loopback bind exposes the dashboard to the network: the mutating
+  // endpoints (ACL rewrite, replay) then require a shared token.
+  const mutatingToken = opts.authToken ?? (loopback ? undefined : "")
+  const apiAuth: DevToolsApiAuth = { mutatingToken }
 
   const server = createServer((req, res) => {
     if (!guard(req, res)) return
@@ -110,7 +123,7 @@ export async function startDevToolsUiServer(opts: DevToolsUiServerOptions = {}):
 
     void (async () => {
       try {
-        if (await handleApi(req, res, url)) return
+        if (await handleApi(req, res, url, apiAuth)) return
         await handleStatic(res, url.pathname)
       } catch (err) {
         if (res.headersSent) {
@@ -143,6 +156,7 @@ export async function startDevToolsUiServer(opts: DevToolsUiServerOptions = {}):
     port: actualPort,
     host,
     url: `http://${host === "0.0.0.0" ? "127.0.0.1" : host}:${actualPort}`,
+    mutatingToken: mutatingToken || undefined,
     close: async () => {
       await teardownSource()
       await new Promise<void>((resolve) => server.close(() => resolve()))

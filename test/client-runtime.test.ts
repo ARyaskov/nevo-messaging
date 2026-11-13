@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { ClientRuntime, type EncodedRequest } from "../src/common/client-runtime"
+import { ClientRuntime, runClientPipeline, type EncodedRequest } from "../src/common/client-runtime"
 import { JsonCodec } from "../src/common/codec"
 import { MessagingError } from "../src/common/errors"
 import { ErrorCode } from "../src/common/error-code"
@@ -65,6 +65,24 @@ test("query caches by idempotency key, scoped to service and method", async () =
   assert.equal(await call("svc-a", "m"), 1, "second identical call is served from cache")
   assert.equal(await call("svc-b", "m"), 2, "another service must not read the first one's entry")
   assert.equal(await call("svc-a", "other"), 3, "another method must not read it either")
+})
+
+test("same idempotency key with different params is a conflict, not a stale hit", async () => {
+  const r = runtime({ idempotency: { enabled: true, ttlMs: 60_000 } })
+  const call = (params: unknown) =>
+    r.query<number>({
+      serviceName: "svc",
+      method: "m",
+      params,
+      opts: { idempotencyKey: "same-key" },
+      send: async (request) => okEnvelope(request.envelope.params)
+    })
+
+  assert.deepEqual(await call({ n: 1 }), { n: 1 })
+  await assert.rejects(
+    () => call({ n: 2 }),
+    (err: unknown) => err instanceof MessagingError && err.code === ErrorCode.IDEMPOTENCY_KEY_CONFLICT
+  )
 })
 
 test("query records exactly one breaker outcome per logical call despite retries", async () => {
@@ -170,11 +188,30 @@ test("mapError translates a transport-native failure before retry classification
   assert.equal(attempts, 2, "the mapped error is retryable, so the retry loop saw it as such")
 })
 
-test("emit runs under the breaker and retry policy", async () => {
+test("emit runs under the breaker and retry policy when an idempotency key is supplied", async () => {
   const r = runtime({
     retry: { maxAttempts: 2, baseMs: 1, maxMs: 2, jitter: false },
     circuitBreaker: { enabled: true, failureThreshold: 5, resetTimeoutMs: 60_000 }
   })
+  let attempts = 0
+  await assert.rejects(() =>
+    r.emit({
+      serviceName: "svc",
+      method: "m",
+      params: {},
+      opts: { idempotencyKey: "k" },
+      send: async () => {
+        attempts++
+        throw new MessagingError(ErrorCode.SERVICE_UNAVAILABLE, { message: "down", retryable: true })
+      }
+    })
+  )
+  assert.equal(attempts, 2)
+  assert.equal(r.circuitBreaker.snapshot()["svc:m"].failures, 1)
+})
+
+test("emit without an explicit idempotency key never retries", async () => {
+  const r = runtime({ retry: { maxAttempts: 3, baseMs: 1, maxMs: 2, jitter: false } })
   let attempts = 0
   await assert.rejects(() =>
     r.emit({
@@ -187,8 +224,7 @@ test("emit runs under the breaker and retry policy", async () => {
       }
     })
   )
-  assert.equal(attempts, 2)
-  assert.equal(r.circuitBreaker.snapshot()["svc:m"].failures, 1)
+  assert.equal(attempts, 1, "a retried one-way emit could double-execute non-idempotent effects")
 })
 
 test("emit stamps a stable idempotency key so a retried publish can be deduped", async () => {
@@ -279,4 +315,53 @@ test("decode round-trips what encode produced", async () => {
   const encoded = r.encodeSync("m", { hello: "world" }, "query")
   const decoded: any = await r.decode(encoded.payload)
   assert.deepEqual(decoded.params, { hello: "world" })
+})
+
+test("an aborted hedge copy does not dispatch its send", async () => {
+  const r = runtime()
+  let dispatched = 0
+  const send = async (attempt: number, signal?: AbortSignal) => {
+    // The "wire dispatch" happens only after this wait; an aborted copy must
+    // never reach it.
+    await new Promise<void>((resolve, reject) => {
+      if (signal?.aborted) return reject(new MessagingError(ErrorCode.CANCELLED, { message: "aborted before dispatch" }))
+      const timer = setTimeout(resolve, attempt === 1 ? 5 : 200)
+      signal?.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(timer)
+          reject(new MessagingError(ErrorCode.CANCELLED, { message: "aborted before dispatch" }))
+        },
+        { once: true }
+      )
+    })
+    dispatched++
+    return okEnvelope(`copy-${attempt}`)
+  }
+  const result = await runClientPipeline(
+    r.circuitBreaker,
+    { enabled: false, maxAttempts: 1, baseMs: 1, maxMs: 2, jitter: false, retryOnCodes: new Set() },
+    "svc:m",
+    (attempt, signal) => send(attempt, signal),
+    { hedge: { enabled: true, copies: 2, delayMs: 1 } }
+  )
+  assert.deepEqual((result as { params: { result: string } }).params.result, "copy-1")
+  assert.equal(dispatched, 1, "the losing hedge copy was cancelled before dispatching")
+})
+
+test("runClientPipeline threads the resilience signal into the attempt", async () => {
+  const r = runtime()
+  let received: AbortSignal | undefined
+  const ctrl = new AbortController()
+  await runClientPipeline(
+    r.circuitBreaker,
+    { enabled: false, maxAttempts: 1, baseMs: 1, maxMs: 2, jitter: false, retryOnCodes: new Set() },
+    "svc:m",
+    async (attempt, signal) => {
+      received = signal
+      return "ok"
+    },
+    { adaptive: { enabled: true, minRetries: 1, maxRetries: 1, targetP99Ms: 100, windowMs: 60_000 } }
+  )
+  assert.ok(received instanceof AbortSignal, "the attempt must receive the caller's cancellation signal")
 })

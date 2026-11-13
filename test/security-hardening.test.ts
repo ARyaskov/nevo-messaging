@@ -49,12 +49,12 @@ test("gateway CORS never pairs a wildcard with credentials", () => {
   assert.equal(runGateway({ origin: "*", credentials: true }, "https://x.example")["access-control-allow-origin"], undefined)
 })
 
-async function startDevToolsApi(): Promise<{ server: Server; port: number }> {
+async function startDevToolsApi(auth?: Parameters<typeof handleApi>[3]): Promise<{ server: Server; port: number }> {
   const guard = createDevToolsRequestGuard("127.0.0.1")
   const server = createServer((req, res) => {
     if (!guard(req, res)) return
     const url = new URL(req.url ?? "/", "http://127.0.0.1")
-    void handleApi(req, res, url).then((handled) => {
+    void handleApi(req, res, url, auth).then((handled) => {
       if (!handled) res.writeHead(404).end()
     })
   })
@@ -148,4 +148,126 @@ test("socket.io router refuses explicit joins into user:* rooms", async () => {
     client.close()
     await ctrl.onModuleDestroy()
   }
+})
+
+test("devtools mutating endpoints require the token when one is configured", async () => {
+  const { server, port } = await startDevToolsApi({ mutatingToken: "secret-token" })
+  const body = JSON.stringify({ service: "user", method: "user.get" })
+  try {
+    const noToken = await send(port, {
+      method: "POST",
+      path: "/api/replay",
+      headers: { host: `127.0.0.1:${port}`, "content-type": "application/json" },
+      body
+    })
+    assert.equal(noToken.status, 401)
+
+    const wrongToken = await send(port, {
+      method: "POST",
+      path: "/api/config",
+      headers: { host: `127.0.0.1:${port}`, "content-type": "application/json", "x-nevo-devtools-token": "nope" },
+      body: JSON.stringify({ service: "user" })
+    })
+    assert.equal(wrongToken.status, 401)
+
+    // An empty header value must never authenticate.
+    const emptyHeader = await send(port, {
+      method: "POST",
+      path: "/api/config",
+      headers: { host: `127.0.0.1:${port}`, "content-type": "application/json", "x-nevo-devtools-token": "" },
+      body: JSON.stringify({ service: "user" })
+    })
+    assert.equal(emptyHeader.status, 401)
+
+    const ok = await send(port, {
+      method: "POST",
+      path: "/api/replay",
+      headers: { host: `127.0.0.1:${port}`, "content-type": "application/json", "x-nevo-devtools-token": "secret-token" },
+      body
+    })
+    assert.equal(ok.status, 200)
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+})
+
+test("devtools mutations fail closed when no token is configured (empty-token bypass)", async () => {
+  // Non-loopback bind without a token: the server hands handleApi an empty
+  // token, which must be unmatchable — any header value, empty included,
+  // gets 401.
+  const { server, port } = await startDevToolsApi({ mutatingToken: "" })
+  const body = JSON.stringify({ service: "user", method: "user.get" })
+  try {
+    for (const tokenHeader of [{}, { "x-nevo-devtools-token": "" }, { "x-nevo-devtools-token": "anything" }]) {
+      const res = await send(port, {
+        method: "POST",
+        path: "/api/replay",
+        headers: { host: `127.0.0.1:${port}`, "content-type": "application/json", ...tokenHeader },
+        body
+      })
+      assert.equal(res.status, 401, `mutation must stay rejected (header: ${JSON.stringify(tokenHeader)})`)
+    }
+    // Read endpoints are unaffected.
+    const read = await send(port, { path: "/api/health", headers: { host: `127.0.0.1:${port}` } })
+    assert.equal(read.status, 200)
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+})
+
+test("a devtools ACL edit binds to the router's live access-control object", async () => {
+  const { addSignalMetadata } = await import("../src/signal.decorator")
+  const { createSignalRouterDecorator, bindSignalRouterForTesting } = await import("../src/signal-router.utils")
+  const { getDevToolsRegistry } = await import("../src/common/devtools-registry")
+
+  let calls = 0
+  class Svc {
+    async run() {
+      calls++
+      return "ok"
+    }
+  }
+  class Ctrl {
+    svc = new Svc()
+  }
+  addSignalMetadata(Ctrl, "acllive.run", "run")
+  const opts: any = { serviceName: "acllive", tracing: { enabled: false }, devtools: false, accessControl: {} }
+  const decorate = createSignalRouterDecorator(
+    Svc,
+    opts,
+    (data: any) => ({ method: data.method, params: data.params, uuid: data.uuid, meta: data.meta }),
+    () => {}
+  )
+  decorate(Ctrl)
+  bindSignalRouterForTesting(Ctrl, opts)
+  const ctrl: any = new Ctrl()
+  const handle = (data: any) => ctrl.handleSignalMessage(data) as Promise<any>
+
+  const msg = { method: "acllive.run", params: {}, uuid: "u1", meta: { service: "frontend" } }
+  await handle(msg)
+  assert.equal(calls, 1, "empty live config allows all")
+
+  // Rewrite the ACL through the DevTools API against the same service name.
+  const reg = getDevToolsRegistry()
+  const { server, port } = await startDevToolsApi()
+  try {
+    const res = await send(port, {
+      method: "POST",
+      path: "/api/config",
+      headers: { host: `127.0.0.1:${port}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        service: "acllive",
+        accessControl: { rules: [{ topic: "acllive-events", method: "*", deny: ["*"] }], allowAllByDefault: false }
+      })
+    })
+    assert.equal(res.status, 200)
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+
+  // The live object mutated above is the one the dispatch pipeline reads.
+  const denied = await handle({ ...msg, uuid: "u2" })
+  assert.equal(denied.params.result, "error")
+  assert.equal(denied.params.error.code, 1, "UNAUTHORIZED after the live ACL edit")
+  assert.equal(calls, 1, "the denied request never reached the handler")
 })

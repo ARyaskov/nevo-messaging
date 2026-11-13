@@ -1,6 +1,7 @@
 "use client"
 
 import { useMemo, useState } from "react"
+import { TokenInput, mutatingHeaders } from "../lib/mutate"
 import type { ServiceInfo } from "../types"
 
 interface Props {
@@ -24,16 +25,23 @@ export function ConfigEditor({ services }: Props) {
     }
     const res = await fetch("/api/config", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: mutatingHeaders(),
       body: JSON.stringify({ service: selected, accessControl: parsed })
     })
-    setStatus(res.ok ? "Applied (in-process). Persistent storage not implemented — restart will revert." : `Error: ${res.status}`)
+    setStatus(
+      res.ok
+        ? "Applied (in-process). Persistent storage not implemented — restart will revert."
+        : res.status === 401
+          ? "Unauthorized: set the API token below (required on non-loopback binds)."
+          : `Error: ${res.status}`
+    )
   }
 
   if (!services.length) return <div className="nv-empty">No services registered yet.</div>
 
   return (
     <>
+      <TokenInput />
       <label style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 12 }}>
         <span className="nv-muted" style={{ fontSize: 12 }}>
           Service

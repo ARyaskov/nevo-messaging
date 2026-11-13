@@ -129,10 +129,11 @@ function makeFakeClient(responses: Record<string, unknown>): QueryEmitClient & {
   }
 }
 
-test("typed() returns the same instance (pure compile-time wrapper)", () => {
+test("typed() returns a facade exposing the raw client via _raw", () => {
   const fake = makeFakeClient({})
   const api = typed<SampleContract>(fake)
-  assert.equal(api, fake)
+  assert.notEqual(api, fake)
+  assert.equal(api._raw, fake, "the raw client stays reachable behind an explicit _raw")
 })
 
 test("typed query forwards service/method/params/opts and returns the result", async () => {
@@ -167,9 +168,9 @@ test("typed emit forwards verbatim and resolves to undefined", async () => {
   })
 })
 
-test("typed() preserves access to the underlying client's other methods", async () => {
-  // A client with an extra method beyond query/emit stays usable through the
-  // intersection type returned by typed().
+test("typed() exposes extra client methods only through _raw", async () => {
+  // A client with an extra method beyond query/emit: the facade no longer
+  // intersects the raw type, so callers reach it explicitly via `_raw`.
   const extra = {
     ...makeFakeClient({ "user.create": { id: "42" } }),
     getInstanceId(): string {
@@ -179,8 +180,13 @@ test("typed() preserves access to the underlying client's other methods", async 
   const api = typed<SampleContract, typeof extra>(extra)
   const created = await api.query("user", "user.create", { name: "Grace" })
   assert.deepEqual(created, { id: "42" })
-  assert.equal(api.getInstanceId(), "inst-1")
+  assert.equal(api._raw.getInstanceId(), "inst-1")
 })
+
+// The raw query(service, anyString) overload must NOT leak through the facade:
+// unknown methods fail at compile time, so the negative case below is already
+// covered by `_negativeTypeChecks` ("user.unknown"). The raw client itself
+// keeps its permissive signature via `_raw`.
 
 // ---------------------------------------------------------------------------
 // Codegen wiring: the generated module must import TypedClient and emit a

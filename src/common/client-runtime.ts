@@ -20,7 +20,8 @@ import { DEFAULT_MAX_PAYLOAD_BYTES, enforcePayloadLimit } from "./payload-limit"
 import { getDefaultTracer, NevoTracer } from "./tracing"
 import { getDefaultMetrics, NEVO_METRIC_NAMES, MetricsRegistry, methodLabel } from "./metrics"
 import { GracefulShutdown } from "./graceful-shutdown"
-import { LruIdempotencyCache, clientIdempotencyKey } from "./idempotency"
+import { LruIdempotencyCache, clientIdempotencyKey, payloadFingerprint } from "./idempotency"
+import { idempotencyEnvelope, type IdempotencyEnvelope } from "./idempotency-store"
 import { formatMethod, DEFAULT_METHOD_VERSION } from "./version"
 import { getDevToolsBus, DevToolsBus, publishClientEvent } from "./devtools"
 import { uuidv7 } from "./uuid"
@@ -49,7 +50,7 @@ export async function runClientPipeline<T>(
   circuitBreaker: CircuitBreakerRegistry,
   retryOptions: ResolvedRetryOptions,
   key: string,
-  attempt: (attempt: number) => Promise<T>,
+  attempt: (attempt: number, signal?: AbortSignal) => Promise<T>,
   resilience?: CompiledResilience
 ): Promise<T> {
   circuitBreaker.before(key)
@@ -61,7 +62,7 @@ export async function runClientPipeline<T>(
           ? applyResilience<T>({
               config: resilience,
               ctx: { key },
-              invoke: () => attempt(retryAttempt),
+              invoke: (_attempt, signal) => attempt(retryAttempt, signal),
               budget
             })
           : budget.run(() => attempt(retryAttempt)),
@@ -83,9 +84,9 @@ export interface ClientRuntimeOptions {
   compressionCapable?: boolean
 }
 
-export type EnvelopeSender = (request: EncodedRequest, attempt: number) => Promise<unknown>
+export type EnvelopeSender = (request: EncodedRequest, attempt: number, signal?: AbortSignal) => Promise<unknown>
 
-export type EnvelopeDispatcher = (request: EncodedRequest, attempt: number) => Promise<void>
+export type EnvelopeDispatcher = (request: EncodedRequest, attempt: number, signal?: AbortSignal) => Promise<void>
 
 export interface ClientQuerySpec {
   serviceName: string
@@ -121,7 +122,7 @@ export class ClientRuntime {
   readonly metrics: MetricsRegistry
   readonly shutdown = new GracefulShutdown()
   readonly maxPayloadBytes: number
-  readonly idempotencyCache: LruIdempotencyCache<unknown>
+  readonly idempotencyCache: LruIdempotencyCache<IdempotencyEnvelope<unknown>>
   readonly devtoolsBus: DevToolsBus | null
   readonly timeoutMs: number
   readonly debug: boolean
@@ -159,7 +160,7 @@ export class ClientRuntime {
     this.tracer = getDefaultTracer()
     this.metrics = getDefaultMetrics()
     this.maxPayloadBytes = opts.security?.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES
-    this.idempotencyCache = new LruIdempotencyCache<unknown>(opts.idempotency)
+    this.idempotencyCache = new LruIdempotencyCache<IdempotencyEnvelope<unknown>>(opts.idempotency)
     this.devtoolsBus = opts.devtools === false ? null : opts.devtools instanceof Object ? (opts.devtools as DevToolsBus) : getDevToolsBus()
     this.defaultVersion = (opts.defaultVersion as string | undefined) || DEFAULT_METHOD_VERSION
     this.metaStaticPart = Object.freeze({
@@ -267,15 +268,23 @@ export class ClientRuntime {
 
   async query<T>(spec: ClientQuerySpec): Promise<T> {
     const { serviceName, method, params, opts, send, mapError } = spec
+    const fingerprint = opts?.idempotencyKey ? payloadFingerprint(params) : undefined
     const cacheKey = opts?.idempotencyKey ? clientIdempotencyKey(serviceName, method, opts.idempotencyKey) : undefined
     if (cacheKey && this.idempotencyCache.isEnabled() && this.idempotencyCache.has(cacheKey)) {
-      return this.idempotencyCache.get(cacheKey) as T
+      const entry = this.idempotencyCache.get(cacheKey)!
+      // The key must not alias a response produced for a different payload.
+      if (entry.f !== undefined && entry.f !== fingerprint) {
+        throw new MessagingError(ErrorCode.IDEMPOTENCY_KEY_CONFLICT, {
+          message: `Idempotency key was already used for a different request payload on ${method}`
+        })
+      }
+      return entry.v as T
     }
 
     const retryIdemKey = opts?.idempotencyKey ?? uuidv7()
 
-    const result = await this.shutdown.trackInflight(
-      runClientPipeline<T>(this.circuitBreaker, this.retryOptions, this.breakerKey(serviceName, method), async (attempt) => {
+    const result = await this.shutdown.trackInflight(() =>
+      runClientPipeline<T>(this.circuitBreaker, this.retryOptions, this.breakerKey(serviceName, method), async (attempt, signal) => {
         const startMs = Date.now()
         let request: EncodedRequest | undefined
         const span = this.tracer.startSpan(`nevo.client.query ${serviceName}.${method}`, {
@@ -285,12 +294,15 @@ export class ClientRuntime {
           "nevo.attempt": attempt
         })
         try {
+          if (signal?.aborted) {
+            throw new MessagingError(ErrorCode.CANCELLED, { message: `Request to ${serviceName}.${method} was aborted before dispatch` })
+          }
           request = await this.encode(method, params, "query", {
             ...opts,
             idempotencyKey: retryIdemKey,
             headers: { ...(opts?.headers ?? {}), "nevo-attempt": String(attempt) }
           })
-          const envelope = await send(request, attempt)
+          const envelope = await send(request, attempt, signal)
           const value = this.unwrap<T>(envelope, serviceName)
           span.setStatus({ code: 1 })
           publishClientEvent(this.devtoolsBus, {
@@ -337,18 +349,25 @@ export class ClientRuntime {
       })
     )
 
-    if (cacheKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(cacheKey, result)
+    if (cacheKey && this.idempotencyCache.isEnabled()) this.idempotencyCache.set(cacheKey, idempotencyEnvelope(result, fingerprint))
     return result
   }
 
   async emit(spec: ClientEmitSpec): Promise<void> {
     const { serviceName, method, params, opts, send, mapError } = spec
     const idemKey = opts?.idempotencyKey ?? uuidv7()
-    return this.shutdown.trackInflight(
-      runClientPipeline<void>(this.circuitBreaker, this.retryOptions, this.breakerKey(serviceName, method), async (attempt) => {
+    // A retried one-way emit can double-execute non-idempotent effects: a
+    // transport failure does not prove the send was lost. Retry only when the
+    // caller supplied an idempotency key the server can dedupe on.
+    const retryOptions = opts?.idempotencyKey ? this.retryOptions : { ...this.retryOptions, enabled: false }
+    return this.shutdown.trackInflight(() =>
+      runClientPipeline<void>(this.circuitBreaker, retryOptions, this.breakerKey(serviceName, method), async (attempt, signal) => {
         try {
+          if (signal?.aborted) {
+            throw new MessagingError(ErrorCode.CANCELLED, { message: `Emit to ${serviceName}.${method} was aborted before dispatch` })
+          }
           const request = await this.encode(method, params, spec.type ?? "emit", { ...opts, idempotencyKey: idemKey })
-          await send(request, attempt)
+          await send(request, attempt, signal)
         } catch (raw) {
           throw mapError ? mapError(raw) : raw
         }
