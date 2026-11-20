@@ -31,6 +31,7 @@ import { getNatsModule } from "../optional-deps"
 
 // Cap on concurrent async encode+compress operations during a batch publish.
 const BATCH_ENCODE_CONCURRENCY = 16
+export const NATS_SCATTER_SUFFIX = ".scatter"
 
 export interface NevoNatsClientOptions extends TransportClientOptions {
   servers?: string[]
@@ -294,10 +295,19 @@ export class NevoNatsClient implements OnModuleDestroy {
     serviceName: string,
     method: string,
     params: unknown,
-    opts?: { version?: string; headers?: Record<string, string>; tenantId?: string; timeoutMs?: number; maxMessages?: number; maxWait?: number }
+    opts?: {
+      version?: string
+      headers?: Record<string, string>
+      tenantId?: string
+      timeoutMs?: number
+      maxMessages?: number
+      maxWait?: number
+      /** Use the original request subject when calling a pre-split router. */
+      legacySubject?: boolean
+    }
   ): Promise<T[]> {
     const normalized = this.ensureServiceRegistered(serviceName)
-    const subject = `${normalized}-events`
+    const subject = `${normalized}-events${opts?.legacySubject ? "" : NATS_SCATTER_SUFFIX}`
     const nc = await this.ensureConnection()
     const { payload, meta, encoding } = await this.encodeRequest(method, params, "query", opts)
     const iter = await nc.requestMany(subject, payload, {

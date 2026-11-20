@@ -16,12 +16,14 @@ import {
   resolveCompressionOptions
 } from "../../common"
 import { getNatsModule } from "../optional-deps"
-import { NevoNatsClient } from "./nevo-nats.client"
+import { NATS_SCATTER_SUFFIX, NevoNatsClient } from "./nevo-nats.client"
 
 export interface NatsSignalRouterOptions extends SignalRouterOptions {
   servers?: string[]
   reuseClient?: boolean
   clientToken?: string | symbol
+  /** Core NATS queue group for commands. Defaults to the request subject. */
+  queueGroup?: string
   /** Maximum active handlers per subscription. Default 1 preserves delivery order. */
   concurrency?: number
   codec?: Codec | string
@@ -61,7 +63,6 @@ export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?:
     },
     (target, eventPattern, handlerName) => {
       target.prototype.natsConnection = null
-      target.prototype.natsSubscription = null
       target.prototype.__natsRouterOwnsConnection = false
 
       const reuseClient = options?.reuseClient !== false
@@ -123,6 +124,9 @@ export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?:
 
         this.natsConnection = nc
         this.__natsRouterOwnsConnection = ownsConnection
+        this.__natsRouterStopped = false
+        const subscriptions = new Set<Subscription>()
+        this.__natsRouterSubscriptions = subscriptions
 
         const handleMessage = async (msg: Msg) => {
           try {
@@ -151,9 +155,9 @@ export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?:
           }
         }
 
-        const subscribeAndPump = async () => {
-          const sub: Subscription = nc!.subscribe(eventPattern)
-          this.natsSubscription = sub
+        const subscribeAndPump = async (subject: string, queue?: string) => {
+          const sub = nc!.subscribe(subject, queue === undefined ? undefined : { queue })
+          subscriptions.add(sub)
           const active = new Set<Promise<void>>()
           try {
             for await (const msg of sub) {
@@ -168,29 +172,35 @@ export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?:
               if (active.size === concurrency) await Promise.race(active)
             }
           } finally {
+            if (subscriptions.delete(sub)) sub.unsubscribe()
             await Promise.allSettled(active)
           }
         }
 
-        ;(async () => {
-          while (nc && (nc as any).isClosed?.() !== true) {
+        const start = async (subject: string, queue?: string) => {
+          while (!this.__natsRouterStopped && nc && nc.isClosed?.() !== true) {
             try {
-              await subscribeAndPump()
+              await subscribeAndPump(subject, queue)
               break
             } catch (err) {
               logger.warn({ event: "nats.router.subscription_loop_error", err: (err as Error)?.message }, "Re-subscribing after error")
               await sleep(1000)
             }
           }
-        })().catch((err) => logger.error({ event: "nats.router.pump_crashed", err: (err as Error)?.message }))
+        }
+        const reportPumpError = (err: unknown) => logger.error({ event: "nats.router.pump_crashed", err: (err as Error)?.message })
+        void start(eventPattern, options?.queueGroup ?? eventPattern).catch(reportPumpError)
+        void start(`${eventPattern}${NATS_SCATTER_SUFFIX}`).catch(reportPumpError)
       }
 
       const originalOnModuleDestroy = target.prototype.onModuleDestroy || function () {}
       target.prototype.onModuleDestroy = async function () {
+        this.__natsRouterStopped = true
         await originalOnModuleDestroy.call(this)
-        if (this.natsSubscription) {
+        for (const subscription of this.__natsRouterSubscriptions ?? []) {
           try {
-            this.natsSubscription.unsubscribe()
+            this.__natsRouterSubscriptions.delete(subscription)
+            subscription.unsubscribe()
           } catch {}
         }
         if (this.natsConnection && this.__natsRouterOwnsConnection) {

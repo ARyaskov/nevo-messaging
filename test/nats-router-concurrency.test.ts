@@ -16,8 +16,13 @@ test("NATS router runs independent requests within its concurrency limit", { tim
   let active = 0
   let maxActive = 0
   const nc = {
-    subscribe: () => ({
+    subscribe: (subject: string, options?: { queue: string }) => ({
       async *[Symbol.asyncIterator]() {
+        if (subject.endsWith(".scatter")) {
+          assert.equal(options, undefined)
+          return
+        }
+        assert.equal(options?.queue, subject)
         for (const id of ["slow", "fast", "last"]) yield { data: codec.encode(id), reply: "inbox" }
       },
       unsubscribe() {}

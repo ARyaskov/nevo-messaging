@@ -17,8 +17,9 @@ test("NATS encodes a fresh reply envelope for equal results", { timeout: 15_000 
   const responses: unknown[] = []
   const { promise, resolve } = Promise.withResolvers<void>()
   const nc = {
-    subscribe: () => ({
+    subscribe: (subject: string) => ({
       async *[Symbol.asyncIterator]() {
+        if (subject.endsWith(".scatter")) return
         for (const request of requests) yield { data: codec.encode(request), reply: "inbox" }
         resolve()
       },

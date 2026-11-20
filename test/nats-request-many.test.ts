@@ -11,7 +11,7 @@ test("requestMany awaits the NATS iterator and unwraps replies", async () => {
     status: async function* () {},
     drain: async () => {},
     async requestMany(subject: string, _payload: Uint8Array, options: { strategy: string; maxMessages: number }) {
-      assert.equal(subject, "catalog-events")
+      assert.equal(subject, "catalog-events.scatter")
       assert.equal(options.strategy, "count")
       assert.equal(options.maxMessages, replies.length)
       return (async function* () {

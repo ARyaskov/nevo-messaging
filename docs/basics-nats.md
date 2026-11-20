@@ -9,6 +9,14 @@ NATS is the lowest-latency and simplest transport. It is the recommended default
 - Subject namespace — no topic provisioning needed
 - JetStream for durable streams via the separate JetStream API
 
+Ordinary `query` and `emit` calls use `<service>-events`. Routers join a queue
+group named after that subject by default, so one replica handles a delivery.
+Set the same `queueGroup` on every replica if you override it. Use
+`requestMany` for scatter/gather via `<service>-events.scatter`; every listening
+replica can reply. Use `{ legacySubject: true }` with older scatter/gather
+routers during migration. Upgrade older replicas together before relying on
+single-replica delivery, because old plain subscriptions still receive RPCs.
+
 ## Install
 
 ```bash
