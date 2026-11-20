@@ -39,6 +39,14 @@ test("a competing PostgreSQL outbox claim skips the entire locked partition", { 
       (await competitor.listPending(1)).map((row) => row.id),
       ["b"]
     )
+    await competitor.markPublished("b")
+    for (const id of ["z", "d", "c"]) {
+      await owner.save({ id, serviceName: "catalog", method: "changed", params: {}, createdAt: 2, attempts: 0, status: "pending" })
+    }
+    assert.deepEqual(
+      (await owner.listPending(2)).map((row) => row.id),
+      ["c", "d"]
+    )
   } finally {
     await first.query("ROLLBACK")
     await first.query(`DROP TABLE IF EXISTS "${table}"`)

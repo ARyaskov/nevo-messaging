@@ -173,15 +173,17 @@ export class PgOutboxStore implements OutboxStore {
                    AND (f.created_at < o.created_at OR (f.created_at = o.created_at AND f.id < o.id))
               )
             ))
-          ORDER BY o.created_at ASC
+          ORDER BY o.created_at ASC, o.id ASC
           LIMIT $1
           FOR UPDATE SKIP LOCKED
+       ), claimed AS (
+         UPDATE ${this.table}
+            SET claimed_at = NOW(), claimed_by = $3
+           FROM cte
+          WHERE ${this.table}.id = cte.id
+         RETURNING ${this.table}.id, service_name, method, params, partition_key, attempts, status, last_error, created_at
        )
-       UPDATE ${this.table}
-          SET claimed_at = NOW(), claimed_by = $3
-         FROM cte
-        WHERE ${this.table}.id = cte.id
-       RETURNING ${this.table}.id, service_name, method, params, partition_key, attempts, status, last_error, created_at`,
+       SELECT * FROM claimed ORDER BY created_at ASC, id ASC`,
       [limit, String(this.claimTtlMs), this.workerId]
     )
     return res.rows.map((r) => ({
