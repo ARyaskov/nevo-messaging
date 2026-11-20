@@ -354,8 +354,6 @@ export class NevoNatsClient implements OnModuleDestroy {
     const nc = await this.ensureConnection()
     const subject = `${normalized}-events`
     const replySubject = `_INBOX.${this.instanceId}.${uuidv7()}`
-    const replySub = nc.subscribe(replySubject)
-    this.subscriptions.add(replySub)
     const startMs = Date.now()
     let count = 0
     let cancelled = false
@@ -364,7 +362,17 @@ export class NevoNatsClient implements OnModuleDestroy {
       ...opts,
       headers: { ...(opts?.headers || {}), "nevo-stream": "1", "nevo-reply-to": replySubject }
     })
-    nc.publish(subject, payload, { reply: replySubject, headers: this.toNatsHeaders(meta.headers, encoding) })
+    const replySub = nc.subscribe(replySubject)
+    this.subscriptions.add(replySub)
+    const cleanup = () => {
+      if (this.subscriptions.delete(replySub)) replySub.unsubscribe()
+    }
+    try {
+      nc.publish(subject, payload, { reply: replySubject, headers: this.toNatsHeaders(meta.headers, encoding) })
+    } catch (err) {
+      cleanup()
+      throw err
+    }
 
     // Idle timeout: reset on every chunk so a long, steadily-producing stream
     // isn't cut off — only a gap longer than `timeoutMs` ends it.
@@ -376,7 +384,7 @@ export class NevoNatsClient implements OnModuleDestroy {
       idleTimer = setTimeout(() => {
         if (!cancelled) {
           timedOut = true
-          void replySub.unsubscribe()
+          cleanup()
         }
       }, timeoutMs)
       if (typeof idleTimer.unref === "function") idleTimer.unref()
@@ -400,7 +408,7 @@ export class NevoNatsClient implements OnModuleDestroy {
         if (timedOut && !cancelled) streamError = new TimeoutError(serviceName, method, timeoutMs)
       } finally {
         clearTimeout(idleTimer)
-        this.subscriptions.delete(replySub)
+        cleanup()
         try {
           onEnd?.({ count, durationMs: Date.now() - startMs, error: streamError })
         } catch (err) {
@@ -412,9 +420,7 @@ export class NevoNatsClient implements OnModuleDestroy {
     return {
       cancel: async () => {
         cancelled = true
-        try {
-          replySub.unsubscribe()
-        } catch {}
+        cleanup()
       }
     }
   }
