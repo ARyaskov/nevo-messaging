@@ -285,7 +285,8 @@ export class NevoNatsClient implements OnModuleDestroy {
     const subject = `${normalized}-events`
     const nc = await this.ensureConnection()
     const { payload, meta, encoding } = await this.encodeRequest(method, params, "query", opts)
-    const iter: AsyncIterable<any> = (nc as any).requestMany(subject, payload, {
+    const iter = await nc.requestMany(subject, payload, {
+      strategy: "count",
       maxMessages: opts?.maxMessages ?? 10,
       maxWait: opts?.maxWait ?? opts?.timeoutMs ?? this.timeoutMs,
       headers: this.toNatsHeaders(meta.headers, encoding)
@@ -294,9 +295,9 @@ export class NevoNatsClient implements OnModuleDestroy {
     for await (const msg of iter) {
       try {
         const responseEncoding = getNatsHeader(msg.headers, "content-encoding")
-        const response: any = await this.decodePayload(msg.data, responseEncoding)
-        if (response?.params?.result === "error") continue
-        results.push(response?.params?.result as T)
+        const response = await this.decodePayload<{ params?: { result?: unknown } }>(msg.data, responseEncoding)
+        if (!response?.params || !Object.hasOwn(response.params, "result")) continue
+        results.push(this.runtime.unwrap<T>(response, normalized))
       } catch {
         // skip malformed
       }
