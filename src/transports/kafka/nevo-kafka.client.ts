@@ -220,7 +220,7 @@ export class NevoKafkaClient implements OnModuleDestroy {
     })
   }
 
-  async emit(serviceName: string, method: string, params: unknown, opts?: ClientCallOptions): Promise<void> {
+  async emit(serviceName: string, method: string, params: unknown, opts?: ClientCallOptions & { partitionKey?: string }): Promise<void> {
     const normalized = this.ensureServiceRegistered(serviceName)
     const topic = `${normalized}-events`
     return this.runtime.emit({
@@ -230,7 +230,11 @@ export class NevoKafkaClient implements OnModuleDestroy {
       opts,
       send: async (request) => {
         await lastValueFrom(
-          this.kafkaClient.emit(topic, { key: request.uuid, value: Buffer.from(request.payload), headers: this.toKafkaHeaders(request.encoding) })
+          this.kafkaClient.emit(topic, {
+            key: opts?.partitionKey ?? request.uuid,
+            value: Buffer.from(request.payload),
+            headers: this.toKafkaHeaders(request.encoding)
+          })
         )
       }
     })

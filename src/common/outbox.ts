@@ -152,7 +152,7 @@ export interface OutboxBatchResult {
 }
 
 export interface OutboxPublisher {
-  emit(serviceName: string, method: string, params: unknown): Promise<void>
+  emit(serviceName: string, method: string, params: unknown, opts?: { partitionKey?: string }): Promise<void>
   /** Optional batch fast path. Return a per-item result array for partial success, or `void` for all-or-nothing. */
   emitBatch?(items: OutboxEmitItem[]): Promise<OutboxBatchResult[] | void>
 }
@@ -248,7 +248,7 @@ export class Outbox {
     let failed = 0
     for (const rec of records) {
       try {
-        await this.publisher.emit(rec.serviceName, rec.method, rec.params)
+        await this.publisher.emit(rec.serviceName, rec.method, rec.params, { partitionKey: rec.partitionKey })
         if ((await this.store.markPublished(rec.id)).owned) published++
       } catch (err: any) {
         const mark = await this.store.markFailed(rec.id, err?.message ?? String(err), maxAttempts)
