@@ -238,20 +238,20 @@ export class ClientRuntime {
     return this.encodeSync(method, params, type, opts)
   }
 
-  decode<T = unknown>(data: Uint8Array, encoding?: string): T | Promise<T> {
+  decode<T = unknown>(data: Uint8Array, encoding?: string, codec = this.codec): T | Promise<T> {
     this.metrics.observeHistogram(NEVO_METRIC_NAMES.payloadBytes, { direction: "in", service: this.serviceName ?? "unknown" }, data.byteLength)
     if (!shouldDecompressAsync(data.byteLength, encoding)) {
       const decompressed = maybeDecompress(data, encoding, this.maxPayloadBytes)
       enforcePayloadLimit(decompressed, this.maxPayloadBytes)
-      return this.codec.decode<T>(decompressed)
+      return codec.decode<T>(decompressed)
     }
-    return this.decodeAsync<T>(data, encoding)
+    return this.decodeAsync<T>(data, encoding, codec)
   }
 
-  async decodeAsync<T = unknown>(data: Uint8Array, encoding?: string): Promise<T> {
+  async decodeAsync<T = unknown>(data: Uint8Array, encoding?: string, codec = this.codec): Promise<T> {
     const decompressed = await maybeDecompressAsync(data, encoding, this.maxPayloadBytes)
     enforcePayloadLimit(decompressed, this.maxPayloadBytes)
-    return this.codec.decode<T>(decompressed)
+    return codec.decode<T>(decompressed)
   }
 
   unwrap<T>(envelope: unknown, serviceName: string): T {

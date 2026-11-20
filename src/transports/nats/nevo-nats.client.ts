@@ -16,6 +16,7 @@ import {
   SubscriptionOptions,
   matchesFilter,
   Codec,
+  getCodec,
   NevoLogger,
   enforcePayloadLimit,
   ClientRuntime,
@@ -189,6 +190,20 @@ export class NevoNatsClient implements OnModuleDestroy {
     return this.runtime.decode<T>(data, encoding)
   }
 
+  private decodeReply<T>(data: Uint8Array, headers?: MsgHdrs): T | Promise<T> {
+    const encoding = getNatsHeader(headers, "content-encoding")
+    const contentType = getNatsHeader(headers, "content-type")
+    const codec =
+      contentType === this.codec.contentType
+        ? this.codec
+        : contentType === "application/json"
+          ? getCodec("json")
+          : contentType === "application/msgpack"
+            ? getCodec("msgpack")
+            : this.codec
+    return this.runtime.decode<T>(data, encoding, codec)
+  }
+
   private ensureServiceRegistered(serviceName: string): string {
     const normalized = normalizeServiceName(serviceName)
     if (!this.serviceNames.includes(normalized)) {
@@ -215,7 +230,7 @@ export class NevoNatsClient implements OnModuleDestroy {
           timeout: opts?.timeoutMs ?? this.timeoutMs,
           headers: this.toNatsHeaders(request.meta.headers, request.encoding)
         })
-        return this.decodePayload(msg.data, getNatsHeader(msg.headers, "content-encoding"))
+        return this.decodeReply(msg.data, msg.headers)
       }
     })
   }
@@ -294,8 +309,7 @@ export class NevoNatsClient implements OnModuleDestroy {
     const results: T[] = []
     for await (const msg of iter) {
       try {
-        const responseEncoding = getNatsHeader(msg.headers, "content-encoding")
-        const response = await this.decodePayload<{ params?: { result?: unknown } }>(msg.data, responseEncoding)
+        const response = await this.decodeReply<{ params?: { result?: unknown } }>(msg.data, msg.headers)
         if (!response?.params || !Object.hasOwn(response.params, "result")) continue
         results.push(this.runtime.unwrap<T>(response, normalized))
       } catch {
@@ -396,10 +410,9 @@ export class NevoNatsClient implements OnModuleDestroy {
         for await (const msg of replySub) {
           if (cancelled) break
           armIdle()
-          const encoding = getNatsHeader(msg.headers, "content-encoding")
-          const response = await this.decodePayload<{ meta?: { headers?: Record<string, string> }; params?: { result?: unknown } }>(
+          const response = await this.decodeReply<{ meta?: { headers?: Record<string, string> }; params?: { result?: unknown } }>(
             msg.data,
-            encoding
+            msg.headers
           )
           if (response?.meta?.headers?.["nevo-stream-end"] === "1") break
           if (!response?.params || !Object.hasOwn(response.params, "result")) continue
