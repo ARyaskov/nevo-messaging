@@ -159,7 +159,8 @@ export interface OutboxPublisher {
 
 export class Outbox {
   private timer?: NodeJS.Timeout
-  private stopped = false
+  private generation?: symbol
+  private activeFlush?: Promise<{ published: number; failed: number }>
   constructor(
     private readonly store: OutboxStore,
     private readonly publisher: OutboxPublisher,
@@ -276,18 +277,23 @@ export class Outbox {
   }
 
   start(): void {
-    this.stopped = false
+    if (this.generation) return
+    const generation = Symbol()
+    this.generation = generation
     const intervalMs = this.opts.intervalMs ?? 1000
     // Self-scheduling loop so a flush that outlasts the interval can't overlap the next.
     const loop = async () => {
-      if (this.stopped) return
+      if (this.generation !== generation) return
       const startedAt = performance.now()
+      const flush = (this.activeFlush ??= this.flushOnce())
       try {
-        await this.flushOnce()
+        await flush
       } catch {
         // swallow: a failed flush must not stop the loop
+      } finally {
+        if (this.activeFlush === flush) this.activeFlush = undefined
       }
-      if (this.stopped) return
+      if (this.generation !== generation) return
       const elapsed = performance.now() - startedAt
       const delay = Math.max(0, intervalMs - elapsed)
       this.timer = setTimeout(loop, delay)
@@ -298,7 +304,7 @@ export class Outbox {
   }
 
   stop(): void {
-    this.stopped = true
+    this.generation = undefined
     if (this.timer) clearTimeout(this.timer)
     this.timer = undefined
   }
