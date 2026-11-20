@@ -1,16 +1,5 @@
 import { setTimeout as sleep } from "node:timers/promises"
 
-const FNV_OFFSET = 0xcbf29ce484222325n
-const FNV_PRIME = 0x100000001b3n
-const MASK_64 = (1n << 64n) - 1n
-function fnv1aHash64(str: string): string {
-  let h = FNV_OFFSET
-  for (let i = 0; i < str.length; i++) {
-    h ^= BigInt(str.charCodeAt(i))
-    h = (h * FNV_PRIME) & MASK_64
-  }
-  return h.toString(36)
-}
 import { Type, Inject, Optional } from "@nestjs/common"
 import type { NatsConnection, Subscription } from "@nats-io/nats-core"
 import { createSignalRouterDecorator, SignalRouterOptions, getRouterRuntime } from "../../signal-router.utils"
@@ -24,8 +13,7 @@ import {
   maybeDecompressAsync,
   shouldDecompressAsync,
   enforcePayloadLimit,
-  resolveCompressionOptions,
-  LruIdempotencyCache
+  resolveCompressionOptions
 } from "../../common"
 import { getNatsModule } from "../optional-deps"
 import { NevoNatsClient } from "./nevo-nats.client"
@@ -36,6 +24,7 @@ export interface NatsSignalRouterOptions extends SignalRouterOptions {
   clientToken?: string | symbol
   codec?: Codec | string
   compression?: { enabled?: boolean; algorithm?: "gzip" | "deflate" | "zstd"; threshold?: number; level?: number; async?: boolean }
+  /** @deprecated Replies are encoded per request. This option has no effect. */
   responseCache?: { enabled?: boolean; maxEntries?: number; ttlMs?: number }
   reconnect?: {
     enabled?: boolean
@@ -53,20 +42,6 @@ const DEFAULT_NATS_CLIENT_TOKEN = "NEVO_NATS_CLIENT"
 export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?: NatsSignalRouterOptions) {
   const codec: Codec = typeof options?.codec === "string" ? getCodec(options.codec) : (options?.codec as Codec) || getDefaultCodec()
   const compression = resolveCompressionOptions(options?.compression)
-
-  const responseCacheEnabled = options?.responseCache?.enabled === true && compression.enabled
-  const responseCache = responseCacheEnabled
-    ? new LruIdempotencyCache<{ data: Uint8Array; encoding: string }>({
-        enabled: true,
-        maxEntries: options?.responseCache?.maxEntries ?? 1024,
-        ttlMs: options?.responseCache?.ttlMs ?? 60_000
-      })
-    : null
-
-  function hashResult(value: unknown): string {
-    const json = typeof value === "string" ? value : JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? v.toString() + "n" : v))
-    return fnv1aHash64(json)
-  }
 
   return createSignalRouterDecorator(
     serviceType,
@@ -158,29 +133,10 @@ export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?:
               const payload = codec.decode(raw)
               const result = await this[handlerName](payload)
               if (msg.reply && result) {
-                let outData: Uint8Array
-                let outEncoding: string
-                if (responseCache) {
-                  const cacheKey = hashResult((result as any)?.params?.result ?? result)
-                  const cached = responseCache.get(cacheKey)
-                  if (cached) {
-                    outData = cached.data
-                    outEncoding = cached.encoding
-                  } else {
-                    const outBuf = codec.encode(result)
-                    const out = compression.async ? await maybeCompressAsync(outBuf, compression) : maybeCompress(outBuf, compression)
-                    outData = out.data
-                    outEncoding = out.encoding
-                    responseCache.set(cacheKey, { data: outData, encoding: outEncoding })
-                  }
-                } else {
-                  const outBuf = codec.encode(result)
-                  const out = compression.async ? await maybeCompressAsync(outBuf, compression) : maybeCompress(outBuf, compression)
-                  outData = out.data
-                  outEncoding = out.encoding
-                }
-                const replyHeaders = this.__buildReplyHeaders ? this.__buildReplyHeaders(outEncoding) : undefined
-                nc!.publish(msg.reply, outData, replyHeaders ? { headers: replyHeaders } : undefined)
+                const outBuf = codec.encode(result)
+                const out = compression.async ? await maybeCompressAsync(outBuf, compression) : maybeCompress(outBuf, compression)
+                const replyHeaders = this.__buildReplyHeaders(out.encoding)
+                nc!.publish(msg.reply, out.data, replyHeaders ? { headers: replyHeaders } : undefined)
               }
             } catch (err) {
               logger.error({ event: "nats.router.handler_error", err: (err as Error)?.message })
