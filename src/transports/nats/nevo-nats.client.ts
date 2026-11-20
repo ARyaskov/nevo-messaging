@@ -1,4 +1,4 @@
-import type { NatsConnection, Subscription as NatsSubscription, ConnectionOptions } from "@nats-io/nats-core"
+import type { NatsConnection, Subscription as NatsSubscription, ConnectionOptions, MsgHdrs } from "@nats-io/nats-core"
 import type { OnModuleDestroy } from "@nestjs/common"
 import { uuidv7 } from "../../common/uuid"
 import {
@@ -428,6 +428,7 @@ export class NevoNatsClient implements OnModuleDestroy {
     }
   }
 
+  /** Publishes in order. A later failure may leave an earlier window published. */
   async emitBatch(
     items: Array<{
       serviceName: string
@@ -439,13 +440,13 @@ export class NevoNatsClient implements OnModuleDestroy {
     if (items.length === 0) return
     const nc = await this.ensureConnection()
     if (this.runtime.compression.async && this.runtime.compression.enabled) {
-      const encoded = await mapLimit(items, BATCH_ENCODE_CONCURRENCY, async (item) => {
+      await this.publishEncodedWindows(nc, items, async (item) => {
         const normalized = this.ensureServiceRegistered(item.serviceName)
         const subject = `${normalized}-events`
         const { payload, meta, encoding } = await this.runtime.encodeAsync(item.method, item.params, "emit", item.opts)
         return { subject, payload, headers: this.toNatsHeaders(meta.headers, encoding) }
       })
-      for (const e of encoded) nc.publish(e.subject, e.payload, e.headers ? { headers: e.headers } : undefined)
+      return
     } else {
       for (const item of items) {
         const normalized = this.ensureServiceRegistered(item.serviceName)
@@ -458,6 +459,7 @@ export class NevoNatsClient implements OnModuleDestroy {
     await nc.flush()
   }
 
+  /** Publishes in order. A later failure may leave an earlier window published. */
   async publishBatch(
     items: Array<{ serviceName: string; method: string; params: unknown; opts?: { version?: string; headers?: Record<string, string> } }>
   ): Promise<void> {
@@ -474,16 +476,25 @@ export class NevoNatsClient implements OnModuleDestroy {
       await nc.flush()
       return
     }
-    const encoded = await mapLimit(items, BATCH_ENCODE_CONCURRENCY, async (item) => {
+    await this.publishEncodedWindows(nc, items, async (item) => {
       const normalized = this.ensureServiceRegistered(item.serviceName)
       const subject = methodSubject(`${normalized}${DEFAULT_SUBSCRIPTION_SUFFIX}`, item.method)
       const { payload, meta, encoding } = await this.encodeRequest(item.method, item.params, "sub", item.opts)
       return { subject, payload, headers: this.toNatsHeaders(meta.headers, encoding) }
     })
-    for (const e of encoded) {
-      nc.publish(e.subject, e.payload, e.headers ? { headers: e.headers } : undefined)
+  }
+
+  private async publishEncodedWindows<T>(
+    nc: NatsConnection,
+    items: readonly T[],
+    encode: (item: T) => Promise<{ subject: string; payload: Uint8Array; headers?: MsgHdrs }>
+  ): Promise<void> {
+    for (let offset = 0; offset < items.length; offset += BATCH_ENCODE_CONCURRENCY) {
+      const window = items.slice(offset, offset + BATCH_ENCODE_CONCURRENCY)
+      const encoded = await mapLimit(window, BATCH_ENCODE_CONCURRENCY, encode)
+      for (const message of encoded) nc.publish(message.subject, message.payload, { headers: message.headers })
+      await nc.flush()
     }
-    await nc.flush()
   }
 
   async flush(): Promise<void> {
