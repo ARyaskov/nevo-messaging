@@ -1,7 +1,7 @@
 import { setTimeout as sleep } from "node:timers/promises"
 
 import { Type, Inject, Optional } from "@nestjs/common"
-import type { NatsConnection, Subscription } from "@nats-io/nats-core"
+import type { Msg, NatsConnection, Subscription } from "@nats-io/nats-core"
 import { createSignalRouterDecorator, SignalRouterOptions, getRouterRuntime } from "../../signal-router.utils"
 import {
   Codec,
@@ -22,6 +22,8 @@ export interface NatsSignalRouterOptions extends SignalRouterOptions {
   servers?: string[]
   reuseClient?: boolean
   clientToken?: string | symbol
+  /** Maximum active handlers per subscription. Default 1 preserves delivery order. */
+  concurrency?: number
   codec?: Codec | string
   compression?: { enabled?: boolean; algorithm?: "gzip" | "deflate" | "zstd"; threshold?: number; level?: number; async?: boolean }
   /** @deprecated Replies are encoded per request. This option has no effect. */
@@ -42,6 +44,8 @@ const DEFAULT_NATS_CLIENT_TOKEN = "NEVO_NATS_CLIENT"
 export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?: NatsSignalRouterOptions) {
   const codec: Codec = typeof options?.codec === "string" ? getCodec(options.codec) : (options?.codec as Codec) || getDefaultCodec()
   const compression = resolveCompressionOptions(options?.compression)
+  const concurrency = options?.concurrency ?? 1
+  if (!Number.isSafeInteger(concurrency) || concurrency < 1) throw new RangeError("NATS router concurrency must be a positive integer")
 
   return createSignalRouterDecorator(
     serviceType,
@@ -120,34 +124,51 @@ export function NatsSignalRouter(serviceType: Type<any> | Type<any>[], options?:
         this.natsConnection = nc
         this.__natsRouterOwnsConnection = ownsConnection
 
+        const handleMessage = async (msg: Msg) => {
+          try {
+            const encoding = msg.headers?.get?.("content-encoding")
+            const raw = shouldDecompressAsync(msg.data.byteLength, encoding)
+              ? await maybeDecompressAsync(msg.data, encoding, maxPayloadBytes)
+              : maybeDecompress(msg.data, encoding, maxPayloadBytes)
+            enforcePayloadLimit(raw, maxPayloadBytes)
+            const payload = codec.decode(raw)
+            const result = await this[handlerName](payload)
+            if (msg.reply && result) {
+              const outBuf = codec.encode(result)
+              const out = compression.async ? await maybeCompressAsync(outBuf, compression) : maybeCompress(outBuf, compression)
+              const replyHeaders = this.__buildReplyHeaders(out.encoding)
+              nc!.publish(msg.reply, out.data, replyHeaders ? { headers: replyHeaders } : undefined)
+            }
+          } catch (err) {
+            logger.error({ event: "nats.router.handler_error", err: (err as Error)?.message })
+            await dlq.route({
+              topic: eventPattern,
+              reason: "handler-error",
+              error: { message: (err as Error)?.message ?? String(err) },
+              rawPayload: undefined,
+              ts: Date.now()
+            })
+          }
+        }
+
         const subscribeAndPump = async () => {
           const sub: Subscription = nc!.subscribe(eventPattern)
           this.natsSubscription = sub
-          for await (const msg of sub) {
-            try {
-              const encoding = msg.headers?.get?.("content-encoding")
-              const raw = shouldDecompressAsync(msg.data.byteLength, encoding)
-                ? await maybeDecompressAsync(msg.data, encoding, maxPayloadBytes)
-                : maybeDecompress(msg.data, encoding, maxPayloadBytes)
-              enforcePayloadLimit(raw, maxPayloadBytes)
-              const payload = codec.decode(raw)
-              const result = await this[handlerName](payload)
-              if (msg.reply && result) {
-                const outBuf = codec.encode(result)
-                const out = compression.async ? await maybeCompressAsync(outBuf, compression) : maybeCompress(outBuf, compression)
-                const replyHeaders = this.__buildReplyHeaders(out.encoding)
-                nc!.publish(msg.reply, out.data, replyHeaders ? { headers: replyHeaders } : undefined)
+          const active = new Set<Promise<void>>()
+          try {
+            for await (const msg of sub) {
+              if (concurrency === 1) {
+                await handleMessage(msg)
+                continue
               }
-            } catch (err) {
-              logger.error({ event: "nats.router.handler_error", err: (err as Error)?.message })
-              await dlq.route({
-                topic: eventPattern,
-                reason: "handler-error",
-                error: { message: (err as Error)?.message ?? String(err) },
-                rawPayload: undefined,
-                ts: Date.now()
-              })
+              const work = handleMessage(msg)
+                .catch((err) => logger.error({ event: "nats.router.worker_failed", err: (err as Error)?.message }))
+                .finally(() => active.delete(work))
+              active.add(work)
+              if (active.size === concurrency) await Promise.race(active)
             }
+          } finally {
+            await Promise.allSettled(active)
           }
         }
 
