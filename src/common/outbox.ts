@@ -143,6 +143,7 @@ export interface OutboxEmitItem {
   params: unknown
   /** Mirrors {@link OutboxRecord.partitionKey} so brokers can key partitions. */
   partitionKey?: string
+  opts?: { idempotencyKey: string }
 }
 
 /** Per-item outcome from {@link OutboxPublisher.emitBatch}, aligned to the input order. */
@@ -152,7 +153,7 @@ export interface OutboxBatchResult {
 }
 
 export interface OutboxPublisher {
-  emit(serviceName: string, method: string, params: unknown, opts?: { partitionKey?: string }): Promise<void>
+  emit(serviceName: string, method: string, params: unknown, opts?: { partitionKey?: string; idempotencyKey?: string }): Promise<void>
   /** Optional batch fast path. Return a per-item result array for partial success, or `void` for all-or-nothing. */
   emitBatch?(items: OutboxEmitItem[]): Promise<OutboxBatchResult[] | void>
 }
@@ -233,7 +234,7 @@ export class Outbox {
 
     for (const rec of records) {
       try {
-        await this.publisher.emit(rec.serviceName, rec.method, rec.params)
+        await this.publisher.emit(rec.serviceName, rec.method, rec.params, { idempotencyKey: rec.id })
         if ((await this.store.markPublished(rec.id)).owned) published++
       } catch (err: any) {
         const mark = await this.store.markFailed(rec.id, err?.message ?? String(err), maxAttempts)
@@ -248,7 +249,7 @@ export class Outbox {
     let failed = 0
     for (const rec of records) {
       try {
-        await this.publisher.emit(rec.serviceName, rec.method, rec.params, { partitionKey: rec.partitionKey })
+        await this.publisher.emit(rec.serviceName, rec.method, rec.params, { partitionKey: rec.partitionKey, idempotencyKey: rec.id })
         if ((await this.store.markPublished(rec.id)).owned) published++
       } catch (err: any) {
         const mark = await this.store.markFailed(rec.id, err?.message ?? String(err), maxAttempts)
@@ -265,7 +266,8 @@ export class Outbox {
       serviceName: r.serviceName,
       method: r.method,
       params: r.params,
-      partitionKey: r.partitionKey
+      partitionKey: r.partitionKey,
+      opts: { idempotencyKey: r.id }
     }))
     try {
       const out = await this.publisher.emitBatch!(items)
