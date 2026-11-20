@@ -396,16 +396,19 @@ export class NevoNatsClient implements OnModuleDestroy {
         for await (const msg of replySub) {
           if (cancelled) break
           armIdle()
-          try {
-            const encoding = getNatsHeader(msg.headers, "content-encoding")
-            const response: any = await this.decodePayload(msg.data, encoding)
-            if (response?.meta?.headers?.["nevo-stream-end"] === "1") break
-            if (response?.params?.result === undefined) continue
-            count++
-            await onChunk(response.params.result as T)
-          } catch {}
+          const encoding = getNatsHeader(msg.headers, "content-encoding")
+          const response = await this.decodePayload<{ meta?: { headers?: Record<string, string> }; params?: { result?: unknown } }>(
+            msg.data,
+            encoding
+          )
+          if (response?.meta?.headers?.["nevo-stream-end"] === "1") break
+          if (!response?.params || !Object.hasOwn(response.params, "result")) continue
+          await onChunk(this.runtime.unwrap<T>(response, normalized))
+          count++
         }
         if (timedOut && !cancelled) streamError = new TimeoutError(serviceName, method, timeoutMs)
+      } catch (err) {
+        if (!cancelled) streamError = err
       } finally {
         clearTimeout(idleTimer)
         cleanup()
