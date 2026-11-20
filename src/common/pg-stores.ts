@@ -57,7 +57,7 @@ export class PgOutboxStore implements OutboxStore {
     this.client = opts.client
     this.table = qident(opts.schema, opts.table ?? "nevo_outbox")
     this.claimTtlMs = opts.claimTtlMs ?? 60_000
-    this.workerId = `worker-${uuidv7().slice(0, 12)}`
+    this.workerId = `worker-${uuidv7()}`
     this.logger = (opts.logger ?? getDefaultLogger()).child({ component: "outbox.pg" })
   }
 
@@ -169,16 +169,8 @@ export class PgOutboxStore implements OutboxStore {
               NOT EXISTS (
                 SELECT 1 FROM ${this.table} f
                  WHERE f.partition_key = o.partition_key
-                   AND f.status = 'failed'
+                   AND f.status IN ('pending', 'failed')
                    AND (f.created_at < o.created_at OR (f.created_at = o.created_at AND f.id < o.id))
-              )
-              AND NOT EXISTS (
-                SELECT 1 FROM ${this.table} c
-                 WHERE c.partition_key = o.partition_key
-                   AND c.status = 'pending'
-                   AND c.claimed_by IS NOT NULL
-                   AND c.claimed_by <> $3
-                   AND c.claimed_at >= NOW() - ($2 || ' milliseconds')::interval
               )
             ))
           ORDER BY o.created_at ASC
