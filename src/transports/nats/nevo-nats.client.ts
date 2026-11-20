@@ -488,6 +488,9 @@ export class NevoNatsClient implements OnModuleDestroy {
     options: SubscriptionOptions | undefined,
     handler: (data: T, context: SubscriptionContext) => Promise<void> | void
   ): Promise<Subscription> {
+    if (options?.ack || options?.durableKey !== undefined) {
+      throw new MessagingError(ErrorCode.BAD_REQUEST, { message: "Core NATS subscriptions do not support ack or durableKey. Use JetStream." })
+    }
     const normalized = normalizeServiceName(serviceName)
     const isBroadcast = normalized === DEFAULT_BROADCAST_TOPIC
     if (!isBroadcast) this.ensureServiceRegistered(serviceName)

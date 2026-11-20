@@ -7,7 +7,7 @@ NATS is the lowest-latency and simplest transport. It is the recommended default
 - Single binary broker, runs anywhere
 - Sub-millisecond request/response under load
 - Subject namespace — no topic provisioning needed
-- JetStream for durable streams (used when you `subscribe` with `ack: true`)
+- JetStream for durable streams via the separate JetStream API
 
 ## Install
 
@@ -137,7 +137,7 @@ await this.subscribeWildcard("orders.>", (msg, ctx) => { ... }) // raw subject p
 
 ## Durable consumers (JetStream)
 
-`this.subscribe(...)` on NATS is a core-NATS subscription: `ack` / `nack` on its context are no-ops and `ack` / `durableKey` options do not create a JetStream consumer. `groupId` maps to a NATS queue group.
+`this.subscribe(...)` creates a Core NATS subscription. Its context has no-op `ack` and `nack` methods. The subscription rejects `ack: true` and `durableKey`. Use the JetStream API for durable consumers. `groupId` maps to a NATS queue group.
 
 For at-least-once delivery with real acknowledgement use the JetStream helper (`getJetStreamHelper(nc)`): `ensureStream`, `ensureConsumer`, `pullSubscribe`, whose context exposes `ack()`, `nack(delayMs?)`, `term()` and `working()`. See [capability-matrix.md](./capability-matrix.md#nats--the-most-capable-transport).
 
