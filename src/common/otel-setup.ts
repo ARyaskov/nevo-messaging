@@ -3,6 +3,15 @@ import { createTracer, setDefaultTracer, NevoTracer } from "./tracing"
 
 const nodeRequire = createRequire(__filename)
 
+function resolveLegacyTracingSdk(): string | undefined {
+  try {
+    return nodeRequire.resolve("@opentelemetry/sdk-trace-node")
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "MODULE_NOT_FOUND") return undefined
+    throw err
+  }
+}
+
 export interface NevoTracingSetupOptions {
   serviceName: string
   serviceVersion?: string
@@ -26,10 +35,13 @@ export async function setupNevoTracing(opts: NevoTracingSetupOptions): Promise<N
   }
 
   let provider: any = null
-  let processor: any = null
+  let releaseGlobals = () => {}
 
   try {
-    const sdkTrace: any = nodeRequire("@opentelemetry/sdk-trace-node")
+    const legacy = resolveLegacyTracingSdk()
+    if (opts.exporter === "jaeger" && !legacy) throw new Error("The Jaeger exporter requires sdk-trace-node")
+    const modern = !legacy
+    const sdkTrace = nodeRequire(legacy ?? "@opentelemetry/sdk-trace")
     const resources: any = nodeRequire("@opentelemetry/resources")
     const semconv: any = nodeRequire("@opentelemetry/semantic-conventions")
     const tracingApi: any = nodeRequire("@opentelemetry/api")
@@ -68,7 +80,7 @@ export async function setupNevoTracing(opts: NevoTracingSetupOptions): Promise<N
       exporter = new sdkTrace.ConsoleSpanExporter()
     }
 
-    processor = new sdkTrace.BatchSpanProcessor(exporter)
+    const processor = modern ? new sdkTrace.BatchSpanProcessor({ exporter }) : new sdkTrace.BatchSpanProcessor(exporter)
     const providerOpts = {
       resource,
       sampler:
@@ -76,36 +88,47 @@ export async function setupNevoTracing(opts: NevoTracingSetupOptions): Promise<N
           ? new sdkTrace.TraceIdRatioBasedSampler(Math.max(0, Math.min(1, opts.sampleRate)))
           : new sdkTrace.AlwaysOnSampler()
     }
-    // SDK 2.x removed addSpanProcessor in favour of the `spanProcessors` constructor option.
-    if (typeof sdkTrace.NodeTracerProvider.prototype.addSpanProcessor === "function") {
+    if (modern) {
+      const { AsyncLocalStorageContextManager } = nodeRequire("@opentelemetry/context-async-hooks")
+      const { CompositePropagator, W3CBaggagePropagator, W3CTraceContextPropagator } = nodeRequire("@opentelemetry/core")
+      const manager = new AsyncLocalStorageContextManager().enable()
+      const propagator = new CompositePropagator({ propagators: [new W3CTraceContextPropagator(), new W3CBaggagePropagator()] })
+      provider = new sdkTrace.TracerProvider({ ...providerOpts, spanProcessors: [processor] })
+      const ownsTrace = tracingApi.trace.setGlobalTracerProvider(provider)
+      const ownsContext = tracingApi.context.setGlobalContextManager(manager)
+      const ownsPropagation = tracingApi.propagation.setGlobalPropagator(propagator)
+      if (!ownsContext) manager.disable()
+      releaseGlobals = () => {
+        if (ownsTrace) tracingApi.trace.disable()
+        if (ownsContext) tracingApi.context.disable()
+        if (ownsPropagation) tracingApi.propagation.disable()
+      }
+    } else if (typeof sdkTrace.NodeTracerProvider.prototype.addSpanProcessor === "function") {
       provider = new sdkTrace.NodeTracerProvider(providerOpts)
       provider.addSpanProcessor(processor)
+      provider.register()
     } else {
       provider = new sdkTrace.NodeTracerProvider({ ...providerOpts, spanProcessors: [processor] })
+      provider.register()
     }
-    provider.register()
-
-    void tracingApi
   } catch (err: any) {
-    throw new Error(
-      `Failed to initialize OpenTelemetry tracing: ${err?.message ?? err}. ` +
-        `Install @opentelemetry/api @opentelemetry/sdk-trace-node @opentelemetry/resources @opentelemetry/semantic-conventions plus your exporter.`,
-      { cause: err }
-    )
+    const install =
+      opts.exporter === "jaeger"
+        ? "Install the legacy OpenTelemetry SDK and Jaeger exporter, or use the OTLP exporter for Jaeger."
+        : "Install @opentelemetry/api, @opentelemetry/sdk-trace, @opentelemetry/resources, @opentelemetry/context-async-hooks, @opentelemetry/core, @opentelemetry/semantic-conventions and your exporter."
+    throw new Error(`Failed to initialize OpenTelemetry tracing: ${err?.message ?? err}. ${install}`, { cause: err })
   }
 
   const tracer = createTracer({ serviceName: opts.serviceName, enabled: true })
   setDefaultTracer(tracer)
+  let shutdown: Promise<void> | undefined
 
   return {
     tracer,
-    shutdown: async () => {
-      try {
-        await processor?.shutdown()
-      } catch {}
-      try {
-        await provider?.shutdown()
-      } catch {}
-    }
+    shutdown: () =>
+      (shutdown ??= Promise.resolve()
+        .then(() => provider.shutdown())
+        .catch(() => {})
+        .finally(releaseGlobals))
   }
 }

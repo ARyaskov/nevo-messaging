@@ -13,7 +13,6 @@ const tracing = await setupNevoTracing({
   exporter: "otlp",                                    // "otlp" | "jaeger" | "zipkin" | "console" | "none"
   endpoint: "http://otel-collector:4318/v1/traces",
   headers: { authorization: "Bearer ..." },
-  protocol: "http/protobuf",                            // for OTLP/HTTP
   sampleRate: 0.1                                       // 0..1, default: 1.0
 })
 
@@ -27,13 +26,21 @@ Call once during process bootstrap (before module init).
 
 | Exporter | Required peer dep |
 |---|---|
-| `"otlp"` | `@opentelemetry/sdk-trace-node` + `@opentelemetry/exporter-trace-otlp-http` |
-| `"jaeger"` | `@opentelemetry/exporter-jaeger` |
+| `"otlp"` | `@opentelemetry/exporter-trace-otlp-http` (OTLP/HTTP JSON) |
+| `"jaeger"` | Legacy `@opentelemetry/sdk-trace-node` and `@opentelemetry/exporter-jaeger` |
 | `"zipkin"` | `@opentelemetry/exporter-zipkin` |
 | `"console"` | none (built-in console exporter) |
 | `"none"` | disables export but keeps span creation |
 
-The SDK packages are loaded dynamically — install only the ones you use.
+For SDK 3, install `@opentelemetry/api@^1.10.0`, `@opentelemetry/sdk-trace@^3`,
+`@opentelemetry/resources@^3`, `@opentelemetry/core@^3`,
+`@opentelemetry/context-async-hooks@^3`, and `@opentelemetry/semantic-conventions`.
+Use matching SDK 3 exporters. To send traces to a current Jaeger instance, use
+`exporter: "otlp"` with the Jaeger OTLP/HTTP endpoint.
+
+Existing SDK 1/2 installations can keep `@opentelemetry/sdk-trace-node` and
+their matching API, resources, and exporter packages. Use one SDK generation
+per process.
 
 ## What gets traced automatically
 
